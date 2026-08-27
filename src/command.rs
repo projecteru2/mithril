@@ -1,0 +1,306 @@
+//! Static command table: name, arity, flags, key positions, and routing kind.
+
+pub const MAX_NAME: usize = 24;
+
+pub const FLAG_WRITE: u8 = 1;
+pub const FLAG_READONLY: u8 = 1 << 1;
+pub const FLAG_NO_AUTH: u8 = 1 << 2;
+
+/// How the proxy routes or handles a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// Route to the node owning the first key.
+    Single,
+    /// Split keys per node, sum integer replies (DEL/UNLINK/EXISTS/TOUCH/PFCOUNT).
+    MultiSum,
+    /// Split keys per node, restore reply order (MGET).
+    Mget,
+    /// Split key/value pairs per node, all replies must be OK (MSET).
+    Mset,
+    /// Route to any master.
+    AnyMaster,
+    /// Blocking single-key family; uses a dedicated backend connection.
+    Blocking,
+    /// Subscribe family; switches the client into pubsub relay mode.
+    Subscribe,
+    /// EVAL: numkeys at argv[2], keys follow.
+    Eval,
+    /// XREAD/XREADGROUP: keys follow the STREAMS token.
+    Xread,
+    /// Cluster-wide SCAN with synthetic cursors.
+    Scan,
+    /// Cluster-wide DBSIZE (sum over masters).
+    Dbsize,
+    /// FLUSHALL ASYNC broadcast to all masters.
+    Flushall,
+    /// Answered by the proxy itself.
+    Local,
+}
+
+/// One command table entry.
+#[derive(Debug, Clone, Copy)]
+pub struct Spec {
+    pub name: &'static str,
+    pub arity: i8,
+    pub flags: u8,
+    pub first_key: u8,
+    pub last_key: i8,
+    pub step: u8,
+    pub kind: Kind,
+}
+
+impl Spec {
+    pub fn is_write(&self) -> bool {
+        self.flags & FLAG_WRITE != 0
+    }
+
+    pub fn is_readonly(&self) -> bool {
+        self.flags & FLAG_READONLY != 0
+    }
+
+    /// Validates argc against redis arity conventions.
+    pub fn arity_ok(&self, argc: usize) -> bool {
+        let argc = argc as i64;
+        let a = i64::from(self.arity);
+        if a >= 0 { argc == a } else { argc >= -a }
+    }
+}
+
+/// Returns the full command table.
+pub fn table() -> &'static [Spec] {
+    TABLE
+}
+
+/// Looks up a command by name, case-insensitively.
+pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
+    if name.len() > MAX_NAME {
+        return None;
+    }
+    let mut buf = [0u8; MAX_NAME];
+    let lower = &mut buf[..name.len()];
+    for (d, &s) in lower.iter_mut().zip(name) {
+        *d = s.to_ascii_lowercase();
+    }
+    let lower: &[u8] = lower;
+    TABLE
+        .binary_search_by(|spec| spec.name.as_bytes().cmp(lower))
+        .ok()
+        .map(|i| &TABLE[i])
+}
+
+const W: u8 = FLAG_WRITE;
+const R: u8 = FLAG_READONLY;
+const N: u8 = FLAG_NO_AUTH;
+
+const fn c(
+    name: &'static str,
+    arity: i8,
+    flags: u8,
+    first_key: u8,
+    last_key: i8,
+    step: u8,
+    kind: Kind,
+) -> Spec {
+    Spec {
+        name,
+        arity,
+        flags,
+        first_key,
+        last_key,
+        step,
+        kind,
+    }
+}
+
+// Sorted by name; lookup binary-searches and a test enforces the order.
+static TABLE: &[Spec] = &[
+    c("acl", -2, 0, 0, 0, 0, Kind::Local),
+    c("append", 3, W, 1, 1, 1, Kind::Single),
+    c("auth", -2, N, 0, 0, 0, Kind::Local),
+    c("bitcount", -2, R, 1, 1, 1, Kind::Single),
+    c("bitfield", -2, W, 1, 1, 1, Kind::Single),
+    c("bitop", -4, W, 2, -1, 1, Kind::Single),
+    c("bitpos", -3, R, 1, 1, 1, Kind::Single),
+    c("blpop", -3, W, 1, -2, 1, Kind::Blocking),
+    c("brpop", -3, W, 1, -2, 1, Kind::Blocking),
+    c("brpoplpush", 4, W, 1, 2, 1, Kind::Blocking),
+    c("bzpopmax", -3, W, 1, -2, 1, Kind::Blocking),
+    c("bzpopmin", -3, W, 1, -2, 1, Kind::Blocking),
+    c("client", -2, 0, 0, 0, 0, Kind::Local),
+    c("cluster", -2, 0, 0, 0, 0, Kind::Local),
+    c("command", -1, 0, 0, 0, 0, Kind::Local),
+    c("config", -2, 0, 0, 0, 0, Kind::Local),
+    c("copy", -3, W, 1, 2, 1, Kind::Single),
+    c("dbsize", 1, R, 0, 0, 0, Kind::Dbsize),
+    c("decr", 2, W, 1, 1, 1, Kind::Single),
+    c("decrby", 3, W, 1, 1, 1, Kind::Single),
+    c("del", -2, W, 1, -1, 1, Kind::MultiSum),
+    c("discard", 1, 0, 0, 0, 0, Kind::Local),
+    c("echo", 2, 0, 0, 0, 0, Kind::Local),
+    c("eval", -3, W, 0, 0, 0, Kind::Eval),
+    c("exec", 1, 0, 0, 0, 0, Kind::Local),
+    c("exists", -2, R, 1, -1, 1, Kind::MultiSum),
+    c("expire", 3, W, 1, 1, 1, Kind::Single),
+    c("expireat", 3, W, 1, 1, 1, Kind::Single),
+    c("flushall", -1, W, 0, 0, 0, Kind::Flushall),
+    c("geoadd", -5, W, 1, 1, 1, Kind::Single),
+    c("geodist", -4, R, 1, 1, 1, Kind::Single),
+    c("geohash", -2, R, 1, 1, 1, Kind::Single),
+    c("geopos", -2, R, 1, 1, 1, Kind::Single),
+    c("georadius", -6, W, 1, 1, 1, Kind::Single),
+    c("georadiusbymember", -5, W, 1, 1, 1, Kind::Single),
+    c("get", 2, R, 1, 1, 1, Kind::Single),
+    c("getbit", 3, R, 1, 1, 1, Kind::Single),
+    c("getdel", 2, W, 1, 1, 1, Kind::Single),
+    c("getex", -2, W, 1, 1, 1, Kind::Single),
+    c("getrange", 4, R, 1, 1, 1, Kind::Single),
+    c("getset", 3, W, 1, 1, 1, Kind::Single),
+    c("hdel", -3, W, 1, 1, 1, Kind::Single),
+    c("hello", -1, N, 0, 0, 0, Kind::Local),
+    c("hexists", 3, R, 1, 1, 1, Kind::Single),
+    c("hget", 3, R, 1, 1, 1, Kind::Single),
+    c("hgetall", 2, R, 1, 1, 1, Kind::Single),
+    c("hincrby", 4, W, 1, 1, 1, Kind::Single),
+    c("hincrbyfloat", 4, W, 1, 1, 1, Kind::Single),
+    c("hkeys", 2, R, 1, 1, 1, Kind::Single),
+    c("hlen", 2, R, 1, 1, 1, Kind::Single),
+    c("hmget", -3, R, 1, 1, 1, Kind::Single),
+    c("hmset", -4, W, 1, 1, 1, Kind::Single),
+    c("hscan", -3, R, 1, 1, 1, Kind::Single),
+    c("hset", -4, W, 1, 1, 1, Kind::Single),
+    c("hsetnx", 4, W, 1, 1, 1, Kind::Single),
+    c("hstrlen", 3, R, 1, 1, 1, Kind::Single),
+    c("hvals", 2, R, 1, 1, 1, Kind::Single),
+    c("incr", 2, W, 1, 1, 1, Kind::Single),
+    c("incrby", 3, W, 1, 1, 1, Kind::Single),
+    c("incrbyfloat", 3, W, 1, 1, 1, Kind::Single),
+    c("info", -1, 0, 0, 0, 0, Kind::Local),
+    c("lindex", 3, R, 1, 1, 1, Kind::Single),
+    c("linsert", 5, W, 1, 1, 1, Kind::Single),
+    c("llen", 2, R, 1, 1, 1, Kind::Single),
+    c("lpop", -2, W, 1, 1, 1, Kind::Single),
+    c("lpos", -3, R, 1, 1, 1, Kind::Single),
+    c("lpush", -3, W, 1, 1, 1, Kind::Single),
+    c("lpushx", -3, W, 1, 1, 1, Kind::Single),
+    c("lrange", 4, R, 1, 1, 1, Kind::Single),
+    c("lrem", 4, W, 1, 1, 1, Kind::Single),
+    c("lset", 4, W, 1, 1, 1, Kind::Single),
+    c("ltrim", 4, W, 1, 1, 1, Kind::Single),
+    c("memory", -2, 0, 0, 0, 0, Kind::Local),
+    c("mget", -2, R, 1, -1, 1, Kind::Mget),
+    c("mset", -3, W, 1, -1, 2, Kind::Mset),
+    c("msetnx", -3, W, 1, -1, 2, Kind::Single),
+    c("multi", 1, 0, 0, 0, 0, Kind::Local),
+    c("persist", 2, W, 1, 1, 1, Kind::Single),
+    c("pexpire", 3, W, 1, 1, 1, Kind::Single),
+    c("pexpireat", 3, W, 1, 1, 1, Kind::Single),
+    c("pfadd", -2, W, 1, 1, 1, Kind::Single),
+    c("pfcount", -2, R, 1, -1, 1, Kind::MultiSum),
+    c("ping", -1, 0, 0, 0, 0, Kind::Local),
+    c("psetex", 4, W, 1, 1, 1, Kind::Single),
+    c("psubscribe", -2, 0, 0, 0, 0, Kind::Subscribe),
+    c("pttl", 2, R, 1, 1, 1, Kind::Single),
+    c("publish", 3, 0, 0, 0, 0, Kind::AnyMaster),
+    c("pubsub", -2, 0, 0, 0, 0, Kind::AnyMaster),
+    c("punsubscribe", -1, 0, 0, 0, 0, Kind::Subscribe),
+    c("quit", 1, N, 0, 0, 0, Kind::Local),
+    c("randomkey", 1, R, 0, 0, 0, Kind::AnyMaster),
+    c("rename", 3, W, 1, 2, 1, Kind::Single),
+    c("renamenx", 3, W, 1, 2, 1, Kind::Single),
+    c("rpop", -2, W, 1, 1, 1, Kind::Single),
+    c("rpoplpush", 3, W, 1, 2, 1, Kind::Single),
+    c("rpush", -3, W, 1, 1, 1, Kind::Single),
+    c("rpushx", -3, W, 1, 1, 1, Kind::Single),
+    c("sadd", -3, W, 1, 1, 1, Kind::Single),
+    c("scan", -2, R, 0, 0, 0, Kind::Scan),
+    c("scard", 2, R, 1, 1, 1, Kind::Single),
+    c("sdiff", -2, R, 1, -1, 1, Kind::Single),
+    c("sdiffstore", -3, W, 1, -1, 1, Kind::Single),
+    c("select", 2, 0, 0, 0, 0, Kind::Local),
+    c("set", -3, W, 1, 1, 1, Kind::Single),
+    c("setbit", 4, W, 1, 1, 1, Kind::Single),
+    c("setex", 4, W, 1, 1, 1, Kind::Single),
+    c("setnx", 3, W, 1, 1, 1, Kind::Single),
+    c("setrange", 4, W, 1, 1, 1, Kind::Single),
+    c("sinter", -2, R, 1, -1, 1, Kind::Single),
+    c("sinterstore", -3, W, 1, -1, 1, Kind::Single),
+    c("sismember", 3, R, 1, 1, 1, Kind::Single),
+    c("smembers", 2, R, 1, 1, 1, Kind::Single),
+    c("smove", 4, W, 1, 2, 1, Kind::Single),
+    c("sort", -2, W, 1, 1, 1, Kind::Single),
+    c("spop", -2, W, 1, 1, 1, Kind::Single),
+    c("srandmember", -2, R, 1, 1, 1, Kind::Single),
+    c("srem", -3, W, 1, 1, 1, Kind::Single),
+    c("sscan", -3, R, 1, 1, 1, Kind::Single),
+    c("strlen", 2, R, 1, 1, 1, Kind::Single),
+    c("subscribe", -2, 0, 0, 0, 0, Kind::Subscribe),
+    c("sunion", -2, R, 1, -1, 1, Kind::Single),
+    c("sunionstore", -3, W, 1, -1, 1, Kind::Single),
+    c("time", 1, 0, 0, 0, 0, Kind::Local),
+    c("touch", -2, R, 1, -1, 1, Kind::MultiSum),
+    c("ttl", 2, R, 1, 1, 1, Kind::Single),
+    c("type", 2, R, 1, 1, 1, Kind::Single),
+    c("unlink", -2, W, 1, -1, 1, Kind::MultiSum),
+    c("unsubscribe", -1, 0, 0, 0, 0, Kind::Subscribe),
+    c("xadd", -5, W, 1, 1, 1, Kind::Single),
+    c("xlen", 2, R, 1, 1, 1, Kind::Single),
+    c("xpending", -3, R, 1, 1, 1, Kind::Single),
+    c("xrange", -4, R, 1, 1, 1, Kind::Single),
+    c("xread", -4, R, 0, 0, 0, Kind::Xread),
+    c("xreadgroup", -7, W, 0, 0, 0, Kind::Xread),
+    c("xrevrange", -4, R, 1, 1, 1, Kind::Single),
+    c("zadd", -4, W, 1, 1, 1, Kind::Single),
+    c("zcard", 2, R, 1, 1, 1, Kind::Single),
+    c("zcount", 4, R, 1, 1, 1, Kind::Single),
+    c("zincrby", 4, W, 1, 1, 1, Kind::Single),
+    c("zinterstore", -4, W, 1, 1, 1, Kind::Single),
+    c("zlexcount", 4, R, 1, 1, 1, Kind::Single),
+    c("zpopmax", -2, W, 1, 1, 1, Kind::Single),
+    c("zpopmin", -2, W, 1, 1, 1, Kind::Single),
+    c("zrange", -4, R, 1, 1, 1, Kind::Single),
+    c("zrangebylex", -4, R, 1, 1, 1, Kind::Single),
+    c("zrangebyscore", -4, R, 1, 1, 1, Kind::Single),
+    c("zrank", 3, R, 1, 1, 1, Kind::Single),
+    c("zrem", -3, W, 1, 1, 1, Kind::Single),
+    c("zremrangebylex", 4, W, 1, 1, 1, Kind::Single),
+    c("zremrangebyrank", 4, W, 1, 1, 1, Kind::Single),
+    c("zremrangebyscore", 4, W, 1, 1, 1, Kind::Single),
+    c("zrevrange", -4, R, 1, 1, 1, Kind::Single),
+    c("zrevrangebylex", -4, R, 1, 1, 1, Kind::Single),
+    c("zrevrangebyscore", -4, R, 1, 1, 1, Kind::Single),
+    c("zrevrank", 3, R, 1, 1, 1, Kind::Single),
+    c("zscan", -3, R, 1, 1, 1, Kind::Single),
+    c("zscore", 3, R, 1, 1, 1, Kind::Single),
+    c("zunionstore", -4, W, 1, 1, 1, Kind::Single),
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_is_sorted_and_unique() {
+        for w in TABLE.windows(2) {
+            assert!(w[0].name < w[1].name, "{} >= {}", w[0].name, w[1].name);
+        }
+    }
+
+    #[test]
+    fn lookup_is_case_insensitive() {
+        assert_eq!(lookup(b"GET").map(|s| s.name), Some("get"));
+        assert_eq!(lookup(b"GeT").map(|s| s.name), Some("get"));
+        assert!(lookup(b"nosuchcmd").is_none());
+        assert!(lookup(&[b'x'; 40]).is_none());
+    }
+
+    #[test]
+    fn arity_checks() {
+        let get = lookup(b"get").unwrap();
+        assert!(get.arity_ok(2));
+        assert!(!get.arity_ok(3));
+        let set = lookup(b"set").unwrap();
+        assert!(set.arity_ok(3));
+        assert!(set.arity_ok(5));
+        assert!(!set.arity_ok(2));
+    }
+}

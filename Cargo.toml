@@ -1,0 +1,27 @@
+[package]
+name = "mithril"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+description = "Redis Cluster proxy"
+
+[dependencies]
+arc-swap = "1"
+bytes = "1"
+socket2 = { version = "0.6", features = ["all"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "macros", "signal"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "macros", "test-util"] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
