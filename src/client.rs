@@ -622,12 +622,11 @@ impl Session {
         }
         let new_slot = {
             let args = collect_args(&frame, argc);
-            let step = if spec.kind == Kind::Mset { 2 } else { 1 };
             let current = self.multi.borrow().as_ref().and_then(|s| s.slot);
             let mut slot = current;
             let mut conflict = false;
-            for key in args[spec.first_key as usize..].iter().step_by(step) {
-                let s = crc16::slot(key);
+            for idx in key_indices(spec, argc) {
+                let s = crc16::slot(args[idx]);
                 match slot {
                     None => slot = Some(s),
                     Some(prev) if prev != s => {
@@ -971,6 +970,22 @@ enum Merge {
 
 fn collect_args(frame: &Bytes, argc: usize) -> Vec<&[u8]> {
     resp::Args::new(frame, argc).collect()
+}
+
+/// Argument indices holding keys, per the spec's first/last/step triple.
+fn key_indices(spec: &Spec, argc: usize) -> impl Iterator<Item = usize> {
+    let first = spec.first_key as usize;
+    let last = if spec.last_key < 0 {
+        (argc as i64 + i64::from(spec.last_key)).max(0) as usize
+    } else {
+        spec.last_key as usize
+    };
+    let end = if first == 0 {
+        0
+    } else {
+        last.min(argc.saturating_sub(1)) + 1
+    };
+    (first..end).step_by((spec.step as usize).max(1))
 }
 
 fn error_frame(msg: &str) -> Bytes {

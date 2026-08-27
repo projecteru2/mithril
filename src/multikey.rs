@@ -12,7 +12,8 @@ pub struct Part {
     pub positions: Vec<usize>,
 }
 
-/// Groups `keys[i]` by owner address, building one sub-command per node.
+/// Groups `keys[i]` by slot (cluster nodes reject multi-key commands whose
+/// keys span slots, even on one node), building one sub-command per slot.
 pub fn split<'k, F>(
     name: &[u8],
     keys: &[&'k [u8]],
@@ -22,28 +23,28 @@ pub fn split<'k, F>(
 where
     F: FnMut(&[u8]) -> Option<String>,
 {
-    type Group<'a> = (String, Vec<&'a [u8]>, Vec<usize>);
+    type Group<'a> = (u16, String, Vec<&'a [u8]>, Vec<usize>);
     let mut parts: Vec<Group<'k>> = Vec::new();
     for (i, key) in keys.iter().enumerate() {
-        let addr = route(key).ok_or_else(|| "slot has no owner".to_string())?;
-        let slot_entry = parts.iter_mut().find(|(a, _, _)| *a == addr);
-        let entry = match slot_entry {
+        let slot = crate::crc16::slot(key);
+        let entry = match parts.iter_mut().find(|(s, ..)| *s == slot) {
             Some(e) => e,
             None => {
-                parts.push((addr, Vec::new(), Vec::new()));
+                let addr = route(key).ok_or_else(|| "slot has no owner".to_string())?;
+                parts.push((slot, addr, Vec::new(), Vec::new()));
                 let last = parts.len() - 1;
                 &mut parts[last]
             }
         };
-        entry.1.push(key);
+        entry.2.push(key);
         if let Some(vals) = values {
-            entry.1.push(vals[i]);
+            entry.2.push(vals[i]);
         }
-        entry.2.push(i);
+        entry.3.push(i);
     }
     Ok(parts
         .into_iter()
-        .map(|(addr, args, positions)| {
+        .map(|(_, addr, args, positions)| {
             let mut all: Vec<&[u8]> = Vec::with_capacity(args.len() + 1);
             all.push(name);
             all.extend_from_slice(&args);
@@ -188,24 +189,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn splits_by_route() {
-        let keys: Vec<&[u8]> = vec![b"a", b"b", b"c"];
-        let parts = split(b"MGET", &keys, None, |k| {
-            Some(if k == b"b" {
-                "n2".to_string()
-            } else {
-                "n1".to_string()
-            })
-        })
-        .unwrap();
+    fn splits_by_slot_even_on_one_node() {
+        let keys: Vec<&[u8]> = vec![b"{t}a", b"b", b"{t}c"];
+        let parts = split(b"MGET", &keys, None, |_| Some("n1".to_string())).unwrap();
         assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0].addr, "n1");
         assert_eq!(parts[0].positions, vec![0, 2]);
         assert_eq!(
             parts[0].frame,
-            b"*3\r\n$4\r\nMGET\r\n$1\r\na\r\n$1\r\nc\r\n"
+            b"*3\r\n$4\r\nMGET\r\n$4\r\n{t}a\r\n$4\r\n{t}c\r\n"
         );
         assert_eq!(parts[1].positions, vec![1]);
+        assert_eq!(parts[1].addr, "n1");
     }
 
     #[test]
