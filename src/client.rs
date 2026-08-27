@@ -231,9 +231,24 @@ impl Session {
             return;
         };
         let seq = self.alloc_seq();
-        let Some((addr, is_replica)) = self.pick_addr(slot, spec.is_readonly()) else {
-            self.emit_at(seq, error_frame(ERR_NO_OWNER));
-            return;
+        // conn is resolved inside the topology guard so the address never
+        // needs an owned copy on the hot path.
+        let conn = {
+            let topo = self.shared.topo.load();
+            let mut rng = self.rng.get();
+            let picked = route::pick(
+                &topo,
+                slot,
+                spec.is_readonly(),
+                self.shared.cfg.slave_mode,
+                &mut rng,
+            );
+            self.rng.set(rng);
+            let Some((addr, is_replica)) = picked else {
+                self.emit_at(seq, error_frame(ERR_NO_OWNER));
+                return;
+            };
+            self.shared.backends.shared(addr, self.id, is_replica)
         };
         self.inflight.borrow_mut().insert(
             seq,
@@ -242,7 +257,6 @@ impl Session {
                 retried: false,
             },
         );
-        let conn = self.shared.backends.shared(&addr, self.id, is_replica);
         conn.send(Outbound {
             head: None,
             frame,
@@ -701,6 +715,12 @@ impl Session {
                     self.closing.set(true);
                     Some(admin::OK.to_vec())
                 }
+                "reset" => {
+                    *self.multi.borrow_mut() = None;
+                    self.proto.set(2);
+                    self.authed.set(self.shared.cfg.requirepass.is_empty());
+                    Some(b"+RESET\r\n".to_vec())
+                }
                 "multi" => {
                     if self.multi.borrow().is_some() {
                         Some(error_frame_vec("ERR MULTI calls can not be nested"))
@@ -1150,7 +1170,13 @@ async fn write_loop(
                 .await;
                 continue;
             }
-            parked.insert(seq, frame);
+            if seq == next_emit {
+                inflight.borrow_mut().remove(&seq);
+                ready.push(convert_nil(frame, proto.get()));
+                next_emit += 1;
+            } else {
+                parked.insert(seq, frame);
+            }
         }
         while let Some(frame) = parked.remove(&next_emit) {
             inflight.borrow_mut().remove(&next_emit);

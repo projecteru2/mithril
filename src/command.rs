@@ -207,6 +207,7 @@ static TABLE: &[Spec] = &[
     c("randomkey", 1, R, 0, 0, 0, Kind::AnyMaster),
     c("rename", 3, W, 1, 2, 1, Kind::Single),
     c("renamenx", 3, W, 1, 2, 1, Kind::Single),
+    c("reset", 1, N, 0, 0, 0, Kind::Local),
     c("rpop", -2, W, 1, 1, 1, Kind::Single),
     c("rpoplpush", 3, W, 1, 2, 1, Kind::Single),
     c("rpush", -3, W, 1, 1, 1, Kind::Single),
