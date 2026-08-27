@@ -37,7 +37,8 @@ end to end.
 ## Behavior contract
 
 - Single-key commands route by slot; reads optionally balance to replicas
-  (`slave-mode master_readwrite|master_writeonly`).
+  (`slave-mode master_readwrite|master_writeonly`). Replica reads trade
+  read-your-write consistency for throughput, as with any replica routing.
 - MGET/MSET/DEL/UNLINK/EXISTS/TOUCH/PFCOUNT split per slot and merge
   (order-preserving for MGET; PFCOUNT sums per-slot counts, which
   double-counts elements shared across slots — inherent to fan-out).
