@@ -120,7 +120,7 @@ impl Backends {
                     return Some(ExclusiveLease {
                         conn: c,
                         pool,
-                        returned: Cell::new(false),
+                        complete: Cell::new(false),
                     });
                 }
                 Some(_) => pool.exclusive_count.set(pool.exclusive_count.get() - 1),
@@ -134,7 +134,7 @@ impl Backends {
         Some(ExclusiveLease {
             conn: self.dial(addr, readonly),
             pool,
-            returned: Cell::new(false),
+            complete: Cell::new(false),
         })
     }
 
@@ -177,34 +177,37 @@ struct Pool {
     exclusive_count: Cell<usize>,
 }
 
-/// Holds one exclusive connection; dropping it returns the connection to the
-/// idle pool (or frees the quota slot if the connection died).
+/// Holds one exclusive connection. Dropping a completed lease returns the
+/// connection to the idle pool; dropping an incomplete lease (cancelled
+/// blocking command) releases the quota slot and lets the connection close,
+/// since its pipeline still carries the abandoned command.
 pub struct ExclusiveLease {
     conn: Rc<Conn>,
     pool: Rc<Pool>,
-    returned: Cell<bool>,
+    complete: Cell<bool>,
 }
 
 impl ExclusiveLease {
     pub fn conn(&self) -> &Conn {
         &self.conn
     }
+
+    pub fn complete(&self) {
+        self.complete.set(true);
+    }
 }
 
 impl Drop for ExclusiveLease {
     fn drop(&mut self) {
-        if self.returned.replace(true) {
-            return;
-        }
-        if self.conn.is_dead() {
-            self.pool
-                .exclusive_count
-                .set(self.pool.exclusive_count.get().saturating_sub(1));
-        } else {
+        if self.complete.get() && !self.conn.is_dead() {
             self.pool
                 .idle_exclusive
                 .borrow_mut()
                 .push(self.conn.clone());
+        } else {
+            self.pool
+                .exclusive_count
+                .set(self.pool.exclusive_count.get().saturating_sub(1));
         }
     }
 }

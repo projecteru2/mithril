@@ -26,6 +26,8 @@ use crate::{admin, crc16, route};
 pub const MAX_INFLIGHT: usize = 65536;
 pub const PUBSUB_FORWARD_QUEUE: usize = 64;
 pub const PUBSUB_PUSH_WINDOW: usize = 4096;
+const GATE_PROBE: std::time::Duration = std::time::Duration::from_millis(100);
+const UNSUB_SYNC: std::time::Duration = std::time::Duration::from_millis(100);
 pub const READ_CHUNK: usize = crate::backend::READ_CHUNK;
 /// Sequence for out-of-band frames (pubsub pushes) that bypass ordering.
 pub const SEQ_OOB: u64 = u64::MAX;
@@ -48,6 +50,7 @@ pub struct Shared {
 
 struct InFlight {
     frame: Bytes,
+    expect: u32,
     retried: bool,
 }
 
@@ -98,10 +101,10 @@ struct Session {
     multi: RefCell<Option<MultiState>>,
     pubsub: RefCell<Option<PubsubHandle>>,
     pubsub_done: Rc<Cell<bool>>,
+    unsub_inflight: Cell<bool>,
     oob_pending: Rc<Cell<usize>>,
     blocking: RefCell<Vec<(u64, tokio::task::JoinHandle<()>)>>,
     closing: Cell<bool>,
-    emitted: Emitted,
     proto_switches: ProtoSwitches,
     conns: RefCell<ConnCache>,
 }
@@ -112,13 +115,9 @@ impl Session {
         if argc == 0 {
             return;
         }
-        if self.pubsub.borrow().is_some() {
-            if self.pubsub_done.get() {
-                if let Some(ps) = self.pubsub.borrow_mut().take() {
-                    ps.task.abort();
-                }
-                self.pubsub_done.set(false);
-            } else {
+        if self.pubsub.borrow().is_some() && !self.exit_pubsub_if_done().await {
+            let passthrough = self.proto.get() >= 3 && !is_pubsub_command(&frame, argc);
+            if !passthrough {
                 self.dispatch_pubsub(frame, argc);
                 return;
             }
@@ -283,10 +282,15 @@ impl Session {
     }
 
     fn track_inflight_entry(&self, seq: u64, frame: &Bytes) {
+        self.track_inflight_expect(seq, frame, 1);
+    }
+
+    fn track_inflight_expect(&self, seq: u64, frame: &Bytes, expect: u32) {
         self.inflight.borrow_mut().insert(
             seq,
             InFlight {
                 frame: frame.clone(),
+                expect,
                 retried: false,
             },
         );
@@ -687,6 +691,7 @@ impl Session {
                 "reset" => {
                     *self.multi.borrow_mut() = None;
                     self.proto.set(2);
+                    self.proto_switches.push(self.next_seq.get(), 2);
                     self.authed.set(self.shared.cfg.requirepass.is_empty());
                     Some(b"+RESET\r\n".to_vec())
                 }
@@ -744,10 +749,12 @@ impl Session {
         }
         blob.extend_from_slice(b"*1\r\n$4\r\nEXEC\r\n");
         let expect = state.frames.len() as u32 + 2;
+        let blob = Bytes::from(blob);
+        self.track_inflight_expect(seq, &blob, expect);
         let conn = self.shared.backends.shared(&addr, self.id, false);
         conn.send(Outbound {
             head: None,
-            frame: Bytes::from(blob),
+            frame: blob,
             expect,
             seq,
             sink: Sink::Client(self.reply_tx.clone()),
@@ -868,6 +875,27 @@ impl Session {
         }
     }
 
+    // an in-flight unsubscribe may zero the count microseconds after the
+    // client pipelines its next command; wait briefly for the confirmation
+    // before deciding the session is still subscribed.
+    async fn exit_pubsub_if_done(&self) -> bool {
+        if !self.pubsub_done.get() && self.unsub_inflight.get() {
+            let deadline = tokio::time::Instant::now() + UNSUB_SYNC;
+            while !self.pubsub_done.get() && tokio::time::Instant::now() < deadline {
+                tokio::task::yield_now().await;
+            }
+            self.unsub_inflight.set(false);
+        }
+        if self.pubsub_done.get() {
+            if let Some(ps) = self.pubsub.borrow_mut().take() {
+                ps.task.abort();
+            }
+            self.pubsub_done.set(false);
+            return true;
+        }
+        false
+    }
+
     fn dispatch_pubsub(&self, frame: Bytes, argc: usize) {
         let forward = {
             let args = collect_args(&frame, argc);
@@ -876,7 +904,11 @@ impl Session {
                 .map(|n| n.to_ascii_lowercase())
                 .unwrap_or_default();
             match lower.as_slice() {
-                b"subscribe" | b"unsubscribe" | b"psubscribe" | b"punsubscribe" | b"ping" => true,
+                b"unsubscribe" | b"punsubscribe" => {
+                    self.unsub_inflight.set(true);
+                    true
+                }
+                b"subscribe" | b"psubscribe" | b"ping" => true,
                 b"quit" => {
                     self.closing.set(true);
                     false
@@ -885,6 +917,8 @@ impl Session {
                     if let Some(ps) = self.pubsub.borrow_mut().take() {
                         ps.task.abort();
                     }
+                    self.proto.set(2);
+                    self.proto_switches.push(self.next_seq.get(), 2);
                     self.emit_local(b"+RESET\r\n".to_vec());
                     return;
                 }
@@ -919,14 +953,7 @@ impl Session {
             self.emit_error(ERR_NO_OWNER);
             return;
         };
-        // pushes bypass sequence ordering, so all ordered replies must be on
-        // the wire before the relay may emit the first confirmation.
-        while self.emitted.get() < self.next_seq.get() {
-            if self.reply_tx.is_closed() {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
+        let first_seq = self.alloc_seq();
         let (tx, rx) = mpsc::channel::<Bytes>(PUBSUB_FORWARD_QUEUE);
         let _ = tx.try_send(first_frame);
         self.pubsub_done.set(false);
@@ -936,7 +963,7 @@ impl Session {
         let done = self.pubsub_done.clone();
         let budget = self.oob_pending.clone();
         let task = tokio::task::spawn_local(async move {
-            pubsub_relay(shared, addr, rx, reply_tx, proto, done, budget).await;
+            pubsub_relay(shared, addr, rx, reply_tx, proto, done, budget, first_seq).await;
         });
         *self.pubsub.borrow_mut() = Some(PubsubHandle { tx, task });
     }
@@ -994,10 +1021,10 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         multi: RefCell::new(None),
         pubsub: RefCell::new(None),
         pubsub_done: Rc::new(Cell::new(false)),
+        unsub_inflight: Cell::new(false),
         oob_pending: oob_budget.clone(),
         blocking: RefCell::new(Vec::new()),
         closing: Cell::new(false),
-        emitted: emitted.clone(),
         proto_switches: proto_switches.clone(),
         conns: RefCell::new(ConnCache {
             epoch: 0,
@@ -1061,7 +1088,11 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
             if reply_tx.is_closed() {
                 break 'main;
             }
-            tokio::task::yield_now().await;
+            let mut probe = [0u8; 1];
+            match tokio::time::timeout(GATE_PROBE, read_half.peek(&mut probe)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break 'main,
+                _ => {}
+            }
         }
         match read_half.read_buf(&mut buf).await {
             Ok(0) | Err(_) => break,
@@ -1104,6 +1135,13 @@ struct PubsubHandle {
 enum Merge {
     Sum,
     Ok,
+}
+
+fn is_pubsub_command(frame: &Bytes, argc: usize) -> bool {
+    let mut it = resp::Args::new(frame, argc);
+    it.next().and_then(command::lookup).is_some_and(|spec| {
+        spec.kind == Kind::Subscribe || matches!(spec.name, "ping" | "quit" | "reset")
+    })
 }
 
 fn collect_args(frame: &Bytes, argc: usize) -> Vec<&[u8]> {
@@ -1177,6 +1215,7 @@ async fn blocking_round(
         })
         .await;
     let reply = recv_or_lost(rx).await;
+    lease.complete();
     drop(lease);
     if !retried
         && reply.first() == Some(&b'-')
@@ -1204,6 +1243,7 @@ fn parse_redirect(frame: &[u8]) -> Option<(bool, String)> {
     Some((ask, addr.to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn pubsub_relay(
     shared: Rc<Shared>,
     addr: String,
@@ -1212,12 +1252,16 @@ async fn pubsub_relay(
     proto: Rc<Cell<u8>>,
     done: Rc<Cell<bool>>,
     budget: Rc<Cell<usize>>,
+    first_seq: u64,
 ) {
+    let mut first_seq = Some(first_seq);
     let stream = match crate::backend::dial_raw(&addr, &shared.cfg).await {
         Ok(s) => s,
         Err(e) => {
             log_debug!("pubsub dial {addr}: {e}");
-            let _ = reply_tx.send((SEQ_OOB, error_frame("ERR pubsub backend unavailable")));
+            if let Some(seq) = first_seq.take() {
+                let _ = reply_tx.send((seq, error_frame("ERR pubsub backend unavailable")));
+            }
             return;
         }
     };
@@ -1247,8 +1291,16 @@ async fn pubsub_relay(
                     }
                     tokio::task::yield_now().await;
                 }
-                budget.set(budget.get() + 1);
-                if reply_tx.send((SEQ_OOB, frame.freeze())).is_err() {
+                // the first confirmation rides normal ordering so it cannot
+                // overtake replies queued before the mode switch.
+                let tagged = match first_seq.take() {
+                    Some(seq) => (seq, frame.freeze()),
+                    None => {
+                        budget.set(budget.get() + 1);
+                        (SEQ_OOB, frame.freeze())
+                    }
+                };
+                if reply_tx.send(tagged).is_err() {
                     break;
                 }
                 continue;
@@ -1322,8 +1374,9 @@ async fn write_loop(
                 continue;
             }
             if frame.first() == Some(&b'-')
-                && let Some(req) = take_retry_frame(&inflight, seq, &frame)
+                && let Some((req, base_expect)) = take_retry_frame(&inflight, seq, &frame)
                 && let Some((ask, target)) = parse_redirect(&frame)
+                && (base_expect == 1 || !ask)
             {
                 stats::bump(&shared.stats.workers[shared.worker].redirects);
                 let _ = shared.refresh.send(());
@@ -1331,7 +1384,7 @@ async fn write_loop(
                 conn.send(Outbound {
                     head: ask.then(|| Bytes::from_static(ASKING_FRAME)),
                     frame: req,
-                    expect: if ask { 2 } else { 1 },
+                    expect: base_expect + u32::from(ask),
                     seq,
                     sink: Sink::Client(reply_tx.clone()),
                 })
@@ -1381,7 +1434,7 @@ async fn write_loop(
     }
 }
 
-fn take_retry_frame(inflight: &InflightMap, seq: u64, frame: &Bytes) -> Option<Bytes> {
+fn take_retry_frame(inflight: &InflightMap, seq: u64, frame: &Bytes) -> Option<(Bytes, u32)> {
     if !frame.starts_with(b"-MOVED ") && !frame.starts_with(b"-ASK ") {
         return None;
     }
@@ -1389,7 +1442,7 @@ fn take_retry_frame(inflight: &InflightMap, seq: u64, frame: &Bytes) -> Option<B
     match inf.get_mut(&seq) {
         Some(entry) if !entry.retried => {
             entry.retried = true;
-            Some(entry.frame.clone())
+            Some((entry.frame.clone(), entry.expect))
         }
         _ => None,
     }

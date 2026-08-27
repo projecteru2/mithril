@@ -209,6 +209,12 @@ pub fn split_inline(line: &[u8]) -> Option<Vec<Vec<u8>>> {
                             i += 1;
                             break;
                         }
+                        b'\\' if line.get(i + 1) == Some(&b'x') => {
+                            let hi = hex_val(*line.get(i + 2)?)?;
+                            let lo = hex_val(*line.get(i + 3)?)?;
+                            arg.push(hi << 4 | lo);
+                            i += 4;
+                        }
                         b'\\' => {
                             i += 1;
                             let &e = line.get(i)?;
@@ -228,17 +234,27 @@ pub fn split_inline(line: &[u8]) -> Option<Vec<Vec<u8>>> {
                         }
                     }
                 }
+                if !matches!(line.get(i), None | Some(b' ') | Some(b'\t')) {
+                    return None;
+                }
             }
             b'\'' => {
                 i += 1;
                 loop {
                     let &b = line.get(i)?;
-                    if b == b'\'' {
+                    if b == b'\\' && line.get(i + 1) == Some(&b'\'') {
+                        arg.push(b'\'');
+                        i += 2;
+                    } else if b == b'\'' {
                         i += 1;
                         break;
+                    } else {
+                        arg.push(b);
+                        i += 1;
                     }
-                    arg.push(b);
-                    i += 1;
+                }
+                if !matches!(line.get(i), None | Some(b' ') | Some(b'\t')) {
+                    return None;
                 }
             }
             _ => {
@@ -251,6 +267,15 @@ pub fn split_inline(line: &[u8]) -> Option<Vec<Vec<u8>>> {
         args.push(arg);
     }
     Some(args)
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn trim_crlf(mut line: &[u8]) -> &[u8] {
@@ -435,6 +460,15 @@ mod tests {
             vec![b"ECHO".to_vec(), b"x y".to_vec()]
         );
         assert!(split_inline(b"GET \"unbalanced\r\n").is_none());
+        assert_eq!(
+            split_inline(b"SET k \"\\x41\\x42\"\r\n").unwrap()[2],
+            b"AB".to_vec()
+        );
+        assert_eq!(
+            split_inline(b"ECHO 'it\\'s'\r\n").unwrap()[1],
+            b"it's".to_vec()
+        );
+        assert!(split_inline(b"GET \"a\"tail\r\n").is_none());
         assert_eq!(scan_request(b"PIN"), ReqScan::Incomplete);
     }
 
