@@ -184,9 +184,7 @@ fn scan_inline(buf: &[u8]) -> ReqScan {
     }
 }
 
-/// Splits an inline request line per redis inline-command rules: whitespace
-/// separation with single/double quotes and backslash escapes; returns None
-/// on unbalanced quotes.
+/// Splits an inline request per redis quoting rules; None on bad syntax.
 pub fn split_inline(line: &[u8]) -> Option<Vec<Vec<u8>>> {
     let line = trim_crlf(line);
     let mut args: Vec<Vec<u8>> = Vec::new();
@@ -335,8 +333,7 @@ pub(crate) fn scan_int_line(buf: &[u8], pos: usize) -> Option<(i64, usize)> {
     Some((if neg { -v } else { v }, end))
 }
 
-/// Returns the payload of a bulk-string frame, without validation beyond the
-/// leading type byte.
+/// Returns a bulk-string frame's payload.
 pub fn bulk_payload(frame: &[u8]) -> Option<&[u8]> {
     if frame.first() != Some(&b'$') {
         return None;

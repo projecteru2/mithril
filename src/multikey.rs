@@ -8,8 +8,7 @@ use crate::resp;
 
 pub const SCAN_CURSOR_BITS: u32 = 51;
 
-/// Sub-request for one node: rebuilt command plus the original positions of
-/// the keys it carries.
+/// Sub-request for one slot: rebuilt command plus original key positions.
 pub struct Part {
     pub slot: u16,
     pub addr: String,
@@ -17,8 +16,7 @@ pub struct Part {
     pub positions: Vec<usize>,
 }
 
-/// Groups `keys[i]` by slot (cluster nodes reject multi-key commands whose
-/// keys span slots, even on one node), building one sub-command per slot.
+/// Groups keys per slot (nodes reject cross-slot multi-key commands).
 pub fn split<'k, F>(
     name: &[u8],
     keys: &[&'k [u8]],

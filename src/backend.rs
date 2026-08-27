@@ -43,8 +43,7 @@ pub struct Outbound {
     pub sink: Sink,
 }
 
-// reply matching trusts the backend to stay RESP2 with no unsolicited
-// pushes; enabling HELLO 3 toward backends would break this pairing.
+// reply pairing assumes RESP2 backends: no unsolicited pushes.
 struct Pending {
     expect: u32,
     seq: u64,
@@ -177,10 +176,8 @@ struct Pool {
     exclusive_count: Cell<usize>,
 }
 
-/// Holds one exclusive connection. Dropping a completed lease returns the
-/// connection to the idle pool; dropping an incomplete lease (cancelled
-/// blocking command) releases the quota slot and lets the connection close,
-/// since its pipeline still carries the abandoned command.
+/// Exclusive connection lease; an incomplete drop frees quota instead of
+/// pooling, because the pipeline still carries the abandoned command.
 pub struct ExclusiveLease {
     conn: Rc<Conn>,
     pool: Rc<Pool>,

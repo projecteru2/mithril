@@ -77,8 +77,7 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Parses a config file without resolving derived defaults; call
-    /// [`Config::finish`] after applying CLI overrides.
+    /// Parses a config file; call [`Config::finish`] after CLI overrides.
     pub fn load(path: &str) -> Result<Config, String> {
         let text = fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
         let mut cfg = Config::default();
@@ -121,8 +120,7 @@ impl Config {
         Ok(())
     }
 
-    /// Validates and resolves derived defaults (worker count, announce
-    /// address).
+    /// Validates and resolves derived defaults.
     pub fn finish(mut self) -> Result<Config, String> {
         if self.bootstrap.is_empty() {
             return Err("bootstrap requires at least one seed address".to_string());

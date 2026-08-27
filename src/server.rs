@@ -36,8 +36,7 @@ fn next_epoch() -> u64 {
 /// Set on SIGINT/SIGTERM; accept loops stop taking new connections.
 pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Runs the proxy until SIGINT/SIGTERM; returns an error message on fatal
-/// startup failure.
+/// Runs the proxy until SIGINT/SIGTERM; Err on fatal startup failure.
 pub fn run(cfg: Config) -> Result<(), String> {
     crate::log::set_level(cfg.loglevel);
     let cfg = Arc::new(cfg);

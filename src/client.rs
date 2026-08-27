@@ -206,8 +206,7 @@ impl Session {
         self.send_single(conn, seq, frame).await;
     }
 
-    // one Vec index per request once warm; re-resolves after topology swaps
-    // or connection death.
+    // one Vec index per request once warm; re-resolves on epoch or death.
     fn cached_conn(&self, topo: &Topology, idx: u16, is_replica: bool) -> Rc<crate::backend::Conn> {
         let mut cache = self.conns.borrow_mut();
         if cache.epoch != topo.epoch {
@@ -444,8 +443,7 @@ impl Session {
             let mut redirected: Vec<(multikey::Part, bool, String)> = Vec::new();
             for (part, rx) in parts.into_iter().zip(receivers) {
                 let reply = recv_or_lost(rx).await;
-                // a MOVED/ASK part executed nothing, so one re-routed resend
-                // is idempotent even for writes.
+                // a redirected part executed nothing: one resend is idempotent.
                 match parse_redirect(&reply) {
                     Some((ask, target)) => redirected.push((part, ask, target)),
                     None => results.push((part.positions, reply)),
@@ -875,9 +873,7 @@ impl Session {
         }
     }
 
-    // an in-flight unsubscribe may zero the count microseconds after the
-    // client pipelines its next command; wait briefly for the confirmation
-    // before deciding the session is still subscribed.
+    // waits briefly for an in-flight unsubscribe confirmation before deciding.
     async fn exit_pubsub_if_done(&self) -> bool {
         if !self.pubsub_done.get() && self.unsub_inflight.get() {
             let deadline = tokio::time::Instant::now() + UNSUB_SYNC;
@@ -1291,8 +1287,7 @@ async fn pubsub_relay(
                     }
                     tokio::task::yield_now().await;
                 }
-                // the first confirmation rides normal ordering so it cannot
-                // overtake replies queued before the mode switch.
+                // the first confirmation rides normal ordering.
                 let tagged = match first_seq.take() {
                     Some(seq) => (seq, frame.freeze()),
                     None => {
@@ -1332,11 +1327,9 @@ async fn write_loop(
 ) {
     let _ = proto;
     let mut next_emit: u64 = 0;
-    // protocol flips take effect at the HELLO reply's sequence, so delayed
-    // earlier replies keep the protocol they were requested under.
+    // protocol flips apply at the HELLO reply's sequence, not before.
     let mut cur_proto: u8 = 2;
-    // set when the reader ends; the loop exits once every sequence below it
-    // has been emitted, so a departed client cannot leak the connection.
+    // reader's final sequence; draining to it lets a departed client close.
     let mut close_at: Option<u64> = None;
     let mut parked: BTreeMap<u64, Bytes> = BTreeMap::new();
     let mut batch: Vec<(u64, Bytes)> = Vec::with_capacity(crate::backend::BATCH);
@@ -1391,8 +1384,7 @@ async fn write_loop(
                 .await;
                 continue;
             }
-            // a backend redirect must never reach a client that believes the
-            // proxy owns every slot.
+            // clients believe the proxy owns every slot: never leak redirects.
             let frame = if frame.starts_with(b"-MOVED ") || frame.starts_with(b"-ASK ") {
                 Bytes::from_static(ERR_TRYAGAIN)
             } else {
