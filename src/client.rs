@@ -111,6 +111,10 @@ impl Session {
             self.queue_multi(spec, frame, argc);
             return;
         }
+        if spec.name == "exec" {
+            self.handle_exec().await;
+            return;
+        }
         match spec.kind {
             Kind::Single => self.forward_single(spec, frame, argc).await,
             Kind::Local => self.handle_local(spec, frame, argc).await,
@@ -155,14 +159,7 @@ impl Session {
             self.cached_conn(&topo, idx, is_replica)
         };
         self.track_inflight_entry(seq, &frame);
-        conn.send(Outbound {
-            head: None,
-            frame,
-            expect: 1,
-            seq,
-            sink: Sink::Client(self.reply_tx.clone()),
-        })
-        .await;
+        self.send_single(conn, seq, frame).await;
     }
 
     // one Vec index per request once warm; re-resolves after topology swaps
@@ -213,14 +210,7 @@ impl Session {
             };
             self.cached_conn(&topo, idx, false)
         };
-        conn.send(Outbound {
-            head: None,
-            frame,
-            expect: 1,
-            seq,
-            sink: Sink::Client(self.reply_tx.clone()),
-        })
-        .await;
+        self.send_single(conn, seq, frame).await;
     }
 
     fn any_master_addr(&self) -> Option<String> {
@@ -234,6 +224,17 @@ impl Session {
         let out = f(&mut rng);
         self.rng.set(rng);
         out
+    }
+
+    async fn send_single(&self, conn: Rc<crate::backend::Conn>, seq: u64, frame: Bytes) {
+        conn.send(Outbound {
+            head: None,
+            frame,
+            expect: 1,
+            seq,
+            sink: Sink::Client(self.reply_tx.clone()),
+        })
+        .await;
     }
 
     fn track_inflight_entry(&self, seq: u64, frame: &Bytes) {
@@ -275,14 +276,7 @@ impl Session {
         };
         self.track_inflight_entry(seq, &frame);
         let conn = self.shared.backends.shared(&addr, self.id, false);
-        conn.send(Outbound {
-            head: None,
-            frame,
-            expect: 1,
-            seq,
-            sink: Sink::Client(self.reply_tx.clone()),
-        })
-        .await;
+        self.send_single(conn, seq, frame).await;
     }
 
     async fn forward_xread(&self, spec: &Spec, frame: Bytes, argc: usize) {
@@ -320,14 +314,7 @@ impl Session {
         };
         self.track_inflight_entry(seq, &frame);
         let conn = self.shared.backends.shared(&addr, self.id, is_replica);
-        conn.send(Outbound {
-            head: None,
-            frame,
-            expect: 1,
-            seq,
-            sink: Sink::Client(self.reply_tx.clone()),
-        })
-        .await;
+        self.send_single(conn, seq, frame).await;
     }
 
     fn forward_blocking(&self, spec: &Spec, frame: Bytes, argc: usize) {
@@ -510,9 +497,7 @@ impl Session {
                 sink: Sink::One(tx),
             })
             .await;
-            let reply = rx
-                .await
-                .unwrap_or_else(|_| Bytes::from_static(ERR_BACKEND_LOST));
+            let reply = recv_or_lost(rx).await;
             let out = match multikey::parse_scan_reply(&reply) {
                 Some((next, keys)) => {
                     let n_masters = shared.topo.load().masters.len();
@@ -694,14 +679,11 @@ impl Session {
                         Some(error_frame_vec("ERR DISCARD without MULTI"))
                     }
                 }
-                "exec" => None,
                 _ => Some(error_frame_vec("ERR unsupported command")),
             }
         };
-        match reply {
-            Some(bytes) => self.emit_local(bytes),
-            None if spec.name == "exec" => self.handle_exec().await,
-            None => {}
+        if let Some(bytes) = reply {
+            self.emit_local(bytes);
         }
     }
 
@@ -1126,9 +1108,7 @@ async fn blocking_round(
         sink: Sink::One(tx),
     })
     .await;
-    let reply = rx
-        .await
-        .unwrap_or_else(|_| Bytes::from_static(ERR_BACKEND_LOST));
+    let reply = recv_or_lost(rx).await;
     shared.backends.put_exclusive(&addr, conn);
     if !retried
         && reply.first() == Some(&b'-')
