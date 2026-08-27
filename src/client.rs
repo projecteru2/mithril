@@ -24,13 +24,14 @@ use crate::topology::Topology;
 use crate::{admin, crc16, route};
 
 pub const MAX_INFLIGHT: usize = 65536;
-pub const READ_CHUNK: usize = 64 * 1024;
+pub const READ_CHUNK: usize = crate::backend::READ_CHUNK;
 /// Sequence for out-of-band frames (pubsub pushes) that bypass ordering.
 pub const SEQ_OOB: u64 = u64::MAX;
 
 const ERR_NOAUTH: &str = "NOAUTH Authentication required.";
 const ERR_CROSSSLOT: &str = "CROSSSLOT Keys in request don't hash to the same slot";
 const ERR_NO_OWNER: &str = "CLUSTERDOWN Hash slot not served";
+const ERR_TRYAGAIN: &[u8] = b"-TRYAGAIN slot is migrating, retry later\r\n";
 
 /// Everything a session needs from its worker.
 pub struct Shared {
@@ -50,6 +51,7 @@ struct InFlight {
 
 type InflightMap = Rc<RefCell<HashMap<u64, InFlight>>>;
 type ReplyTx = mpsc::UnboundedSender<(u64, Bytes)>;
+type Emitted = Rc<Cell<u64>>;
 
 struct Session {
     shared: Rc<Shared>,
@@ -80,20 +82,16 @@ impl Session {
         }
         let spec = {
             let mut it = resp::Args::new(&frame, argc);
-            match it.next().map(command::lookup) {
-                Some(Some(spec)) => spec,
-                Some(None) => {
-                    let name = {
-                        let mut it = resp::Args::new(&frame, argc);
-                        it.next().map(|n| String::from_utf8_lossy(n).into_owned())
-                    };
-                    self.emit_error(&format!(
-                        "ERR unknown command '{}'",
-                        name.unwrap_or_default()
-                    ));
+            let Some(name) = it.next() else {
+                return;
+            };
+            match command::lookup(name) {
+                Some(spec) => spec,
+                None => {
+                    let name = String::from_utf8_lossy(name).into_owned();
+                    self.emit_error(&format!("ERR unknown command '{name}'"));
                     return;
                 }
-                None => return,
             }
         };
         if !spec.arity_ok(argc) {
@@ -123,7 +121,7 @@ impl Session {
             Kind::Xread => self.forward_xread(spec, frame, argc).await,
             Kind::Subscribe => self.enter_pubsub(frame).await,
             Kind::Scan => self.run_scan(&frame, argc),
-            Kind::Dbsize => self.run_broadcast(b"DBSIZE", Merge::Sum),
+            Kind::Dbsize => self.run_broadcast_frame(frame, Merge::Sum),
             Kind::Flushall => self.run_broadcast_frame(frame, Merge::Ok),
         }
     }
@@ -141,15 +139,15 @@ impl Session {
         let seq = self.alloc_seq();
         let conn = {
             let topo = self.shared.topo.load();
-            let mut rng = self.rng.get();
-            let picked = route::pick(
-                &topo,
-                slot,
-                spec.is_readonly(),
-                self.shared.cfg.slave_mode,
-                &mut rng,
-            );
-            self.rng.set(rng);
+            let picked = self.with_rng(|r| {
+                route::pick(
+                    &topo,
+                    slot,
+                    spec.is_readonly(),
+                    self.shared.cfg.slave_mode,
+                    r,
+                )
+            });
             let Some((idx, is_replica)) = picked else {
                 self.emit_at(seq, error_frame(ERR_NO_OWNER));
                 return;
@@ -194,11 +192,8 @@ impl Session {
 
     fn pick_addr(&self, slot: u16, readonly: bool) -> Option<(String, bool)> {
         let topo = self.shared.topo.load();
-        let mut rng = self.rng.get();
-        let picked = route::pick(&topo, slot, readonly, self.shared.cfg.slave_mode, &mut rng)
-            .map(|(i, r)| (topo.nodes[i as usize].addr.clone(), r));
-        self.rng.set(rng);
-        picked
+        self.with_rng(|r| route::pick(&topo, slot, readonly, self.shared.cfg.slave_mode, r))
+            .map(|(i, is_replica)| (topo.nodes[i as usize].addr.clone(), is_replica))
     }
 
     fn master_addr(&self, slot: u16) -> Option<String> {
@@ -211,9 +206,7 @@ impl Session {
         let seq = self.alloc_seq();
         let conn = {
             let topo = self.shared.topo.load();
-            let mut rng = self.rng.get();
-            let picked = route::any_master(&topo, &mut rng);
-            self.rng.set(rng);
+            let picked = self.with_rng(|r| route::any_master(&topo, r));
             let Some(idx) = picked else {
                 self.emit_at(seq, error_frame(ERR_NO_OWNER));
                 return;
@@ -232,10 +225,15 @@ impl Session {
 
     fn any_master_addr(&self) -> Option<String> {
         let topo = self.shared.topo.load();
+        let idx = self.with_rng(|r| route::any_master(&topo, r))?;
+        Some(topo.nodes[idx as usize].addr.clone())
+    }
+
+    fn with_rng<R>(&self, f: impl FnOnce(&mut u64) -> R) -> R {
         let mut rng = self.rng.get();
-        let a = route::any_master(&topo, &mut rng).map(|i| topo.nodes[i as usize].addr.clone());
+        let out = f(&mut rng);
         self.rng.set(rng);
-        a
+        out
     }
 
     fn track_inflight_entry(&self, seq: u64, frame: &Bytes) {
@@ -357,30 +355,26 @@ impl Session {
         let seq = self.alloc_seq();
         let readonly = spec.is_readonly();
         let mode = self.shared.cfg.slave_mode;
+        if spec.kind == Kind::Mset && !(argc - 1).is_multiple_of(2) {
+            self.emit_at(
+                seq,
+                error_frame("ERR wrong number of arguments for 'mset' command"),
+            );
+            return;
+        }
         let split = {
             let args = collect_args(frame, argc);
-            let (keys, values): (Vec<&[u8]>, Option<Vec<&[u8]>>) = if spec.kind == Kind::Mset {
-                let ks = args[1..].iter().step_by(2).copied().collect();
-                let vs = args[2..].iter().step_by(2).copied().collect();
-                (ks, Some(vs))
-            } else {
-                (args[1..].to_vec(), None)
-            };
-            if spec.kind == Kind::Mset && !(argc - 1).is_multiple_of(2) {
-                self.emit_at(
-                    seq,
-                    error_frame("ERR wrong number of arguments for 'mset' command"),
-                );
-                return;
-            }
+            let keys: Vec<&[u8]> = key_indices(spec, argc).map(|i| args[i]).collect();
+            let values: Option<Vec<&[u8]>> =
+                (spec.step == 2).then(|| key_indices(spec, argc).map(|i| args[i + 1]).collect());
             let total = keys.len();
-            let mut rng = self.rng.get();
             let topo = self.shared.topo.load();
-            let parts = multikey::split(spec.name.as_bytes(), &keys, values.as_deref(), |slot| {
-                route::pick(&topo, slot, readonly, mode, &mut rng)
-                    .map(|(i, _)| topo.nodes[i as usize].addr.clone())
+            let parts = self.with_rng(|rng| {
+                multikey::split(spec.name.as_bytes(), &keys, values.as_deref(), |slot| {
+                    route::pick(&topo, slot, readonly, mode, rng)
+                        .map(|(i, _)| topo.nodes[i as usize].addr.clone())
+                })
             });
-            self.rng.set(rng);
             parts.map(|p| (p, total))
         };
         let (parts, total) = match split {
@@ -411,23 +405,26 @@ impl Session {
                 receivers.push(rx);
             }
             let mut results: Vec<(Vec<usize>, Bytes)> = Vec::with_capacity(parts.len());
-            let mut redirected: Vec<multikey::Part> = Vec::new();
+            let mut redirected: Vec<(multikey::Part, bool, String)> = Vec::new();
             for (part, rx) in parts.into_iter().zip(receivers) {
                 let reply = recv_or_lost(rx).await;
                 // a MOVED/ASK part executed nothing, so one re-routed resend
                 // is idempotent even for writes.
-                if reply.starts_with(b"-MOVED ") || reply.starts_with(b"-ASK ") {
-                    redirected.push(part);
-                } else {
-                    results.push((part.positions, reply));
+                match parse_redirect(&reply) {
+                    Some((ask, target)) => redirected.push((part, ask, target)),
+                    None => results.push((part.positions, reply)),
                 }
             }
             if !redirected.is_empty() {
                 let _ = shared.refresh.send(());
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                if redirected.iter().any(|(_, ask, _)| !ask) {
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
                 let mut retries = Vec::with_capacity(redirected.len());
-                for part in &redirected {
-                    let addr = {
+                for (part, ask, target) in &redirected {
+                    let addr = if *ask {
+                        Some(target.clone())
+                    } else {
                         let topo = shared.topo.load();
                         topo.owner(part.slot)
                             .map(|i| topo.nodes[i as usize].addr.clone())
@@ -437,9 +434,9 @@ impl Session {
                         Some(addr) => {
                             let conn = shared.backends.shared(&addr, id, false);
                             conn.send(Outbound {
-                                head: None,
+                                head: ask.then(|| Bytes::from_static(ASKING_FRAME)),
                                 frame: part.frame.clone(),
-                                expect: 1,
+                                expect: if *ask { 2 } else { 1 },
                                 seq: 0,
                                 sink: Sink::One(tx),
                             })
@@ -449,17 +446,16 @@ impl Session {
                     }
                     retries.push(rx);
                 }
-                for (part, rx) in redirected.into_iter().zip(retries) {
-                    let reply = rx
-                        .await
-                        .unwrap_or_else(|_| Bytes::from_static(ERR_BACKEND_LOST));
+                for ((part, _, _), rx) in redirected.into_iter().zip(retries) {
+                    let reply = recv_or_lost(rx).await;
                     results.push((part.positions, reply));
                 }
             }
             let merged = match kind {
                 Kind::Mget => multikey::merge_mget(total, &results),
                 Kind::Mset => multikey::merge_ok(&results),
-                _ => multikey::merge_sum(&results),
+                Kind::MultiSum => multikey::merge_sum(&results),
+                _ => unreachable!("fan_out only handles multi-key kinds"),
             };
             let out = match merged {
                 Ok(bytes) => Bytes::from(bytes),
@@ -535,12 +531,6 @@ impl Session {
             };
             let _ = reply_tx.send((seq, out));
         });
-    }
-
-    fn run_broadcast(&self, name: &'static [u8], merge: Merge) {
-        let mut cmd = Vec::new();
-        resp::write_command(&mut cmd, &[name]);
-        self.run_broadcast_frame(Bytes::from(cmd), merge);
     }
 
     fn run_broadcast_frame(&self, frame: Bytes, merge: Merge) {
@@ -901,6 +891,9 @@ impl Session {
                 .as_ref()
                 .is_some_and(|ps| ps.tx.send(frame).is_ok());
             if !sent {
+                if let Some(ps) = self.pubsub.borrow_mut().take() {
+                    ps.task.abort();
+                }
                 self.emit_error("ERR pubsub backend connection lost");
             }
         } else {
@@ -954,6 +947,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
     let (reply_tx, reply_rx) = mpsc::unbounded_channel();
     let inflight: InflightMap = Rc::new(RefCell::new(HashMap::new()));
     let proto = Rc::new(Cell::new(2u8));
+    let emitted: Emitted = Rc::new(Cell::new(0));
 
     let session = Session {
         shared: shared.clone(),
@@ -983,6 +977,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         reply_tx.clone(),
         close_rx,
         inflight,
+        emitted.clone(),
         proto,
         id,
     ));
@@ -1020,7 +1015,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
             session.emit_error("ERR query buffer exceeds limit");
             break;
         }
-        while session.inflight.borrow().len() > MAX_INFLIGHT {
+        while session.next_seq.get().saturating_sub(emitted.get()) > MAX_INFLIGHT as u64 {
             tokio::task::yield_now().await;
         }
         match read_half.read_buf(&mut buf).await {
@@ -1217,6 +1212,7 @@ async fn write_loop(
     reply_tx: ReplyTx,
     mut close_rx: oneshot::Receiver<u64>,
     inflight: InflightMap,
+    emitted: Emitted,
     proto: Rc<Cell<u8>>,
     client_id: u64,
 ) {
@@ -1275,6 +1271,13 @@ async fn write_loop(
                 .await;
                 continue;
             }
+            // a backend redirect must never reach a client that believes the
+            // proxy owns every slot.
+            let frame = if frame.starts_with(b"-MOVED ") || frame.starts_with(b"-ASK ") {
+                Bytes::from_static(ERR_TRYAGAIN)
+            } else {
+                frame
+            };
             if seq == next_emit {
                 inflight.borrow_mut().remove(&seq);
                 ready.push(convert_nil(frame, proto.get()));
@@ -1288,6 +1291,7 @@ async fn write_loop(
             ready.push(convert_nil(frame, proto.get()));
             next_emit += 1;
         }
+        emitted.set(next_emit);
         if !ready.is_empty() {
             let mut total = 0usize;
             let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(ready.len());

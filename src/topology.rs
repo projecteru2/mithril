@@ -14,12 +14,6 @@ pub struct Node {
     pub replicas: Vec<u16>,
 }
 
-impl Node {
-    pub fn is_master(&self) -> bool {
-        self.master.is_none()
-    }
-}
-
 /// Immutable snapshot of cluster topology, swapped atomically on refresh.
 #[derive(Debug)]
 pub struct Topology {
@@ -27,7 +21,6 @@ pub struct Topology {
     pub nodes: Vec<Node>,
     pub slots: Vec<u16>,
     pub masters: Vec<u16>,
-    pub raw: String,
 }
 
 impl Topology {
@@ -109,7 +102,6 @@ impl Topology {
             nodes,
             slots,
             masters,
-            raw: raw.to_string(),
         })
     }
 

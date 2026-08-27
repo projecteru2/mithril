@@ -5,6 +5,15 @@ use std::fs;
 
 pub const DEFAULT_PORT: u16 = 7979;
 
+const BYTE_UNITS: &[(&str, usize)] = &[
+    ("gb", 1 << 30),
+    ("g", 1 << 30),
+    ("mb", 1 << 20),
+    ("m", 1 << 20),
+    ("kb", 1 << 10),
+    ("k", 1 << 10),
+];
+
 /// Replica read routing mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlaveMode {
@@ -153,16 +162,10 @@ fn parse_slave_mode(value: &str) -> Result<SlaveMode, String> {
 
 fn parse_bytes(key: &str, value: &str) -> Result<usize, String> {
     let lower = value.to_ascii_lowercase();
-    let (digits, mult) = match lower.strip_suffix("gb").or_else(|| lower.strip_suffix('g')) {
-        Some(d) => (d, 1 << 30),
-        None => match lower.strip_suffix("mb").or_else(|| lower.strip_suffix('m')) {
-            Some(d) => (d, 1 << 20),
-            None => match lower.strip_suffix("kb").or_else(|| lower.strip_suffix('k')) {
-                Some(d) => (d, 1 << 10),
-                None => (lower.as_str(), 1),
-            },
-        },
-    };
+    let (digits, mult) = BYTE_UNITS
+        .iter()
+        .find_map(|&(suffix, mult)| lower.strip_suffix(suffix).map(|d| (d, mult)))
+        .unwrap_or((lower.as_str(), 1));
     let n: usize = parse(key, digits.trim())?;
     Ok(n * mult)
 }

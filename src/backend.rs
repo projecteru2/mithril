@@ -43,6 +43,8 @@ pub struct Outbound {
     pub sink: Sink,
 }
 
+// reply matching trusts the backend to stay RESP2 with no unsolicited
+// pushes; enabling HELLO 3 toward backends would break this pairing.
 struct Pending {
     expect: u32,
     seq: u64,

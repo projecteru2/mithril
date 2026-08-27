@@ -5,7 +5,7 @@
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::command::{FLAG_READONLY, FLAG_WRITE, Spec};
+use crate::command::Spec;
 use crate::config::Config;
 use crate::crc16::{self, SLOTS};
 use crate::resp;
@@ -124,11 +124,11 @@ fn command_entry(out: &mut Vec<u8>, spec: &Spec) {
     bulk(out, spec.name.as_bytes());
     integer(out, i64::from(spec.arity));
     let mut flags: Vec<&[u8]> = Vec::new();
-    if spec.flags & FLAG_WRITE != 0 {
+    if spec.is_write() {
         flags.push(b"write");
         flags.push(b"denyoom");
     }
-    if spec.flags & FLAG_READONLY != 0 {
+    if spec.is_readonly() {
         flags.push(b"readonly");
     }
     out.push(b'*');
