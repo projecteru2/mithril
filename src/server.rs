@@ -22,6 +22,10 @@ use crate::{log_notice, log_warn, resp};
 
 pub const REFRESH_DEBOUNCE: Duration = Duration::from_millis(100);
 pub const BOOTSTRAP_RETRY: Duration = Duration::from_secs(1);
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Set on SIGINT/SIGTERM; accept loops stop taking new connections.
+pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Runs the proxy until SIGINT/SIGTERM; returns an error message on fatal
 /// startup failure.
@@ -68,7 +72,16 @@ pub fn run(cfg: Config) -> Result<(), String> {
     }
 
     wait_for_signal();
-    log_notice!("shutting down");
+    log_notice!("shutting down: draining clients");
+    SHUTTING_DOWN.store(true, Ordering::Relaxed);
+    let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
+    while stats.clients.load(Ordering::Relaxed) > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let left = stats.clients.load(Ordering::Relaxed);
+    if left > 0 {
+        log_warn!("drain timeout with {left} clients still connected");
+    }
     std::process::exit(0);
 }
 
@@ -138,7 +151,19 @@ fn worker_thread(
         });
         let mut next_client: u64 = worker as u64;
         loop {
-            let (stream, _) = match listener.accept().await {
+            let accepted = tokio::select! {
+                a = listener.accept() => a,
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                    if SHUTTING_DOWN.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            if SHUTTING_DOWN.load(Ordering::Relaxed) {
+                return;
+            }
+            let (stream, _) = match accepted {
                 Ok(v) => v,
                 Err(_) => continue,
             };
