@@ -54,7 +54,36 @@ struct InFlight {
 type InflightMap = Rc<RefCell<HashMap<u64, InFlight>>>;
 type ReplyTx = mpsc::UnboundedSender<(u64, Bytes)>;
 type Emitted = Rc<Cell<u64>>;
-type ProtoSwitches = Rc<RefCell<std::collections::VecDeque<(u64, u8)>>>;
+type ProtoSwitches = Rc<ProtoSwitchQueue>;
+
+/// Pending protocol flips; `armed` keeps the hot path off the RefCell.
+#[derive(Default)]
+pub struct ProtoSwitchQueue {
+    armed: Cell<usize>,
+    queue: RefCell<std::collections::VecDeque<(u64, u8)>>,
+}
+
+impl ProtoSwitchQueue {
+    fn push(&self, at: u64, proto: u8) {
+        self.queue.borrow_mut().push_back((at, proto));
+        self.armed.set(self.armed.get() + 1);
+    }
+
+    fn apply(&self, seq: u64, cur: &mut u8) {
+        if self.armed.get() == 0 {
+            return;
+        }
+        let mut q = self.queue.borrow_mut();
+        while let Some(&(at, p)) = q.front() {
+            if at > seq {
+                break;
+            }
+            *cur = p;
+            q.pop_front();
+            self.armed.set(self.armed.get() - 1);
+        }
+    }
+}
 
 struct Session {
     shared: Rc<Shared>,
@@ -795,9 +824,7 @@ impl Session {
             return;
         }
         self.proto.set(proto);
-        self.proto_switches
-            .borrow_mut()
-            .push_back((self.next_seq.get(), proto));
+        self.proto_switches.push(self.next_seq.get(), proto);
         let mut out = Vec::new();
         if proto >= 3 {
             out.extend_from_slice(b"%7\r\n");
@@ -951,7 +978,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
     let inflight: InflightMap = Rc::new(RefCell::new(HashMap::new()));
     let proto = Rc::new(Cell::new(2u8));
     let emitted: Emitted = Rc::new(Cell::new(0));
-    let proto_switches: ProtoSwitches = Rc::new(RefCell::new(std::collections::VecDeque::new()));
+    let proto_switches: ProtoSwitches = Rc::new(ProtoSwitchQueue::default());
     let oob_budget: Rc<Cell<usize>> = Rc::new(Cell::new(0));
 
     let session = Session {
@@ -1320,7 +1347,7 @@ async fn write_loop(
             };
             if seq == next_emit {
                 inflight.borrow_mut().remove(&seq);
-                apply_proto_switch(&proto_switches, next_emit, &mut cur_proto);
+                proto_switches.apply(next_emit, &mut cur_proto);
                 ready.push(convert_nil(frame, cur_proto));
                 next_emit += 1;
             } else {
@@ -1329,7 +1356,7 @@ async fn write_loop(
         }
         while let Some(frame) = parked.remove(&next_emit) {
             inflight.borrow_mut().remove(&next_emit);
-            apply_proto_switch(&proto_switches, next_emit, &mut cur_proto);
+            proto_switches.apply(next_emit, &mut cur_proto);
             ready.push(convert_nil(frame, cur_proto));
             next_emit += 1;
         }
@@ -1386,17 +1413,6 @@ fn subscription_count(frame: &[u8]) -> Option<i64> {
         return None;
     }
     multikey::parse_int(items[2])
-}
-
-fn apply_proto_switch(switches: &ProtoSwitches, seq: u64, cur: &mut u8) {
-    let mut sw = switches.borrow_mut();
-    while let Some(&(at, p)) = sw.front() {
-        if at > seq {
-            break;
-        }
-        *cur = p;
-        sw.pop_front();
-    }
 }
 
 fn convert_nil(frame: Bytes, proto: u8) -> Bytes {
