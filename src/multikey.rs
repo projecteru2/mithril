@@ -7,6 +7,7 @@ use crate::resp;
 /// Sub-request for one node: rebuilt command plus the original positions of
 /// the keys it carries.
 pub struct Part {
+    pub slot: u16,
     pub addr: String,
     pub frame: Vec<u8>,
     pub positions: Vec<usize>,
@@ -44,13 +45,14 @@ where
     }
     Ok(parts
         .into_iter()
-        .map(|(_, addr, args, positions)| {
+        .map(|(slot, addr, args, positions)| {
             let mut all: Vec<&[u8]> = Vec::with_capacity(args.len() + 1);
             all.push(name);
             all.extend_from_slice(&args);
             let mut frame = Vec::new();
             resp::write_command(&mut frame, &all);
             Part {
+                slot,
                 addr,
                 frame,
                 positions,

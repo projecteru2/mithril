@@ -479,11 +479,52 @@ impl Session {
                 receivers.push(rx);
             }
             let mut results: Vec<(Vec<usize>, Bytes)> = Vec::with_capacity(parts.len());
+            let mut redirected: Vec<multikey::Part> = Vec::new();
             for (part, rx) in parts.into_iter().zip(receivers) {
                 let reply = rx
                     .await
                     .unwrap_or_else(|_| Bytes::from_static(ERR_BACKEND_LOST));
-                results.push((part.positions, reply));
+                // a MOVED/ASK part executed nothing, so one re-routed resend
+                // is idempotent even for writes.
+                if reply.starts_with(b"-MOVED ") || reply.starts_with(b"-ASK ") {
+                    redirected.push(part);
+                } else {
+                    results.push((part.positions, reply));
+                }
+            }
+            if !redirected.is_empty() {
+                let _ = shared.refresh.send(());
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                let mut retries = Vec::with_capacity(redirected.len());
+                for part in &redirected {
+                    let addr = {
+                        let topo = shared.topo.load();
+                        topo.owner(part.slot)
+                            .map(|i| topo.nodes[i as usize].addr.clone())
+                    };
+                    let (tx, rx) = oneshot::channel();
+                    match addr {
+                        Some(addr) => {
+                            let conn = shared.backends.shared(&addr, id, false);
+                            conn.send(Outbound {
+                                head: None,
+                                frame: Bytes::from(part.frame.clone()),
+                                expect: 1,
+                                seq: 0,
+                                sink: Sink::One(tx),
+                            })
+                            .await;
+                        }
+                        None => drop(tx),
+                    }
+                    retries.push(rx);
+                }
+                for (part, rx) in redirected.into_iter().zip(retries) {
+                    let reply = rx
+                        .await
+                        .unwrap_or_else(|_| Bytes::from_static(ERR_BACKEND_LOST));
+                    results.push((part.positions, reply));
+                }
             }
             let merged = match kind {
                 Kind::Mget => multikey::merge_mget(total, &results),
