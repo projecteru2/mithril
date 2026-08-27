@@ -80,12 +80,6 @@ pub struct Backends {
     pools: RefCell<HashMap<Box<str>, Rc<Pool>>>,
 }
 
-struct Pool {
-    shared: RefCell<Vec<Rc<Conn>>>,
-    idle_exclusive: RefCell<Vec<Rc<Conn>>>,
-    exclusive_count: Cell<usize>,
-}
-
 impl Backends {
     pub fn new(cfg: Rc<Config>) -> Rc<Backends> {
         Rc::new(Backends {
@@ -170,6 +164,12 @@ impl Backends {
     }
 }
 
+struct Pool {
+    shared: RefCell<Vec<Rc<Conn>>>,
+    idle_exclusive: RefCell<Vec<Rc<Conn>>>,
+    exclusive_count: Cell<usize>,
+}
+
 async fn run_conn(
     addr: &str,
     mut rx: mpsc::Receiver<Outbound>,
@@ -245,7 +245,7 @@ async fn run_conn(
                     frames.push(out.frame);
                 }
                 let mut slices: Vec<IoSlice<'_>> = frames.iter().map(|f| IoSlice::new(f)).collect();
-                if write_vectored_all(&mut write_half, &mut slices).await.is_err() {
+                if write_slices(&mut write_half, &mut slices).await.is_err() {
                     break 'io;
                 }
             }
@@ -367,11 +367,4 @@ pub async fn write_slices<W: tokio::io::AsyncWrite + Unpin>(
         IoSlice::advance_slices(&mut rest, n);
     }
     Ok(())
-}
-
-async fn write_vectored_all(
-    w: &mut OwnedWriteHalf,
-    slices: &mut [IoSlice<'_>],
-) -> std::io::Result<()> {
-    write_slices(w, slices).await
 }

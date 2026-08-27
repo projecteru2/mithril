@@ -5,6 +5,8 @@ pub const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
 pub const MAX_INLINE_LEN: usize = 64 * 1024;
 pub const MAX_DEPTH: usize = 32;
 pub const MAX_ARGC: usize = 1024 * 1024;
+pub const MAX_INT_DIGITS: usize = 18;
+pub const DEC_BUF: usize = 20;
 
 pub const NIL_BULK: &[u8] = b"$-1\r\n";
 pub const NIL_ARRAY: &[u8] = b"*-1\r\n";
@@ -222,14 +224,14 @@ fn scan_bulk(buf: &[u8], pos: usize) -> BulkScan {
 }
 
 // i64::MIN marks a malformed integer line; every caller rejects negatives.
-fn scan_int_line(buf: &[u8], pos: usize) -> Option<(i64, usize)> {
+pub(crate) fn scan_int_line(buf: &[u8], pos: usize) -> Option<(i64, usize)> {
     let end = find_crlf(buf, pos)?;
     let line = &buf[pos..pos + (end - pos) - 2];
     let (neg, digits) = match line.first() {
         Some(b'-') => (true, &line[1..]),
         _ => (false, line),
     };
-    if digits.is_empty() || digits.len() > 18 {
+    if digits.is_empty() || digits.len() > MAX_INT_DIGITS {
         return Some((i64::MIN, end));
     }
     let mut v: i64 = 0;
@@ -242,6 +244,26 @@ fn scan_int_line(buf: &[u8], pos: usize) -> Option<(i64, usize)> {
     Some((if neg { -v } else { v }, end))
 }
 
+/// Returns the payload of a bulk-string frame, without validation beyond the
+/// leading type byte.
+pub fn bulk_payload(frame: &[u8]) -> Option<&[u8]> {
+    if frame.first() != Some(&b'$') {
+        return None;
+    }
+    let start = frame.iter().position(|&b| b == b'\n')? + 1;
+    frame.get(start..frame.len().saturating_sub(2))
+}
+
+/// Appends a signed RESP integer payload in decimal.
+pub(crate) fn push_i64(out: &mut Vec<u8>, n: i64) {
+    if n < 0 {
+        out.push(b'-');
+        push_usize(out, n.unsigned_abs() as usize);
+    } else {
+        push_usize(out, n as usize);
+    }
+}
+
 fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
     let rel = buf.get(from..)?.iter().position(|&b| b == b'\n')?;
     let end = from + rel + 1;
@@ -251,8 +273,8 @@ fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
     Some(end)
 }
 
-fn push_usize(out: &mut Vec<u8>, mut n: usize) {
-    let mut tmp = [0u8; 20];
+pub(crate) fn push_usize(out: &mut Vec<u8>, mut n: usize) {
+    let mut tmp = [0u8; DEC_BUF];
     let mut i = tmp.len();
     loop {
         i -= 1;

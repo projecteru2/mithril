@@ -48,14 +48,14 @@ struct InFlight {
     retried: bool,
 }
 
-type Inflight = Rc<RefCell<HashMap<u64, InFlight>>>;
+type InflightMap = Rc<RefCell<HashMap<u64, InFlight>>>;
 type ReplyTx = mpsc::UnboundedSender<(u64, Bytes)>;
 
 struct Session {
     shared: Rc<Shared>,
     id: u64,
     reply_tx: ReplyTx,
-    inflight: Inflight,
+    inflight: InflightMap,
     proto: Rc<Cell<u8>>,
     authed: Cell<bool>,
     name: RefCell<String>,
@@ -66,120 +66,6 @@ struct Session {
     blocking: RefCell<Vec<(u64, tokio::task::JoinHandle<()>)>>,
     closing: Cell<bool>,
     conns: RefCell<ConnCache>,
-}
-
-/// Per-session resolved connections, valid for one topology epoch.
-struct ConnCache {
-    epoch: u64,
-    by_node: Vec<Option<Rc<crate::backend::Conn>>>,
-}
-
-struct MultiState {
-    slot: Option<u16>,
-    frames: Vec<Bytes>,
-    aborted: bool,
-}
-
-struct PubsubHandle {
-    tx: mpsc::UnboundedSender<Bytes>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-/// Serves one client connection to completion.
-pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
-    if stream.set_nodelay(true).is_err() {
-        return;
-    }
-    let (mut read_half, write_half) = stream.into_split();
-    let (reply_tx, reply_rx) = mpsc::unbounded_channel();
-    let inflight: Inflight = Rc::new(RefCell::new(HashMap::new()));
-    let proto = Rc::new(Cell::new(2u8));
-
-    let session = Session {
-        shared: shared.clone(),
-        id,
-        reply_tx: reply_tx.clone(),
-        inflight: inflight.clone(),
-        proto: proto.clone(),
-        authed: Cell::new(shared.cfg.requirepass.is_empty()),
-        name: RefCell::new(String::new()),
-        next_seq: Cell::new(0),
-        rng: Cell::new(id | 1),
-        multi: RefCell::new(None),
-        pubsub: RefCell::new(None),
-        blocking: RefCell::new(Vec::new()),
-        closing: Cell::new(false),
-        conns: RefCell::new(ConnCache {
-            epoch: 0,
-            by_node: Vec::new(),
-        }),
-    };
-
-    let (close_tx, close_rx) = oneshot::channel::<u64>();
-    let writer = tokio::task::spawn_local(write_loop(
-        shared.clone(),
-        write_half,
-        reply_rx,
-        reply_tx.clone(),
-        close_rx,
-        inflight,
-        proto,
-        id,
-    ));
-
-    let mut buf = BytesMut::with_capacity(READ_CHUNK);
-    'main: loop {
-        loop {
-            match resp::scan_request(&buf) {
-                ReqScan::Complete { len, argc } => {
-                    let frame = buf.split_to(len).freeze();
-                    session.dispatch(frame, argc).await;
-                }
-                ReqScan::Inline { len } => {
-                    let line = buf.split_to(len);
-                    let args = resp::split_inline(&line);
-                    let argc = args.len();
-                    if argc > 0 {
-                        let mut rebuilt = Vec::new();
-                        resp::write_command(&mut rebuilt, &args);
-                        drop(args);
-                        session.dispatch(Bytes::from(rebuilt), argc).await;
-                    }
-                }
-                ReqScan::Invalid(e) => {
-                    session.emit_error(&format!("ERR Protocol error: {e}"));
-                    break 'main;
-                }
-                ReqScan::Incomplete => break,
-            }
-            if session.closing.get() {
-                break 'main;
-            }
-        }
-        if buf.len() > shared.cfg.query_buffer_limit {
-            session.emit_error("ERR query buffer exceeds limit");
-            break;
-        }
-        while session.inflight.borrow().len() > MAX_INFLIGHT {
-            tokio::task::yield_now().await;
-        }
-        match read_half.read_buf(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => stats::add(&shared.stats.workers[shared.worker].bytes_in, n as u64),
-        }
-    }
-    if let Some(ps) = session.pubsub.borrow_mut().take() {
-        ps.task.abort();
-    }
-    for (seq, task) in session.blocking.borrow_mut().drain(..) {
-        task.abort();
-        let _ = reply_tx.send((seq, Bytes::from_static(ERR_BACKEND_LOST)));
-    }
-    let final_seq = session.next_seq.get();
-    drop(session);
-    drop(reply_tx);
-    let _ = close_tx.send(final_seq);
-    let _ = writer.await;
 }
 
 impl Session {
@@ -270,13 +156,7 @@ impl Session {
             };
             self.cached_conn(&topo, idx, is_replica)
         };
-        self.inflight.borrow_mut().insert(
-            seq,
-            InFlight {
-                frame: frame.clone(),
-                retried: false,
-            },
-        );
+        self.track_inflight_entry(seq, &frame);
         conn.send(Outbound {
             head: None,
             frame,
@@ -329,18 +209,17 @@ impl Session {
 
     async fn forward_any_master(&self, frame: Bytes) {
         let seq = self.alloc_seq();
-        let addr = {
+        let conn = {
             let topo = self.shared.topo.load();
             let mut rng = self.rng.get();
-            let a = route::any_master(&topo, &mut rng).map(|i| topo.nodes[i as usize].addr.clone());
+            let picked = route::any_master(&topo, &mut rng);
             self.rng.set(rng);
-            a
+            let Some(idx) = picked else {
+                self.emit_at(seq, error_frame(ERR_NO_OWNER));
+                return;
+            };
+            self.cached_conn(&topo, idx, false)
         };
-        let Some(addr) = addr else {
-            self.emit_at(seq, error_frame(ERR_NO_OWNER));
-            return;
-        };
-        let conn = self.shared.backends.shared(&addr, self.id, false);
         conn.send(Outbound {
             head: None,
             frame,
@@ -349,6 +228,24 @@ impl Session {
             sink: Sink::Client(self.reply_tx.clone()),
         })
         .await;
+    }
+
+    fn any_master_addr(&self) -> Option<String> {
+        let topo = self.shared.topo.load();
+        let mut rng = self.rng.get();
+        let a = route::any_master(&topo, &mut rng).map(|i| topo.nodes[i as usize].addr.clone());
+        self.rng.set(rng);
+        a
+    }
+
+    fn track_inflight_entry(&self, seq: u64, frame: &Bytes) {
+        self.inflight.borrow_mut().insert(
+            seq,
+            InFlight {
+                frame: frame.clone(),
+                retried: false,
+            },
+        );
     }
 
     async fn forward_eval(&self, frame: Bytes, argc: usize) {
@@ -378,13 +275,7 @@ impl Session {
             self.emit_at(seq, error_frame(ERR_NO_OWNER));
             return;
         };
-        self.inflight.borrow_mut().insert(
-            seq,
-            InFlight {
-                frame: frame.clone(),
-                retried: false,
-            },
-        );
+        self.track_inflight_entry(seq, &frame);
         let conn = self.shared.backends.shared(&addr, self.id, false);
         conn.send(Outbound {
             head: None,
@@ -429,13 +320,7 @@ impl Session {
             self.emit_at(seq, error_frame(ERR_NO_OWNER));
             return;
         };
-        self.inflight.borrow_mut().insert(
-            seq,
-            InFlight {
-                frame: frame.clone(),
-                retried: false,
-            },
-        );
+        self.track_inflight_entry(seq, &frame);
         let conn = self.shared.backends.shared(&addr, self.id, is_replica);
         conn.send(Outbound {
             head: None,
@@ -490,10 +375,9 @@ impl Session {
             }
             let total = keys.len();
             let mut rng = self.rng.get();
-            let name_upper = spec.name.to_ascii_uppercase();
             let topo = self.shared.topo.load();
-            let parts = multikey::split(name_upper.as_bytes(), &keys, values.as_deref(), |k| {
-                route::pick(&topo, crc16::slot(k), readonly, mode, &mut rng)
+            let parts = multikey::split(spec.name.as_bytes(), &keys, values.as_deref(), |slot| {
+                route::pick(&topo, slot, readonly, mode, &mut rng)
                     .map(|(i, _)| topo.nodes[i as usize].addr.clone())
             });
             self.rng.set(rng);
@@ -518,7 +402,7 @@ impl Session {
                 let conn = shared.backends.shared(&part.addr, id, flag_readonly);
                 conn.send(Outbound {
                     head: None,
-                    frame: Bytes::from(part.frame.clone()),
+                    frame: part.frame.clone(),
                     expect: 1,
                     seq: 0,
                     sink: Sink::One(tx),
@@ -529,9 +413,7 @@ impl Session {
             let mut results: Vec<(Vec<usize>, Bytes)> = Vec::with_capacity(parts.len());
             let mut redirected: Vec<multikey::Part> = Vec::new();
             for (part, rx) in parts.into_iter().zip(receivers) {
-                let reply = rx
-                    .await
-                    .unwrap_or_else(|_| Bytes::from_static(ERR_BACKEND_LOST));
+                let reply = recv_or_lost(rx).await;
                 // a MOVED/ASK part executed nothing, so one re-routed resend
                 // is idempotent even for writes.
                 if reply.starts_with(b"-MOVED ") || reply.starts_with(b"-ASK ") {
@@ -556,7 +438,7 @@ impl Session {
                             let conn = shared.backends.shared(&addr, id, false);
                             conn.send(Outbound {
                                 head: None,
-                                frame: Bytes::from(part.frame.clone()),
+                                frame: part.frame.clone(),
                                 expect: 1,
                                 seq: 0,
                                 sink: Sink::One(tx),
@@ -576,12 +458,8 @@ impl Session {
             }
             let merged = match kind {
                 Kind::Mget => multikey::merge_mget(total, &results),
-                Kind::Mset => {
-                    multikey::merge_ok(&results.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>())
-                }
-                _ => {
-                    multikey::merge_sum(&results.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>())
-                }
+                Kind::Mset => multikey::merge_ok(&results),
+                _ => multikey::merge_sum(&results),
             };
             let out = match merged {
                 Ok(bytes) => Bytes::from(bytes),
@@ -692,12 +570,9 @@ impl Session {
                 .await;
                 receivers.push(rx);
             }
-            let mut replies = Vec::with_capacity(receivers.len());
+            let mut replies: Vec<(Vec<usize>, Bytes)> = Vec::with_capacity(receivers.len());
             for rx in receivers {
-                replies.push(
-                    rx.await
-                        .unwrap_or_else(|_| Bytes::from_static(ERR_BACKEND_LOST)),
-                );
+                replies.push((Vec::new(), recv_or_lost(rx).await));
             }
             let merged = match merge {
                 Merge::Sum => multikey::merge_sum(&replies),
@@ -1034,14 +909,7 @@ impl Session {
     }
 
     async fn enter_pubsub(&self, first_frame: Bytes) {
-        let addr = {
-            let topo = self.shared.topo.load();
-            let mut rng = self.rng.get();
-            let a = route::any_master(&topo, &mut rng).map(|i| topo.nodes[i as usize].addr.clone());
-            self.rng.set(rng);
-            a
-        };
-        let Some(addr) = addr else {
+        let Some(addr) = self.any_master_addr() else {
             self.emit_error(ERR_NO_OWNER);
             return;
         };
@@ -1077,6 +945,119 @@ impl Session {
     }
 }
 
+/// Serves one client connection to completion.
+pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
+    if stream.set_nodelay(true).is_err() {
+        return;
+    }
+    let (mut read_half, write_half) = stream.into_split();
+    let (reply_tx, reply_rx) = mpsc::unbounded_channel();
+    let inflight: InflightMap = Rc::new(RefCell::new(HashMap::new()));
+    let proto = Rc::new(Cell::new(2u8));
+
+    let session = Session {
+        shared: shared.clone(),
+        id,
+        reply_tx: reply_tx.clone(),
+        inflight: inflight.clone(),
+        proto: proto.clone(),
+        authed: Cell::new(shared.cfg.requirepass.is_empty()),
+        name: RefCell::new(String::new()),
+        next_seq: Cell::new(0),
+        rng: Cell::new(id | 1),
+        multi: RefCell::new(None),
+        pubsub: RefCell::new(None),
+        blocking: RefCell::new(Vec::new()),
+        closing: Cell::new(false),
+        conns: RefCell::new(ConnCache {
+            epoch: 0,
+            by_node: Vec::new(),
+        }),
+    };
+
+    let (close_tx, close_rx) = oneshot::channel::<u64>();
+    let writer = tokio::task::spawn_local(write_loop(
+        shared.clone(),
+        write_half,
+        reply_rx,
+        reply_tx.clone(),
+        close_rx,
+        inflight,
+        proto,
+        id,
+    ));
+
+    let mut buf = BytesMut::with_capacity(READ_CHUNK);
+    'main: loop {
+        loop {
+            match resp::scan_request(&buf) {
+                ReqScan::Complete { len, argc } => {
+                    let frame = buf.split_to(len).freeze();
+                    session.dispatch(frame, argc).await;
+                }
+                ReqScan::Inline { len } => {
+                    let line = buf.split_to(len);
+                    let args = resp::split_inline(&line);
+                    let argc = args.len();
+                    if argc > 0 {
+                        let mut rebuilt = Vec::new();
+                        resp::write_command(&mut rebuilt, &args);
+                        drop(args);
+                        session.dispatch(Bytes::from(rebuilt), argc).await;
+                    }
+                }
+                ReqScan::Invalid(e) => {
+                    session.emit_error(&format!("ERR Protocol error: {e}"));
+                    break 'main;
+                }
+                ReqScan::Incomplete => break,
+            }
+            if session.closing.get() {
+                break 'main;
+            }
+        }
+        if buf.len() > shared.cfg.query_buffer_limit {
+            session.emit_error("ERR query buffer exceeds limit");
+            break;
+        }
+        while session.inflight.borrow().len() > MAX_INFLIGHT {
+            tokio::task::yield_now().await;
+        }
+        match read_half.read_buf(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => stats::add(&shared.stats.workers[shared.worker].bytes_in, n as u64),
+        }
+    }
+    if let Some(ps) = session.pubsub.borrow_mut().take() {
+        ps.task.abort();
+    }
+    for (seq, task) in session.blocking.borrow_mut().drain(..) {
+        task.abort();
+        let _ = reply_tx.send((seq, Bytes::from_static(ERR_BACKEND_LOST)));
+    }
+    let final_seq = session.next_seq.get();
+    drop(session);
+    drop(reply_tx);
+    let _ = close_tx.send(final_seq);
+    let _ = writer.await;
+}
+/// Per-session resolved connections, valid for one topology epoch.
+struct ConnCache {
+    epoch: u64,
+    by_node: Vec<Option<Rc<crate::backend::Conn>>>,
+}
+
+struct MultiState {
+    slot: Option<u16>,
+    frames: Vec<Bytes>,
+    aborted: bool,
+}
+
+struct PubsubHandle {
+    tx: mpsc::UnboundedSender<Bytes>,
+    task: tokio::task::JoinHandle<()>,
+}
+
 enum Merge {
     Sum,
     Ok,
@@ -1100,6 +1081,11 @@ fn key_indices(spec: &Spec, argc: usize) -> impl Iterator<Item = usize> {
         last.min(argc.saturating_sub(1)) + 1
     };
     (first..end).step_by((spec.step as usize).max(1))
+}
+
+async fn recv_or_lost(rx: oneshot::Receiver<Bytes>) -> Bytes {
+    rx.await
+        .unwrap_or_else(|_| Bytes::from_static(ERR_BACKEND_LOST))
 }
 
 fn error_frame(msg: &str) -> Bytes {
@@ -1230,7 +1216,7 @@ async fn write_loop(
     mut rx: mpsc::UnboundedReceiver<(u64, Bytes)>,
     reply_tx: ReplyTx,
     mut close_rx: oneshot::Receiver<u64>,
-    inflight: Inflight,
+    inflight: InflightMap,
     proto: Rc<Cell<u8>>,
     client_id: u64,
 ) {
@@ -1322,7 +1308,7 @@ async fn write_loop(
     }
 }
 
-fn take_retry_frame(inflight: &Inflight, seq: u64, frame: &Bytes) -> Option<Bytes> {
+fn take_retry_frame(inflight: &InflightMap, seq: u64, frame: &Bytes) -> Option<Bytes> {
     if !frame.starts_with(b"-MOVED ") && !frame.starts_with(b"-ASK ") {
         return None;
     }
@@ -1341,5 +1327,51 @@ fn convert_nil(frame: Bytes, proto: u8) -> Bytes {
         Bytes::from_static(resp::NIL_RESP3)
     } else {
         frame
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(name: &str) -> &'static Spec {
+        command::lookup(name.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn key_indices_honor_first_last_step() {
+        let set: Vec<usize> = key_indices(spec("set"), 3).collect();
+        assert_eq!(set, vec![1]);
+        let mset: Vec<usize> = key_indices(spec("mset"), 5).collect();
+        assert_eq!(mset, vec![1, 3]);
+        let del: Vec<usize> = key_indices(spec("del"), 4).collect();
+        assert_eq!(del, vec![1, 2, 3]);
+        let rename: Vec<usize> = key_indices(spec("rename"), 3).collect();
+        assert_eq!(rename, vec![1, 2]);
+        let ping: Vec<usize> = key_indices(spec("ping"), 1).collect();
+        assert!(ping.is_empty());
+    }
+
+    #[test]
+    fn parses_redirects() {
+        assert_eq!(
+            parse_redirect(b"-MOVED 3999 10.0.0.2:7002\r\n"),
+            Some((false, "10.0.0.2:7002".to_string()))
+        );
+        assert_eq!(
+            parse_redirect(b"-ASK 42 10.0.0.3:7003\r\n"),
+            Some((true, "10.0.0.3:7003".to_string()))
+        );
+        assert_eq!(parse_redirect(b"-ERR nope\r\n"), None);
+        assert_eq!(parse_redirect(b"-MOVED garbage\r\n"), None);
+    }
+
+    #[test]
+    fn converts_top_level_nils_for_resp3() {
+        let nil = Bytes::from_static(resp::NIL_BULK);
+        assert_eq!(convert_nil(nil.clone(), 3).as_ref(), resp::NIL_RESP3);
+        assert_eq!(convert_nil(nil, 2).as_ref(), resp::NIL_BULK);
+        let value = Bytes::from_static(b"$1\r\nx\r\n");
+        assert_eq!(convert_nil(value.clone(), 3), value);
     }
 }

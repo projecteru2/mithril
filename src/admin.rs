@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::command::{FLAG_READONLY, FLAG_WRITE, Spec};
 use crate::config::Config;
-use crate::crc16;
+use crate::crc16::{self, SLOTS};
 use crate::resp;
 use crate::stats::Stats;
 
@@ -35,7 +35,7 @@ pub fn node_id(announce: &str) -> String {
 
 pub fn bulk(out: &mut Vec<u8>, payload: &[u8]) {
     out.push(b'$');
-    out.extend_from_slice(payload.len().to_string().as_bytes());
+    resp::push_usize(out, payload.len());
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(payload);
     out.extend_from_slice(b"\r\n");
@@ -43,13 +43,7 @@ pub fn bulk(out: &mut Vec<u8>, payload: &[u8]) {
 
 pub fn integer(out: &mut Vec<u8>, n: i64) {
     out.push(b':');
-    out.extend_from_slice(n.to_string().as_bytes());
-    out.extend_from_slice(b"\r\n");
-}
-
-pub fn simple(out: &mut Vec<u8>, s: &str) {
-    out.push(b'+');
-    out.extend_from_slice(s.as_bytes());
+    resp::push_i64(out, n);
     out.extend_from_slice(b"\r\n");
 }
 
@@ -180,7 +174,7 @@ pub fn cluster(args: &[&[u8]], cfg: &Config, proto: u8) -> Vec<u8> {
         b"slots" => {
             out.extend_from_slice(b"*1\r\n*3\r\n");
             integer(&mut out, 0);
-            integer(&mut out, 16383);
+            integer(&mut out, SLOTS as i64 - 1);
             out.extend_from_slice(b"*3\r\n");
             bulk(&mut out, host.as_bytes());
             integer(&mut out, i64::from(port));
@@ -197,7 +191,7 @@ pub fn cluster(args: &[&[u8]], cfg: &Config, proto: u8) -> Vec<u8> {
             bulk(&mut out, b"slots");
             out.extend_from_slice(b"*2\r\n");
             integer(&mut out, 0);
-            integer(&mut out, 16383);
+            integer(&mut out, SLOTS as i64 - 1);
             bulk(&mut out, b"nodes");
             out.extend_from_slice(b"*1\r\n");
             shard_node(&mut out, cfg, proto);

@@ -4,12 +4,14 @@ use bytes::Bytes;
 
 use crate::resp;
 
+pub const SCAN_CURSOR_BITS: u32 = 51;
+
 /// Sub-request for one node: rebuilt command plus the original positions of
 /// the keys it carries.
 pub struct Part {
     pub slot: u16,
     pub addr: String,
-    pub frame: Vec<u8>,
+    pub frame: Bytes,
     pub positions: Vec<usize>,
 }
 
@@ -22,7 +24,7 @@ pub fn split<'k, F>(
     mut route: F,
 ) -> Result<Vec<Part>, String>
 where
-    F: FnMut(&[u8]) -> Option<String>,
+    F: FnMut(u16) -> Option<String>,
 {
     type Group<'a> = (u16, String, Vec<&'a [u8]>, Vec<usize>);
     let mut parts: Vec<Group<'k>> = Vec::new();
@@ -31,7 +33,7 @@ where
         let entry = match parts.iter_mut().find(|(s, ..)| *s == slot) {
             Some(e) => e,
             None => {
-                let addr = route(key).ok_or_else(|| "slot has no owner".to_string())?;
+                let addr = route(slot).ok_or_else(|| "slot has no owner".to_string())?;
                 parts.push((slot, addr, Vec::new(), Vec::new()));
                 let last = parts.len() - 1;
                 &mut parts[last]
@@ -54,7 +56,7 @@ where
             Part {
                 slot,
                 addr,
-                frame,
+                frame: Bytes::from(frame),
                 positions,
             }
         })
@@ -66,11 +68,11 @@ pub fn split_array(frame: &[u8]) -> Option<Vec<&[u8]>> {
     if frame.first() != Some(&b'*') {
         return None;
     }
-    let header_end = frame.iter().position(|&b| b == b'\n')? + 1;
-    let count: usize = std::str::from_utf8(&frame[1..header_end - 2])
-        .ok()?
-        .parse()
-        .ok()?;
+    let (n, header_end) = resp::scan_int_line(frame, 1)?;
+    if n < 0 {
+        return None;
+    }
+    let count = n as usize;
     let mut items = Vec::with_capacity(count);
     let mut pos = header_end;
     for _ in 0..count {
@@ -111,9 +113,9 @@ pub fn merge_mget(total: usize, parts: &[(Vec<usize>, Bytes)]) -> Result<Vec<u8>
 }
 
 /// Sums integer part replies (DEL/UNLINK/EXISTS/TOUCH/PFCOUNT).
-pub fn merge_sum(parts: &[Bytes]) -> Result<Vec<u8>, Bytes> {
+pub fn merge_sum(parts: &[(Vec<usize>, Bytes)]) -> Result<Vec<u8>, Bytes> {
     let mut total: i64 = 0;
-    for reply in parts {
+    for (_, reply) in parts {
         match parse_int(reply) {
             Some(n) => total += n,
             None => return Err(reply.clone()),
@@ -125,8 +127,8 @@ pub fn merge_sum(parts: &[Bytes]) -> Result<Vec<u8>, Bytes> {
 }
 
 /// Requires every part to reply +OK (MSET).
-pub fn merge_ok(parts: &[Bytes]) -> Result<Vec<u8>, Bytes> {
-    for reply in parts {
+pub fn merge_ok(parts: &[(Vec<usize>, Bytes)]) -> Result<Vec<u8>, Bytes> {
+    for (_, reply) in parts {
         if reply.as_ref() != crate::admin::OK {
             return Err(reply.clone());
         }
@@ -142,8 +144,6 @@ pub fn parse_int(frame: &[u8]) -> Option<i64> {
     let end = frame.iter().position(|&b| b == b'\r')?;
     std::str::from_utf8(&frame[1..end]).ok()?.parse().ok()
 }
-
-pub const SCAN_CURSOR_BITS: u32 = 51;
 
 /// Packs (master index, node cursor) into one synthetic SCAN cursor.
 pub fn pack_cursor(master_idx: usize, node_cursor: u64) -> u64 {
@@ -164,7 +164,7 @@ pub fn parse_scan_reply(frame: &[u8]) -> Option<(u64, &[u8])> {
     if items.len() != 2 {
         return None;
     }
-    let cursor_payload = bulk_payload(items[0])?;
+    let cursor_payload = resp::bulk_payload(items[0])?;
     let cursor: u64 = std::str::from_utf8(cursor_payload).ok()?.parse().ok()?;
     Some((cursor, items[1]))
 }
@@ -178,14 +178,6 @@ pub fn rebuild_scan_reply(cursor: u64, keys_frame: &[u8]) -> Vec<u8> {
     out
 }
 
-fn bulk_payload(frame: &[u8]) -> Option<&[u8]> {
-    if frame.first() != Some(&b'$') {
-        return None;
-    }
-    let start = frame.iter().position(|&b| b == b'\n')? + 1;
-    frame.get(start..frame.len().saturating_sub(2))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,11 +185,11 @@ mod tests {
     #[test]
     fn splits_by_slot_even_on_one_node() {
         let keys: Vec<&[u8]> = vec![b"{t}a", b"b", b"{t}c"];
-        let parts = split(b"MGET", &keys, None, |_| Some("n1".to_string())).unwrap();
+        let parts = split(b"MGET", &keys, None, |_slot| Some("n1".to_string())).unwrap();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].positions, vec![0, 2]);
         assert_eq!(
-            parts[0].frame,
+            parts[0].frame.as_ref(),
             b"*3\r\n$4\r\nMGET\r\n$4\r\n{t}a\r\n$4\r\n{t}c\r\n"
         );
         assert_eq!(parts[1].positions, vec![1]);
@@ -214,11 +206,14 @@ mod tests {
 
     #[test]
     fn merges_sums_and_oks() {
-        let parts = vec![Bytes::from_static(b":2\r\n"), Bytes::from_static(b":1\r\n")];
+        let parts = vec![
+            (vec![0], Bytes::from_static(b":2\r\n")),
+            (vec![1], Bytes::from_static(b":1\r\n")),
+        ];
         assert_eq!(merge_sum(&parts).unwrap(), b":3\r\n");
-        let oks = vec![Bytes::from_static(b"+OK\r\n")];
+        let oks = vec![(vec![0], Bytes::from_static(b"+OK\r\n"))];
         assert_eq!(merge_ok(&oks).unwrap(), b"+OK\r\n");
-        let bad = vec![Bytes::from_static(b"-ERR nope\r\n")];
+        let bad = vec![(vec![0], Bytes::from_static(b"-ERR nope\r\n"))];
         assert!(merge_sum(&bad).is_err());
     }
 

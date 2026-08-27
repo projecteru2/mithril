@@ -1,3 +1,5 @@
+//! Thin CLI wrapper: parses arguments, loads config, runs the server.
+
 use mithril::config::Config;
 
 fn main() {

@@ -22,6 +22,8 @@ use crate::{log_notice, log_warn, resp};
 
 pub const REFRESH_DEBOUNCE: Duration = Duration::from_millis(100);
 pub const BOOTSTRAP_RETRY: Duration = Duration::from_secs(1);
+pub const BOOTSTRAP_ROUNDS: usize = 30;
+pub const LISTEN_BACKLOG: i32 = 1024;
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 static TOPO_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -214,7 +216,7 @@ fn bind_reuseport(bind: &str, port: u16) -> std::io::Result<TcpListener> {
     socket.set_reuse_port(true)?;
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
-    socket.listen(1024)?;
+    socket.listen(LISTEN_BACKLOG)?;
     TcpListener::from_std(socket.into())
 }
 
@@ -260,7 +262,7 @@ fn refresher_thread(
 }
 
 async fn bootstrap(cfg: &Config) -> Result<Topology, String> {
-    for round in 0..30 {
+    for round in 0..BOOTSTRAP_ROUNDS {
         match fetch_topology(cfg, cfg.bootstrap.iter().map(String::as_str)).await {
             Ok(t) => return Ok(t),
             Err(e) => {
@@ -269,7 +271,7 @@ async fn bootstrap(cfg: &Config) -> Result<Topology, String> {
             }
         }
     }
-    Err("bootstrap failed after 30 rounds".to_string())
+    Err(format!("bootstrap failed after {BOOTSTRAP_ROUNDS} rounds"))
 }
 
 async fn fetch_topology<'a, I: Iterator<Item = &'a str>>(
@@ -294,7 +296,7 @@ async fn fetch_from(cfg: &Config, addr: &str) -> Result<Topology, String> {
         .write_all(b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nNODES\r\n")
         .await
         .map_err(|e| e.to_string())?;
-    let mut buf = BytesMut::with_capacity(64 * 1024);
+    let mut buf = BytesMut::with_capacity(crate::backend::READ_CHUNK);
     loop {
         match resp::scan_value(&buf) {
             resp::Scan::Complete(len) => {
@@ -316,10 +318,5 @@ async fn fetch_from(cfg: &Config, addr: &str) -> Result<Topology, String> {
 }
 
 fn bulk_text(frame: &[u8]) -> Option<&str> {
-    if frame.first() != Some(&b'$') {
-        return None;
-    }
-    let start = frame.iter().position(|&b| b == b'\n')? + 1;
-    let payload = frame.get(start..frame.len().checked_sub(2)?)?;
-    std::str::from_utf8(payload).ok()
+    std::str::from_utf8(resp::bulk_payload(frame)?).ok()
 }
