@@ -63,6 +63,7 @@ struct Session {
     rng: Cell<u64>,
     multi: RefCell<Option<MultiState>>,
     pubsub: RefCell<Option<PubsubHandle>>,
+    blocking: RefCell<Vec<(u64, tokio::task::JoinHandle<()>)>>,
     closing: Cell<bool>,
     conns: RefCell<ConnCache>,
 }
@@ -106,6 +107,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         rng: Cell::new(id | 1),
         multi: RefCell::new(None),
         pubsub: RefCell::new(None),
+        blocking: RefCell::new(Vec::new()),
         closing: Cell::new(false),
         conns: RefCell::new(ConnCache {
             epoch: 0,
@@ -113,11 +115,13 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         }),
     };
 
+    let (close_tx, close_rx) = oneshot::channel::<u64>();
     let writer = tokio::task::spawn_local(write_loop(
         shared.clone(),
         write_half,
         reply_rx,
-        reply_tx,
+        reply_tx.clone(),
+        close_rx,
         inflight,
         proto,
         id,
@@ -167,7 +171,14 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
     if let Some(ps) = session.pubsub.borrow_mut().take() {
         ps.task.abort();
     }
+    for (seq, task) in session.blocking.borrow_mut().drain(..) {
+        task.abort();
+        let _ = reply_tx.send((seq, Bytes::from_static(ERR_BACKEND_LOST)));
+    }
+    let final_seq = session.next_seq.get();
     drop(session);
+    drop(reply_tx);
+    let _ = close_tx.send(final_seq);
     let _ = writer.await;
 }
 
@@ -448,10 +459,13 @@ impl Session {
         let seq = self.alloc_seq();
         let shared = self.shared.clone();
         let reply_tx = self.reply_tx.clone();
-        tokio::task::spawn_local(async move {
+        let task = tokio::task::spawn_local(async move {
             let reply = blocking_round(&shared, slot, frame, None, false).await;
             let _ = reply_tx.send((seq, reply));
         });
+        let mut blocking = self.blocking.borrow_mut();
+        blocking.retain(|(_, t)| !t.is_finished());
+        blocking.push((seq, task));
     }
 
     fn fan_out(&self, spec: &Spec, frame: &Bytes, argc: usize) {
@@ -1215,26 +1229,51 @@ async fn write_loop(
     mut write_half: OwnedWriteHalf,
     mut rx: mpsc::UnboundedReceiver<(u64, Bytes)>,
     reply_tx: ReplyTx,
+    mut close_rx: oneshot::Receiver<u64>,
     inflight: Inflight,
     proto: Rc<Cell<u8>>,
     client_id: u64,
 ) {
     let mut next_emit: u64 = 0;
+    // set when the reader ends; the loop exits once every sequence below it
+    // has been emitted, so a departed client cannot leak the connection.
+    let mut close_at: Option<u64> = None;
     let mut parked: BTreeMap<u64, Bytes> = BTreeMap::new();
     let mut batch: Vec<(u64, Bytes)> = Vec::with_capacity(crate::backend::BATCH);
     let mut ready: Vec<Bytes> = Vec::with_capacity(crate::backend::BATCH);
     loop {
-        let n = rx.recv_many(&mut batch, crate::backend::BATCH).await;
-        if n == 0 {
+        if let Some(n) = close_at
+            && next_emit >= n
+            && parked.is_empty()
+        {
             return;
+        }
+        tokio::select! {
+            n = rx.recv_many(&mut batch, crate::backend::BATCH) => {
+                if n == 0 {
+                    return;
+                }
+            }
+            r = &mut close_rx, if close_at.is_none() => {
+                match r {
+                    Ok(n) => {
+                        close_at = Some(n);
+                        continue;
+                    }
+                    Err(_) => return,
+                }
+            }
         }
         for (seq, frame) in batch.drain(..) {
             if seq == SEQ_OOB {
                 ready.push(convert_nil(frame, proto.get()));
                 continue;
             }
+            if seq < next_emit {
+                continue;
+            }
             if frame.first() == Some(&b'-')
-                && let Some(req) = retryable(&inflight, seq, &frame)
+                && let Some(req) = take_retry_frame(&inflight, seq, &frame)
                 && let Some((ask, target)) = parse_redirect(&frame)
             {
                 stats::bump(&shared.stats.workers[shared.worker].redirects);
@@ -1264,21 +1303,26 @@ async fn write_loop(
             next_emit += 1;
         }
         if !ready.is_empty() {
-            let total: usize = ready.iter().map(|f| f.len()).sum();
-            let mut slices: Vec<IoSlice<'_>> = ready.iter().map(|f| IoSlice::new(f)).collect();
+            let mut total = 0usize;
+            let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(ready.len());
+            for f in &ready {
+                total += f.len();
+                slices.push(IoSlice::new(f));
+            }
             if crate::backend::write_slices(&mut write_half, &mut slices)
                 .await
                 .is_err()
             {
                 return;
             }
+            drop(slices);
             stats::add(&shared.stats.workers[shared.worker].bytes_out, total as u64);
             ready.clear();
         }
     }
 }
 
-fn retryable(inflight: &Inflight, seq: u64, frame: &Bytes) -> Option<Bytes> {
+fn take_retry_frame(inflight: &Inflight, seq: u64, frame: &Bytes) -> Option<Bytes> {
     if !frame.starts_with(b"-MOVED ") && !frame.starts_with(b"-ASK ") {
         return None;
     }
