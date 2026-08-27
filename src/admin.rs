@@ -246,7 +246,8 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
          # Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n\
          total_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\n\
          total_errors:{}\r\nredirections:{}\r\n\r\n\
-         # Mithril\r\nworker_threads:{}\r\nbackend_conns_per_node:{}\r\nslave_mode:{}\r\n",
+         # Mithril\r\nworker_threads:{}\r\nbackend_conns_per_node:{}\r\nslave_mode:{}\r\n\
+         worker_commands:{}\r\n",
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
         cfg.port,
@@ -261,6 +262,12 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
         cfg.workers,
         cfg.backend_conns,
         cfg.slave_mode,
+        stats
+            .workers
+            .iter()
+            .map(|w| w.commands.load(Ordering::Relaxed).to_string())
+            .collect::<Vec<_>>()
+            .join(","),
     );
     let mut out = Vec::new();
     bulk(&mut out, text.as_bytes());

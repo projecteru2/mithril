@@ -192,78 +192,75 @@ async fn run_conn(
         return;
     }
 
-    let pending: Rc<RefCell<VecDeque<Pending>>> = Rc::new(RefCell::new(VecDeque::new()));
-    let write_pending = pending.clone();
-    let writer = tokio::task::spawn_local(async move {
-        let mut batch: Vec<Outbound> = Vec::with_capacity(64);
-        let mut frames: Vec<Bytes> = Vec::with_capacity(128);
+    // Single task owns both directions: no cross-task pending state, and a
+    // dead connection can still drain queued requests with error replies.
+    let mut pending: VecDeque<Pending> = VecDeque::new();
+    let mut batch: Vec<Outbound> = Vec::with_capacity(64);
+    let mut frames: Vec<Bytes> = Vec::with_capacity(128);
+    let mut buf = BytesMut::with_capacity(READ_CHUNK);
+    let mut tx_open = true;
+    'io: loop {
         loop {
-            let n = rx.recv_many(&mut batch, 64).await;
-            if n == 0 {
-                return;
+            match resp::scan_value(&buf) {
+                resp::Scan::Complete(len) => {
+                    let frame = buf.split_to(len).freeze();
+                    let done = match pending.front_mut() {
+                        Some(front) if front.expect > 1 => {
+                            front.expect -= 1;
+                            None
+                        }
+                        Some(_) => pending.pop_front(),
+                        None => None,
+                    };
+                    if let Some(d) = done {
+                        deliver(d.sink, d.seq, frame);
+                    }
+                }
+                resp::Scan::Invalid(e) => {
+                    log_debug!("backend {addr} protocol error: {e}");
+                    break 'io;
+                }
+                resp::Scan::Incomplete => break,
             }
-            frames.clear();
-            {
-                let mut p = write_pending.borrow_mut();
+        }
+        if !tx_open && pending.is_empty() {
+            break 'io;
+        }
+        tokio::select! {
+            n = rx.recv_many(&mut batch, 64), if tx_open => {
+                if n == 0 {
+                    tx_open = false;
+                    if pending.is_empty() {
+                        break 'io;
+                    }
+                    continue;
+                }
+                frames.clear();
                 for out in batch.drain(..) {
-                    p.push_back(Pending {
-                        expect: out.expect,
-                        seq: out.seq,
-                        sink: out.sink,
-                    });
+                    pending.push_back(Pending { expect: out.expect, seq: out.seq, sink: out.sink });
                     if let Some(h) = out.head {
                         frames.push(h);
                     }
                     frames.push(out.frame);
                 }
-            }
-            let mut slices: Vec<IoSlice<'_>> = frames.iter().map(|f| IoSlice::new(f)).collect();
-            if write_vectored_all(&mut write_half, &mut slices)
-                .await
-                .is_err()
-            {
-                return;
-            }
-        }
-    });
-
-    let mut buf = BytesMut::with_capacity(READ_CHUNK);
-    loop {
-        match resp::scan_value(&buf) {
-            resp::Scan::Complete(len) => {
-                let frame = buf.split_to(len).freeze();
-                let done = {
-                    let mut p = pending.borrow_mut();
-                    match p.front_mut() {
-                        Some(front) if front.expect > 1 => {
-                            front.expect -= 1;
-                            None
-                        }
-                        Some(_) => p.pop_front(),
-                        None => None,
-                    }
-                };
-                if let Some(d) = done {
-                    deliver(d.sink, d.seq, frame);
+                let mut slices: Vec<IoSlice<'_>> = frames.iter().map(|f| IoSlice::new(f)).collect();
+                if write_vectored_all(&mut write_half, &mut slices).await.is_err() {
+                    break 'io;
                 }
-                continue;
             }
-            resp::Scan::Invalid(e) => {
-                log_debug!("backend {addr} protocol error: {e}");
-                break;
+            r = read_half.read_buf(&mut buf) => {
+                match r {
+                    Ok(0) | Err(_) => break 'io,
+                    Ok(_) => {}
+                }
             }
-            resp::Scan::Incomplete => {}
-        }
-        match read_half.read_buf(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
         }
     }
 
-    writer.abort();
-    for p in pending.borrow_mut().drain(..) {
+    for p in pending.drain(..) {
         deliver(p.sink, p.seq, Bytes::from_static(ERR_BACKEND_LOST));
     }
+    drain_channel(&mut rx);
 }
 
 fn deliver(sink: Sink, seq: u64, frame: Bytes) {

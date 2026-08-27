@@ -931,8 +931,13 @@ impl Session {
             }
         };
         if forward {
-            if let Some(ps) = self.pubsub.borrow().as_ref() {
-                let _ = ps.tx.send(frame);
+            let sent = self
+                .pubsub
+                .borrow()
+                .as_ref()
+                .is_some_and(|ps| ps.tx.send(frame).is_ok());
+            if !sent {
+                self.emit_error("ERR pubsub backend connection lost");
             }
         } else {
             self.emit_local(admin::OK.to_vec());

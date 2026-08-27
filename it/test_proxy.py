@@ -176,11 +176,14 @@ def test_multi_exec_same_slot(r, key_prefix):
 
 
 def test_multi_exec_cross_slot_rejected(r, key_prefix):
+    # The proxy rejects the second QUEUED command with CROSSSLOT; redis-py's
+    # transaction pipeline then aborts EXEC and re-raises that first queuing
+    # error rather than wrapping it as ExecAbortError.
     k1, k2 = _cross_slot_pair(key_prefix)
     pipe = r.pipeline(transaction=True)
     pipe.set(k1, "1")
     pipe.set(k2, "2")
-    with pytest.raises(redis.exceptions.ExecAbortError):
+    with pytest.raises(redis.exceptions.ResponseError, match=r"(?i)crossslot"):
         pipe.execute()
 
 
@@ -300,19 +303,20 @@ def test_scan_full_iteration(r, key_prefix):
 
 def test_dbsize_matches_direct_cluster_sum(r, cluster_direct):
     proxy_size = r.dbsize()
-    per_master = cluster_direct.dbsize(target_nodes=RedisCluster.PRIMARIES)
-    assert proxy_size == sum(per_master.values())
+    # redis-py already reduces DBSIZE across target_nodes with a sum.
+    total_direct = cluster_direct.dbsize(target_nodes=RedisCluster.PRIMARIES)
+    assert proxy_size == total_direct
 
 
 # --- cluster emulation ---
 
 
 def test_cluster_slots_emulation(r, proxy_addr):
-    slots = r.cluster_slots()
+    slots = r.execute_command("CLUSTER", "SLOTS")
     assert len(slots) == 1
-    (start, end), info = next(iter(slots.items()))
+    start, end, primary = slots[0][0], slots[0][1], slots[0][2]
     assert (start, end) == (0, 16383)
-    assert info["primary"] == proxy_addr
+    assert (primary[0], primary[1]) == proxy_addr
 
 
 def test_rediscluster_client_via_proxy(proxy_addr, key_prefix):
@@ -366,7 +370,7 @@ def test_admin_config_get_maxclients(r):
 
 
 def test_admin_command_count(r):
-    assert r.execute_command("COMMAND", "COUNT") > 100
+    assert r.command_count() > 100
 
 
 def test_admin_client_id_setname_getname(new_conn):
@@ -379,7 +383,8 @@ def test_admin_client_id_setname_getname(new_conn):
 
 def test_admin_select(new_conn):
     c = new_conn()
-    assert c.execute_command("SELECT", 0) == "OK"
+    # redis-py's SELECT callback normalizes the +OK reply to a bool.
+    assert c.execute_command("SELECT", 0) is True
     with pytest.raises(redis.exceptions.ResponseError):
         c.execute_command("SELECT", 1)
 
