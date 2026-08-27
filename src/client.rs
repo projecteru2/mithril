@@ -1095,6 +1095,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
             Ok(n) => stats::add(&shared.stats.workers[shared.worker].bytes_in, n as u64),
         }
     }
+    stats::bump(&shared.stats.workers[shared.worker].readers_exited);
     if let Some(ps) = session.pubsub.borrow_mut().take() {
         ps.task.abort();
     }
@@ -1110,6 +1111,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
     drop(reply_tx);
     let _ = close_tx.send(final_seq);
     let _ = writer.await;
+    stats::bump(&shared.stats.workers[shared.worker].sessions_closed);
 }
 /// Per-session resolved connections, valid for one topology epoch.
 struct ConnCache {
@@ -1326,6 +1328,13 @@ async fn write_loop(
     client_id: u64,
 ) {
     let _ = proto;
+    struct ExitBump(Rc<Shared>);
+    impl Drop for ExitBump {
+        fn drop(&mut self) {
+            stats::bump(&self.0.stats.workers[self.0.worker].writers_exited);
+        }
+    }
+    let _exit = ExitBump(shared.clone());
     let mut next_emit: u64 = 0;
     // protocol flips apply at the HELLO reply's sequence, not before.
     let mut cur_proto: u8 = 2;

@@ -12,6 +12,9 @@ pub struct WorkerStats {
     pub redirects: AtomicU64,
     pub bytes_in: AtomicU64,
     pub bytes_out: AtomicU64,
+    pub readers_exited: AtomicU64,
+    pub writers_exited: AtomicU64,
+    pub sessions_closed: AtomicU64,
 }
 
 /// Process-wide stats shared across workers.
