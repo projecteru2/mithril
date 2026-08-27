@@ -1146,10 +1146,10 @@ async fn write_loop(
 ) {
     let mut next_emit: u64 = 0;
     let mut parked: BTreeMap<u64, Bytes> = BTreeMap::new();
-    let mut batch: Vec<(u64, Bytes)> = Vec::with_capacity(64);
-    let mut ready: Vec<Bytes> = Vec::with_capacity(64);
+    let mut batch: Vec<(u64, Bytes)> = Vec::with_capacity(crate::backend::BATCH);
+    let mut ready: Vec<Bytes> = Vec::with_capacity(crate::backend::BATCH);
     loop {
-        let n = rx.recv_many(&mut batch, 64).await;
+        let n = rx.recv_many(&mut batch, crate::backend::BATCH).await;
         if n == 0 {
             return;
         }

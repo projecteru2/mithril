@@ -19,6 +19,7 @@ use crate::resp;
 
 pub const OUTBOUND_QUEUE: usize = 8192;
 pub const READ_CHUNK: usize = 64 * 1024;
+pub const BATCH: usize = 256;
 pub const MAX_EXCLUSIVE_PER_NODE: usize = 512;
 
 pub const ASKING_FRAME: &[u8] = b"*1\r\n$6\r\nASKING\r\n";
@@ -195,8 +196,8 @@ async fn run_conn(
     // Single task owns both directions: no cross-task pending state, and a
     // dead connection can still drain queued requests with error replies.
     let mut pending: VecDeque<Pending> = VecDeque::new();
-    let mut batch: Vec<Outbound> = Vec::with_capacity(64);
-    let mut frames: Vec<Bytes> = Vec::with_capacity(128);
+    let mut batch: Vec<Outbound> = Vec::with_capacity(BATCH);
+    let mut frames: Vec<Bytes> = Vec::with_capacity(BATCH * 2);
     let mut buf = BytesMut::with_capacity(READ_CHUNK);
     let mut tx_open = true;
     'io: loop {
@@ -227,7 +228,7 @@ async fn run_conn(
             break 'io;
         }
         tokio::select! {
-            n = rx.recv_many(&mut batch, 64), if tx_open => {
+            n = rx.recv_many(&mut batch, BATCH), if tx_open => {
                 if n == 0 {
                     tx_open = false;
                     if pending.is_empty() {
