@@ -1,5 +1,7 @@
 //! Multi-key fan-out: split keys per owner node, merge partial replies.
 
+use std::collections::HashMap;
+
 use bytes::Bytes;
 
 use crate::resp;
@@ -28,12 +30,14 @@ where
 {
     type Group<'a> = (u16, String, Vec<&'a [u8]>, Vec<usize>);
     let mut parts: Vec<Group<'k>> = Vec::new();
+    let mut by_slot: std::collections::HashMap<u16, usize> = HashMap::new();
     for (i, key) in keys.iter().enumerate() {
         let slot = crate::crc16::slot(key);
-        let entry = match parts.iter_mut().find(|(s, ..)| *s == slot) {
-            Some(e) => e,
+        let entry = match by_slot.get(&slot) {
+            Some(&g) => &mut parts[g],
             None => {
                 let addr = route(slot).ok_or_else(|| "slot has no owner".to_string())?;
+                by_slot.insert(slot, parts.len());
                 parts.push((slot, addr, Vec::new(), Vec::new()));
                 let last = parts.len() - 1;
                 &mut parts[last]

@@ -24,6 +24,7 @@ pub const REFRESH_DEBOUNCE: Duration = Duration::from_millis(100);
 pub const BOOTSTRAP_RETRY: Duration = Duration::from_secs(1);
 pub const BOOTSTRAP_ROUNDS: usize = 30;
 pub const LISTEN_BACKLOG: i32 = 1024;
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 static TOPO_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -176,11 +177,11 @@ fn worker_thread(
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if stats.clients.load(Ordering::Relaxed) >= shared.cfg.maxclients {
+            if stats.clients.fetch_add(1, Ordering::Relaxed) >= shared.cfg.maxclients {
+                stats.clients.fetch_sub(1, Ordering::Relaxed);
                 reject_maxclients(stream);
                 continue;
             }
-            stats.clients.fetch_add(1, Ordering::Relaxed);
             stats.total_connections.fetch_add(1, Ordering::Relaxed);
             let shared = shared.clone();
             let id = next_client;
@@ -250,7 +251,13 @@ fn refresher_thread(
                 let current = topo.load();
                 current.nodes.iter().map(|n| n.addr.clone()).collect()
             };
-            match fetch_topology(&cfg, seeds.iter().map(String::as_str)).await {
+            let fetched = tokio::time::timeout(
+                FETCH_TIMEOUT,
+                fetch_topology(&cfg, seeds.iter().map(String::as_str)),
+            )
+            .await
+            .unwrap_or_else(|_| Err("topology fetch timed out".to_string()));
+            match fetched {
                 Ok(mut new_topo) => {
                     new_topo.epoch = next_epoch();
                     topo.store(Arc::new(new_topo));
@@ -263,7 +270,13 @@ fn refresher_thread(
 
 async fn bootstrap(cfg: &Config) -> Result<Topology, String> {
     for round in 0..BOOTSTRAP_ROUNDS {
-        match fetch_topology(cfg, cfg.bootstrap.iter().map(String::as_str)).await {
+        let fetched = tokio::time::timeout(
+            FETCH_TIMEOUT,
+            fetch_topology(cfg, cfg.bootstrap.iter().map(String::as_str)),
+        )
+        .await
+        .unwrap_or_else(|_| Err("topology fetch timed out".to_string()));
+        match fetched {
             Ok(t) => return Ok(t),
             Err(e) => {
                 log_warn!("bootstrap round {round}: {e}");
@@ -289,8 +302,9 @@ async fn fetch_topology<'a, I: Iterator<Item = &'a str>>(
 }
 
 async fn fetch_from(cfg: &Config, addr: &str) -> Result<Topology, String> {
-    let mut stream = crate::backend::dial_raw(addr, cfg)
+    let mut stream = tokio::time::timeout(FETCH_TIMEOUT, crate::backend::dial_raw(addr, cfg))
         .await
+        .map_err(|_| "dial timed out".to_string())?
         .map_err(|e| e.to_string())?;
     stream
         .write_all(b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nNODES\r\n")

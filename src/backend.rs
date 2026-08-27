@@ -49,6 +49,7 @@ struct Pending {
     expect: u32,
     seq: u64,
     sink: Sink,
+    first_err: Option<Bytes>,
 }
 
 /// A live backend connection; cheap to clone via Rc.
@@ -77,9 +78,11 @@ impl Conn {
 }
 
 /// Per-worker backend pools keyed by node address.
+type PoolKey = (Box<str>, bool);
+
 pub struct Backends {
     cfg: Rc<Config>,
-    pools: RefCell<HashMap<Box<str>, Rc<Pool>>>,
+    pools: RefCell<HashMap<PoolKey, Rc<Pool>>>,
 }
 
 impl Backends {
@@ -92,7 +95,7 @@ impl Backends {
 
     /// Returns the sticky shared connection for `addr`.
     pub fn shared(self: &Rc<Self>, addr: &str, sticky: u64, readonly: bool) -> Rc<Conn> {
-        let pool = self.pool(addr);
+        let pool = self.pool(addr, readonly);
         let want = self.cfg.backend_conns;
         let idx = (sticky % want as u64) as usize;
         let mut conns = pool.shared.borrow_mut();
@@ -105,13 +108,21 @@ impl Backends {
         conns[idx].clone()
     }
 
-    /// Takes an exclusive connection for blocking commands or pubsub.
-    pub fn take_exclusive(self: &Rc<Self>, addr: &str, readonly: bool) -> Option<Rc<Conn>> {
-        let pool = self.pool(addr);
+    /// Leases an exclusive connection for blocking commands; the lease
+    /// returns it (or releases its quota slot) on drop, so a cancelled task
+    /// cannot strand quota.
+    pub fn take_exclusive(self: &Rc<Self>, addr: &str, readonly: bool) -> Option<ExclusiveLease> {
+        let pool = self.pool(addr, readonly);
         loop {
             let conn = pool.idle_exclusive.borrow_mut().pop();
             match conn {
-                Some(c) if !c.is_dead() => return Some(c),
+                Some(c) if !c.is_dead() => {
+                    return Some(ExclusiveLease {
+                        conn: c,
+                        pool,
+                        returned: Cell::new(false),
+                    });
+                }
                 Some(_) => pool.exclusive_count.set(pool.exclusive_count.get() - 1),
                 None => break,
             }
@@ -120,22 +131,16 @@ impl Backends {
             return None;
         }
         pool.exclusive_count.set(pool.exclusive_count.get() + 1);
-        Some(self.dial(addr, readonly))
+        Some(ExclusiveLease {
+            conn: self.dial(addr, readonly),
+            pool,
+            returned: Cell::new(false),
+        })
     }
 
-    /// Returns an exclusive connection to the idle pool.
-    pub fn put_exclusive(&self, addr: &str, conn: Rc<Conn>) {
-        let pool = self.pool(addr);
-        if conn.is_dead() {
-            pool.exclusive_count
-                .set(pool.exclusive_count.get().saturating_sub(1));
-            return;
-        }
-        pool.idle_exclusive.borrow_mut().push(conn);
-    }
-
-    fn pool(&self, addr: &str) -> Rc<Pool> {
-        if let Some(p) = self.pools.borrow().get(addr) {
+    fn pool(&self, addr: &str, readonly: bool) -> Rc<Pool> {
+        let key = (addr.into(), readonly);
+        if let Some(p) = self.pools.borrow().get(&key) {
             return p.clone();
         }
         let pool = Rc::new(Pool {
@@ -143,7 +148,7 @@ impl Backends {
             idle_exclusive: RefCell::new(Vec::new()),
             exclusive_count: Cell::new(0),
         });
-        self.pools.borrow_mut().insert(addr.into(), pool.clone());
+        self.pools.borrow_mut().insert(key, pool.clone());
         pool
     }
 
@@ -170,6 +175,38 @@ struct Pool {
     shared: RefCell<Vec<Rc<Conn>>>,
     idle_exclusive: RefCell<Vec<Rc<Conn>>>,
     exclusive_count: Cell<usize>,
+}
+
+/// Holds one exclusive connection; dropping it returns the connection to the
+/// idle pool (or frees the quota slot if the connection died).
+pub struct ExclusiveLease {
+    conn: Rc<Conn>,
+    pool: Rc<Pool>,
+    returned: Cell<bool>,
+}
+
+impl ExclusiveLease {
+    pub fn conn(&self) -> &Conn {
+        &self.conn
+    }
+}
+
+impl Drop for ExclusiveLease {
+    fn drop(&mut self) {
+        if self.returned.replace(true) {
+            return;
+        }
+        if self.conn.is_dead() {
+            self.pool
+                .exclusive_count
+                .set(self.pool.exclusive_count.get().saturating_sub(1));
+        } else {
+            self.pool
+                .idle_exclusive
+                .borrow_mut()
+                .push(self.conn.clone());
+        }
+    }
 }
 
 async fn run_conn(
@@ -207,16 +244,23 @@ async fn run_conn(
             match resp::scan_value(&buf) {
                 resp::Scan::Complete(len) => {
                     let frame = buf.split_to(len).freeze();
-                    let done = match pending.front_mut() {
-                        Some(front) if front.expect > 1 => {
+                    let is_err = frame.first() == Some(&b'-');
+                    let swallow = pending.front().is_some_and(|f| f.expect > 1);
+                    if swallow {
+                        if let Some(front) = pending.front_mut() {
                             front.expect -= 1;
-                            None
+                            if front.first_err.is_none() && is_err {
+                                front.first_err = Some(frame);
+                            }
                         }
-                        Some(_) => pending.pop_front(),
-                        None => None,
-                    };
-                    if let Some(d) = done {
-                        deliver(d.sink, d.seq, frame);
+                    } else if let Some(d) = pending.pop_front() {
+                        // an aborted MULTI reports the first queued error, not
+                        // the terminal EXECABORT.
+                        let reply = match d.first_err {
+                            Some(err) if is_err => err,
+                            _ => frame,
+                        };
+                        deliver(d.sink, d.seq, reply);
                     }
                 }
                 resp::Scan::Invalid(e) => {
@@ -240,7 +284,12 @@ async fn run_conn(
                 }
                 frames.clear();
                 for out in batch.drain(..) {
-                    pending.push_back(Pending { expect: out.expect, seq: out.seq, sink: out.sink });
+                    pending.push_back(Pending {
+                        expect: out.expect,
+                        seq: out.seq,
+                        sink: out.sink,
+                        first_err: None,
+                    });
                     if let Some(h) = out.head {
                         frames.push(h);
                     }

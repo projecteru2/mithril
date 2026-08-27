@@ -61,7 +61,12 @@ pub fn scan_request(buf: &[u8]) -> ReqScan {
     }
     for _ in 0..argc {
         match scan_bulk(buf, pos) {
-            Some(Ok((_, end))) => pos = end,
+            Some(Ok((payload, end))) => {
+                if payload.0 == payload.1 && &buf[pos..pos + 3] == b"$-1" {
+                    return ReqScan::Invalid("null argument in request");
+                }
+                pos = end;
+            }
             Some(Err(e)) => return ReqScan::Invalid(e),
             None => return ReqScan::Incomplete,
         }
@@ -179,12 +184,73 @@ fn scan_inline(buf: &[u8]) -> ReqScan {
     }
 }
 
-/// Splits an inline request line into whitespace-separated arguments.
-pub fn split_inline(line: &[u8]) -> Vec<&[u8]> {
+/// Splits an inline request line per redis inline-command rules: whitespace
+/// separation with single/double quotes and backslash escapes; returns None
+/// on unbalanced quotes.
+pub fn split_inline(line: &[u8]) -> Option<Vec<Vec<u8>>> {
     let line = trim_crlf(line);
-    line.split(|&b| b == b' ' || b == b'\t')
-        .filter(|s| !s.is_empty())
-        .collect()
+    let mut args: Vec<Vec<u8>> = Vec::new();
+    let mut i = 0;
+    while i < line.len() {
+        while i < line.len() && (line[i] == b' ' || line[i] == b'\t') {
+            i += 1;
+        }
+        if i >= line.len() {
+            break;
+        }
+        let mut arg = Vec::new();
+        match line[i] {
+            b'"' => {
+                i += 1;
+                loop {
+                    let &b = line.get(i)?;
+                    match b {
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        b'\\' => {
+                            i += 1;
+                            let &e = line.get(i)?;
+                            arg.push(match e {
+                                b'n' => b'\n',
+                                b'r' => b'\r',
+                                b't' => b'\t',
+                                b'b' => 0x08,
+                                b'a' => 0x07,
+                                other => other,
+                            });
+                            i += 1;
+                        }
+                        _ => {
+                            arg.push(b);
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            b'\'' => {
+                i += 1;
+                loop {
+                    let &b = line.get(i)?;
+                    if b == b'\'' {
+                        i += 1;
+                        break;
+                    }
+                    arg.push(b);
+                    i += 1;
+                }
+            }
+            _ => {
+                while i < line.len() && line[i] != b' ' && line[i] != b'\t' {
+                    arg.push(line[i]);
+                    i += 1;
+                }
+            }
+        }
+        args.push(arg);
+    }
+    Some(args)
 }
 
 fn trim_crlf(mut line: &[u8]) -> &[u8] {
@@ -353,10 +419,31 @@ mod tests {
     fn scans_inline_requests() {
         assert_eq!(scan_request(b"PING\r\n"), ReqScan::Inline { len: 6 });
         assert_eq!(
-            split_inline(b"SET  k v\r\n"),
-            vec![b"SET".as_ref(), b"k".as_ref(), b"v".as_ref()]
+            split_inline(b"SET  k v\r\n").unwrap(),
+            vec![b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()]
         );
+        assert_eq!(
+            split_inline(b"SET k \"a b\"\r\n").unwrap(),
+            vec![b"SET".to_vec(), b"k".to_vec(), b"a b".to_vec()]
+        );
+        assert_eq!(
+            split_inline(b"SET k \"a\\nb\"\r\n").unwrap(),
+            vec![b"SET".to_vec(), b"k".to_vec(), b"a\nb".to_vec()]
+        );
+        assert_eq!(
+            split_inline(b"ECHO 'x y'\r\n").unwrap(),
+            vec![b"ECHO".to_vec(), b"x y".to_vec()]
+        );
+        assert!(split_inline(b"GET \"unbalanced\r\n").is_none());
         assert_eq!(scan_request(b"PIN"), ReqScan::Incomplete);
+    }
+
+    #[test]
+    fn rejects_null_request_argument() {
+        assert!(matches!(
+            scan_request(b"*2\r\n$3\r\nGET\r\n$-1\r\n"),
+            ReqScan::Invalid(_)
+        ));
     }
 
     #[test]
