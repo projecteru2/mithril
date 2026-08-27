@@ -23,6 +23,7 @@ impl Node {
 /// Immutable snapshot of cluster topology, swapped atomically on refresh.
 #[derive(Debug)]
 pub struct Topology {
+    pub epoch: u64,
     pub nodes: Vec<Node>,
     pub slots: Vec<u16>,
     pub masters: Vec<u16>,
@@ -104,6 +105,7 @@ impl Topology {
             return Err("no slots assigned".to_string());
         }
         Ok(Topology {
+            epoch: 0,
             nodes,
             slots,
             masters,

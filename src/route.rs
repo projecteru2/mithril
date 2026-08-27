@@ -4,17 +4,17 @@ use crate::config::SlaveMode;
 use crate::topology::Topology;
 
 /// Picks the target node address for `slot`, honoring read splitting.
-pub fn pick<'t>(
-    topo: &'t Topology,
+pub fn pick(
+    topo: &Topology,
     slot: u16,
     readonly: bool,
     mode: SlaveMode,
     rng: &mut u64,
-) -> Option<(&'t str, bool)> {
+) -> Option<(u16, bool)> {
     let midx = topo.owner(slot)?;
     let master = &topo.nodes[midx as usize];
     if !readonly || mode == SlaveMode::Off || master.replicas.is_empty() {
-        return Some((&master.addr, false));
+        return Some((midx, false));
     }
     let n = master.replicas.len();
     let pool = match mode {
@@ -23,19 +23,17 @@ pub fn pick<'t>(
     };
     let pick = (next_rand(rng) % pool as u64) as usize;
     if pick >= n {
-        return Some((&master.addr, false));
+        return Some((midx, false));
     }
-    let ridx = master.replicas[pick];
-    Some((&topo.nodes[ridx as usize].addr, true))
+    Some((master.replicas[pick], true))
 }
 
 /// Picks a master round-robin for keyless commands.
-pub fn any_master<'t>(topo: &'t Topology, rng: &mut u64) -> Option<&'t str> {
+pub fn any_master(topo: &Topology, rng: &mut u64) -> Option<u16> {
     if topo.masters.is_empty() {
         return None;
     }
-    let idx = topo.masters[(next_rand(rng) % topo.masters.len() as u64) as usize];
-    Some(&topo.nodes[idx as usize].addr)
+    Some(topo.masters[(next_rand(rng) % topo.masters.len() as u64) as usize])
 }
 
 fn next_rand(state: &mut u64) -> u64 {
@@ -62,8 +60,8 @@ r1 10.0.0.3:7003@17003 slave m1 0 1 1 connected\n";
         let topo = Topology::parse(SAMPLE).unwrap();
         let mut rng = 42;
         for _ in 0..16 {
-            let (addr, is_replica) = pick(&topo, 0, false, SlaveMode::WriteOnly, &mut rng).unwrap();
-            assert_eq!(addr, "10.0.0.1:7001");
+            let (idx, is_replica) = pick(&topo, 0, false, SlaveMode::WriteOnly, &mut rng).unwrap();
+            assert_eq!(topo.nodes[idx as usize].addr, "10.0.0.1:7001");
             assert!(!is_replica);
         }
     }
@@ -73,12 +71,12 @@ r1 10.0.0.3:7003@17003 slave m1 0 1 1 connected\n";
         let topo = Topology::parse(SAMPLE).unwrap();
         let mut rng = 42;
         for _ in 0..16 {
-            let (addr, is_replica) = pick(&topo, 0, true, SlaveMode::WriteOnly, &mut rng).unwrap();
-            assert_eq!(addr, "10.0.0.3:7003");
+            let (idx, is_replica) = pick(&topo, 0, true, SlaveMode::WriteOnly, &mut rng).unwrap();
+            assert_eq!(topo.nodes[idx as usize].addr, "10.0.0.3:7003");
             assert!(is_replica);
         }
-        let (addr, _) = pick(&topo, 8192, true, SlaveMode::WriteOnly, &mut rng).unwrap();
-        assert_eq!(addr, "10.0.0.2:7002");
+        let (idx, _) = pick(&topo, 8192, true, SlaveMode::WriteOnly, &mut rng).unwrap();
+        assert_eq!(topo.nodes[idx as usize].addr, "10.0.0.2:7002");
     }
 
     #[test]

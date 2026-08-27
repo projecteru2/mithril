@@ -41,6 +41,7 @@ pub enum Kind {
 #[derive(Debug, Clone, Copy)]
 pub struct Spec {
     pub name: &'static str,
+    pub prefix: u64,
     pub arity: i8,
     pub flags: u8,
     pub first_key: u8,
@@ -71,7 +72,10 @@ pub fn table() -> &'static [Spec] {
     TABLE
 }
 
-/// Looks up a command by name, case-insensitively.
+/// Looks up a command by name, case-insensitively. The search key is the
+/// big-endian first-8-bytes integer plus name length, so probes compare one
+/// u64 instead of running memcmp; only same-prefix long names fall back to a
+/// tail comparison.
 pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
     if name.len() > MAX_NAME {
         return None;
@@ -81,11 +85,27 @@ pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
     for (d, &s) in lower.iter_mut().zip(name) {
         *d = s.to_ascii_lowercase();
     }
-    let lower: &[u8] = lower;
-    TABLE
-        .binary_search_by(|spec| spec.name.as_bytes().cmp(lower))
-        .ok()
-        .map(|i| &TABLE[i])
+    let key = (prefix64(lower), name.len() as u8);
+    let idx = TABLE
+        .binary_search_by(|spec| {
+            (spec.prefix, spec.name.len() as u8)
+                .cmp(&key)
+                .then_with(|| {
+                    spec.name.as_bytes()[8.min(spec.name.len())..].cmp(&lower[8.min(lower.len())..])
+                })
+        })
+        .ok()?;
+    Some(&TABLE[idx])
+}
+
+const fn prefix64(name: &[u8]) -> u64 {
+    let mut v: u64 = 0;
+    let mut i = 0;
+    while i < 8 && i < name.len() {
+        v |= (name[i] as u64) << (56 - i * 8);
+        i += 1;
+    }
+    v
 }
 
 const W: u8 = FLAG_WRITE;
@@ -103,6 +123,7 @@ const fn c(
 ) -> Spec {
     Spec {
         name,
+        prefix: prefix64(name.as_bytes()),
         arity,
         flags,
         first_key,
@@ -280,9 +301,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn table_is_sorted_and_unique() {
+    fn table_is_sorted_by_lookup_key() {
         for w in TABLE.windows(2) {
-            assert!(w[0].name < w[1].name, "{} >= {}", w[0].name, w[1].name);
+            let a = (
+                w[0].prefix,
+                w[0].name.len() as u8,
+                &w[0].name.as_bytes()[8.min(w[0].name.len())..],
+            );
+            let b = (
+                w[1].prefix,
+                w[1].name.len() as u8,
+                &w[1].name.as_bytes()[8.min(w[1].name.len())..],
+            );
+            assert!(a < b, "{} !< {}", w[0].name, w[1].name);
+        }
+    }
+
+    #[test]
+    fn lookup_resolves_shared_prefix_names() {
+        for name in [
+            "zrangebylex",
+            "zrangebyscore",
+            "zremrangebyrank",
+            "zrevrange",
+            "georadiusbymember",
+            "zrevrank",
+        ] {
+            assert_eq!(lookup(name.as_bytes()).map(|s| s.name), Some(name));
         }
     }
 

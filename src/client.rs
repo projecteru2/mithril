@@ -64,6 +64,13 @@ struct Session {
     multi: RefCell<Option<MultiState>>,
     pubsub: RefCell<Option<PubsubHandle>>,
     closing: Cell<bool>,
+    conns: RefCell<ConnCache>,
+}
+
+/// Per-session resolved connections, valid for one topology epoch.
+struct ConnCache {
+    epoch: u64,
+    by_node: Vec<Option<Rc<crate::backend::Conn>>>,
 }
 
 struct MultiState {
@@ -100,6 +107,10 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         multi: RefCell::new(None),
         pubsub: RefCell::new(None),
         closing: Cell::new(false),
+        conns: RefCell::new(ConnCache {
+            epoch: 0,
+            by_node: Vec::new(),
+        }),
     };
 
     let writer = tokio::task::spawn_local(write_loop(
@@ -231,8 +242,6 @@ impl Session {
             return;
         };
         let seq = self.alloc_seq();
-        // conn is resolved inside the topology guard so the address never
-        // needs an owned copy on the hot path.
         let conn = {
             let topo = self.shared.topo.load();
             let mut rng = self.rng.get();
@@ -244,11 +253,11 @@ impl Session {
                 &mut rng,
             );
             self.rng.set(rng);
-            let Some((addr, is_replica)) = picked else {
+            let Some((idx, is_replica)) = picked else {
                 self.emit_at(seq, error_frame(ERR_NO_OWNER));
                 return;
             };
-            self.shared.backends.shared(addr, self.id, is_replica)
+            self.cached_conn(&topo, idx, is_replica)
         };
         self.inflight.borrow_mut().insert(
             seq,
@@ -267,11 +276,36 @@ impl Session {
         .await;
     }
 
+    // one Vec index per request once warm; re-resolves after topology swaps
+    // or connection death.
+    fn cached_conn(&self, topo: &Topology, idx: u16, is_replica: bool) -> Rc<crate::backend::Conn> {
+        let mut cache = self.conns.borrow_mut();
+        if cache.epoch != topo.epoch {
+            cache.epoch = topo.epoch;
+            cache.by_node.clear();
+        }
+        if cache.by_node.len() < topo.nodes.len() {
+            cache.by_node.resize(topo.nodes.len(), None);
+        }
+        let entry = &mut cache.by_node[idx as usize];
+        if let Some(conn) = entry
+            && !conn.is_dead()
+        {
+            return conn.clone();
+        }
+        let conn = self
+            .shared
+            .backends
+            .shared(&topo.nodes[idx as usize].addr, self.id, is_replica);
+        *entry = Some(conn.clone());
+        conn
+    }
+
     fn pick_addr(&self, slot: u16, readonly: bool) -> Option<(String, bool)> {
         let topo = self.shared.topo.load();
         let mut rng = self.rng.get();
         let picked = route::pick(&topo, slot, readonly, self.shared.cfg.slave_mode, &mut rng)
-            .map(|(a, r)| (a.to_string(), r));
+            .map(|(i, r)| (topo.nodes[i as usize].addr.clone(), r));
         self.rng.set(rng);
         picked
     }
@@ -287,7 +321,7 @@ impl Session {
         let addr = {
             let topo = self.shared.topo.load();
             let mut rng = self.rng.get();
-            let a = route::any_master(&topo, &mut rng).map(str::to_string);
+            let a = route::any_master(&topo, &mut rng).map(|i| topo.nodes[i as usize].addr.clone());
             self.rng.set(rng);
             a
         };
@@ -446,7 +480,7 @@ impl Session {
             let topo = self.shared.topo.load();
             let parts = multikey::split(name_upper.as_bytes(), &keys, values.as_deref(), |k| {
                 route::pick(&topo, crc16::slot(k), readonly, mode, &mut rng)
-                    .map(|(a, _)| a.to_string())
+                    .map(|(i, _)| topo.nodes[i as usize].addr.clone())
             });
             self.rng.set(rng);
             parts.map(|p| (p, total))
@@ -989,7 +1023,7 @@ impl Session {
         let addr = {
             let topo = self.shared.topo.load();
             let mut rng = self.rng.get();
-            let a = route::any_master(&topo, &mut rng).map(str::to_string);
+            let a = route::any_master(&topo, &mut rng).map(|i| topo.nodes[i as usize].addr.clone());
             self.rng.set(rng);
             a
         };

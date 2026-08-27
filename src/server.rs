@@ -24,6 +24,12 @@ pub const REFRESH_DEBOUNCE: Duration = Duration::from_millis(100);
 pub const BOOTSTRAP_RETRY: Duration = Duration::from_secs(1);
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+static TOPO_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_epoch() -> u64 {
+    TOPO_EPOCH.fetch_add(1, Ordering::Relaxed) + 1
+}
+
 /// Set on SIGINT/SIGTERM; accept loops stop taking new connections.
 pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -42,7 +48,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|e| format!("runtime: {e}"))?;
-    let topo = boot_rt.block_on(bootstrap(&cfg))?;
+    let mut topo = boot_rt.block_on(bootstrap(&cfg))?;
+    topo.epoch = next_epoch();
     log_notice!(
         "topology bootstrapped: {} nodes, {} masters",
         topo.nodes.len(),
@@ -242,7 +249,10 @@ fn refresher_thread(
                 current.nodes.iter().map(|n| n.addr.clone()).collect()
             };
             match fetch_topology(&cfg, seeds.iter().map(String::as_str)).await {
-                Ok(new_topo) => topo.store(Arc::new(new_topo)),
+                Ok(mut new_topo) => {
+                    new_topo.epoch = next_epoch();
+                    topo.store(Arc::new(new_topo));
+                }
                 Err(e) => log_warn!("topology refresh failed: {e}"),
             }
         }
