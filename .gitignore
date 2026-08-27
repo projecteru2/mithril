@@ -2,3 +2,8 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+/target-linux
+/target-prof
+/target-79
+/mithril-linux-*
+/mithril-x86-*
