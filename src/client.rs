@@ -1599,79 +1599,98 @@ async fn write_loop(
                 }
             }
         }
-        for reply in batch.drain(..) {
-            let (seq, mut frame) = match reply {
-                Reply::Close => {
-                    close_now = true;
-                    continue;
-                }
-                // a push never overtakes the confirmation it followed
-                Reply::Push { after, frame } => {
-                    match after {
-                        Some(a) if a >= next_emit => held_pushes.push_back((a, frame)),
-                        _ => emit_push(&link, &mut ready, frame, cur_proto),
+        // pass 1 processes the woken batch; one yield then coalesces every
+        // ready backend's deliveries into the same flush
+        for pass in 0..2 {
+            for reply in batch.drain(..) {
+                let (seq, mut frame) = match reply {
+                    Reply::Close => {
+                        close_now = true;
+                        continue;
                     }
-                    continue;
-                }
-                Reply::Ack(seq, frame) => {
-                    if seq >= next_emit {
-                        parked_acks.put(seq, frame);
+                    // a push never overtakes the confirmation it followed
+                    Reply::Push { after, frame } => {
+                        match after {
+                            Some(a) if a >= next_emit => held_pushes.push_back((a, frame)),
+                            _ => emit_push(&link, &mut ready, frame, cur_proto),
+                        }
+                        continue;
                     }
+                    Reply::Ack(seq, frame) => {
+                        if seq >= next_emit {
+                            parked_acks.put(seq, frame);
+                        }
+                        continue;
+                    }
+                    Reply::At(seq, frame) => (seq, frame),
+                };
+                if seq < next_emit {
                     continue;
                 }
-                Reply::At(seq, frame) => (seq, frame),
-            };
-            if seq < next_emit {
-                continue;
-            }
-            if frame.first() == Some(&b'-')
-                && (frame.starts_with(b"-MOVED ") || frame.starts_with(b"-ASK "))
-            {
-                if let Some((ask, target)) = parse_redirect(&frame)
-                    && let Some((req, base_expect)) = take_retry_frame(&link.inflight, seq, ask)
+                if frame.first() == Some(&b'-')
+                    && (frame.starts_with(b"-MOVED ") || frame.starts_with(b"-ASK "))
                 {
-                    stats::bump(&shared.stats.workers[shared.worker].redirects);
-                    let _ = shared.refresh.send(());
-                    let conn = shared.backends.shared(&target, client_id, false);
-                    conn.send(Outbound {
-                        head: ask.then(|| Bytes::from_static(ASKING_FRAME)),
-                        frame: req,
-                        expect: base_expect + u32::from(ask),
-                        sink: Sink::Client(reply_tx.clone(), seq),
-                    })
-                    .await;
+                    if let Some((ask, target)) = parse_redirect(&frame)
+                        && let Some((req, base_expect)) = take_retry_frame(&link.inflight, seq, ask)
+                    {
+                        stats::bump(&shared.stats.workers[shared.worker].redirects);
+                        let _ = shared.refresh.send(());
+                        let conn = shared.backends.shared(&target, client_id, false);
+                        conn.send(Outbound {
+                            head: ask.then(|| Bytes::from_static(ASKING_FRAME)),
+                            frame: req,
+                            expect: base_expect + u32::from(ask),
+                            sink: Sink::Client(reply_tx.clone(), seq),
+                        })
+                        .await;
+                        continue;
+                    }
+                    // clients believe the proxy owns every slot: never leak redirects
+                    frame = Bytes::from_static(ERR_TRYAGAIN);
+                }
+                if seq == next_emit {
+                    link.proto_switches.apply(next_emit, &mut cur_proto);
+                    ready.push(convert_nil(frame, cur_proto));
+                    next_emit += 1;
+                } else {
+                    parked.put(seq, frame);
+                }
+            }
+            loop {
+                if let Some(&(barrier, _)) = held_pushes.front()
+                    && barrier < next_emit
+                {
+                    if let Some((_, frame)) = held_pushes.pop_front() {
+                        emit_push(&link, &mut ready, frame, cur_proto);
+                    }
                     continue;
                 }
-                // clients believe the proxy owns every slot: never leak redirects
-                frame = Bytes::from_static(ERR_TRYAGAIN);
-            }
-            if seq == next_emit {
-                link.proto_switches.apply(next_emit, &mut cur_proto);
-                ready.push(convert_nil(frame, cur_proto));
-                next_emit += 1;
-            } else {
-                parked.put(seq, frame);
-            }
-        }
-        loop {
-            if let Some(&(barrier, _)) = held_pushes.front()
-                && barrier < next_emit
-            {
-                if let Some((_, frame)) = held_pushes.pop_front() {
-                    emit_push(&link, &mut ready, frame, cur_proto);
+                if let Some(frame) = parked.take(next_emit) {
+                    link.proto_switches.apply(next_emit, &mut cur_proto);
+                    ready.push(convert_nil(frame, cur_proto));
+                    next_emit += 1;
+                } else if let Some(frame) = parked_acks.take(next_emit) {
+                    link.proto_switches.apply(next_emit, &mut cur_proto);
+                    push_pubsub_frame(&mut ready, frame, cur_proto);
+                    next_emit += 1;
+                } else {
+                    break;
                 }
-                continue;
             }
-            if let Some(frame) = parked.take(next_emit) {
-                link.proto_switches.apply(next_emit, &mut cur_proto);
-                ready.push(convert_nil(frame, cur_proto));
-                next_emit += 1;
-            } else if let Some(frame) = parked_acks.take(next_emit) {
-                link.proto_switches.apply(next_emit, &mut cur_proto);
-                push_pubsub_frame(&mut ready, frame, cur_proto);
-                next_emit += 1;
-            } else {
-                break;
+            if pass == 0 {
+                if ready.len() < 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+                while batch.len() < crate::backend::BATCH {
+                    match rx.try_recv() {
+                        Ok(r) => batch.push(r),
+                        Err(_) => break,
+                    }
+                }
+                if batch.is_empty() {
+                    break;
+                }
             }
         }
         if next_emit > swept_to {
