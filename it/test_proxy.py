@@ -302,9 +302,15 @@ def test_scan_full_iteration(r, key_prefix):
 
 
 def test_dbsize_matches_direct_cluster_sum(r, cluster_direct):
-    proxy_size = r.dbsize()
-    # redis-py already reduces DBSIZE across target_nodes with a sum.
-    total_direct = cluster_direct.dbsize(target_nodes=RedisCluster.PRIMARIES)
+    # two clients sample at different instants; retry until replication and
+    # the proxy topology snapshot converge
+    deadline = time.time() + 5
+    while True:
+        proxy_size = r.dbsize()
+        total_direct = cluster_direct.dbsize(target_nodes=RedisCluster.PRIMARIES)
+        if proxy_size == total_direct or time.time() > deadline:
+            break
+        time.sleep(0.2)
     assert proxy_size == total_direct
 
 
