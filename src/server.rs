@@ -156,7 +156,7 @@ impl Drop for Admitted {
     }
 }
 
-// kernel reuseport hashing skews connections binomially; one acceptor round-robins
+// kernel reuseport hashing skews connections binomially; one acceptor places
 fn acceptor_thread(
     listener: std::net::TcpListener,
     cfg: Arc<Config>,
@@ -176,34 +176,35 @@ fn acceptor_thread(
         };
         let mut next = 0usize;
         let mut cmd_snap = vec![0u64; conn_txs.len()];
-        let mut cmd_rate = vec![0u64; conn_txs.len()];
+        let mut buckets = vec![0u64; conn_txs.len()];
         let mut placed = vec![0u64; conn_txs.len()];
         let mut order: Vec<usize> = Vec::with_capacity(conn_txs.len());
-        let lb = cfg.placement == Placement::LeastLoaded;
-        let mut tick = tokio::time::interval(SNAP_WINDOW);
+        let least_loaded = cfg.placement == Placement::LeastLoaded;
+        // least-loaded samples worker activity per window; round-robin only
+        // needs a shutdown poll
+        let period = if least_loaded {
+            SNAP_WINDOW
+        } else {
+            ACCEPT_POLL
+        };
+        let mut tick = tokio::time::interval(period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let accepted = tokio::select! {
-                a = listener.accept() => a,
-                // rates must stay fresh through accept gaps, or a burst on
-                // one worker dilutes across the whole gap and reads as idle
-                _ = tick.tick(), if lb => {
-                    if SHUTTING_DOWN.load(Ordering::Relaxed) {
-                        return;
+                a = listener.accept() => Some(a),
+                _ = tick.tick() => {
+                    if least_loaded {
+                        refresh_buckets(&stats, &mut cmd_snap, &mut buckets, &mut placed);
                     }
-                    refresh_rates(&stats, &mut cmd_snap, &mut cmd_rate, &mut placed);
-                    continue;
-                }
-                _ = tokio::time::sleep(ACCEPT_POLL) => {
-                    if SHUTTING_DOWN.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    continue;
+                    None
                 }
             };
             if SHUTTING_DOWN.load(Ordering::Relaxed) {
                 return;
             }
+            let Some(accepted) = accepted else {
+                continue;
+            };
             let (stream, _) = match accepted {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -221,29 +222,14 @@ fn acceptor_thread(
             if admitted.stream.is_none() {
                 continue;
             }
-            // placement-key order per worker: round-robin keeps rotation;
-            // least-loaded keys lexicographically on (in-window placement
-            // imbalance, activity bucket, rotation), so a connect burst is
-            // forced to spread evenly, sparse arrivals steer to the
-            // least-active worker, a near-idle proxy never tiers on
-            // stray-command noise, and a full queue falls back to the
-            // next-best key instead of a cyclic neighbor
-            // a full queue must not stall accepts for the rest
+            // a full queue falls to the next-best key and never stalls accepts
             'place: loop {
                 order.clear();
                 order.extend(0..conn_txs.len());
-                if lb {
-                    let total: u64 = cmd_rate.iter().sum();
-                    let share = (total / conn_txs.len() as u64).max(1);
-                    let quiet = total < QUIET_FLOOR;
-                    let floor = placed.iter().min().copied().unwrap_or(0);
-                    order.sort_by_key(|&i| {
-                        let bucket = if quiet { 0 } else { cmd_rate[i] / share };
-                        let rot = (i + conn_txs.len() - next) % conn_txs.len();
-                        (placed[i] - floor, bucket, rot)
-                    });
-                } else {
-                    order.rotate_left(next);
+                order.rotate_left(next);
+                if least_loaded {
+                    // stable sort keeps rotation order inside equal keys
+                    order.sort_by_key(|&i| (placed[i], buckets[i]));
                 }
                 for &i in &order {
                     match conn_txs[i].try_send(admitted) {
@@ -258,11 +244,9 @@ fn acceptor_thread(
                 if SHUTTING_DOWN.load(Ordering::Relaxed) {
                     break;
                 }
-                // full-queue retry: resample on the tick cadence so shifting
-                // load reranks with fresh single-window rates
-                if lb {
+                if least_loaded {
                     tick.tick().await;
-                    refresh_rates(&stats, &mut cmd_snap, &mut cmd_rate, &mut placed);
+                    refresh_buckets(&stats, &mut cmd_snap, &mut buckets, &mut placed);
                 } else {
                     tokio::time::sleep(DRAIN_POLL).await;
                 }
@@ -317,12 +301,19 @@ fn worker_thread(
     });
 }
 
-fn refresh_rates(stats: &Stats, snap: &mut [u64], rate: &mut [u64], placed: &mut [u64]) {
+// converts the window's command deltas straight into sort buckets
+fn refresh_buckets(stats: &Stats, snap: &mut [u64], buckets: &mut [u64], placed: &mut [u64]) {
+    let mut total = 0u64;
     for i in 0..snap.len() {
         let c = stats.workers[i].commands.load(Ordering::Relaxed);
-        rate[i] = c - snap[i];
+        buckets[i] = c - snap[i];
         snap[i] = c;
         placed[i] = 0;
+        total += buckets[i];
+    }
+    let share = (total / snap.len() as u64).max(1);
+    for b in buckets.iter_mut() {
+        *b = if total < QUIET_FLOOR { 0 } else { *b / share };
     }
 }
 

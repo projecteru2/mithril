@@ -14,7 +14,7 @@ const BYTE_UNITS: &[(&str, usize)] = &[
     ("k", 1 << 10),
 ];
 
-/// Replica read routing mode.
+/// New-connection placement across workers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Placement {
     RoundRobin,
@@ -30,6 +30,7 @@ impl fmt::Display for Placement {
     }
 }
 
+/// Replica read routing mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlaveMode {
     Off,
