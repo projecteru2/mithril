@@ -2,6 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::io::IoSlice;
 use std::rc::Rc;
 
@@ -72,11 +73,13 @@ impl Conn {
         }
     }
 
-    /// Full-queue slow path; boxed so the wait stays out of every caller's future.
-    pub async fn send_wait(&self, out: Outbound) {
-        if let Err(e) = Box::pin(self.tx.send(out)).await {
-            deliver(e.0.sink, Bytes::from_static(ERR_BACKEND_LOST));
-        }
+    /// Full-queue slow path; the box keeps the wait out of every caller's future.
+    pub fn send_wait(&self, out: Outbound) -> impl Future<Output = ()> + '_ {
+        Box::pin(async move {
+            if let Err(e) = self.tx.send(out).await {
+                deliver(e.0.sink, Bytes::from_static(ERR_BACKEND_LOST));
+            }
+        })
     }
 
     pub fn is_dead(&self) -> bool {

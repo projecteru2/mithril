@@ -1,7 +1,7 @@
 //! Client sessions: dispatch, ordered replies, MULTI, pubsub, redirects.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::io::IoSlice;
 use std::rc::Rc;
 
@@ -143,8 +143,8 @@ impl Session {
         if argc == 0 {
             return;
         }
+        let mut it = resp::Args::new(&frame, argc);
         let spec = {
-            let mut it = resp::Args::new(&frame, argc);
             let Some(name) = it.next() else {
                 return;
             };
@@ -189,15 +189,17 @@ impl Session {
             return;
         }
         match spec.kind {
-            Kind::Single => match self.key_slot(&frame, argc, spec.first_key as usize) {
+            Kind::Single => match it.nth(spec.first_key as usize - 1).map(crc16::slot) {
                 Some(slot) => {
-                    if let Some((conn, out)) = self.route_single(slot, spec.is_readonly(), frame) {
+                    if let Some(cold) = self.route_single(slot, spec.is_readonly(), frame) {
+                        let (conn, out) = *cold;
                         conn.send_wait(out).await;
                     }
                 }
                 None => self.emit_error("ERR missing key"),
             },
-            Kind::Local => self.handle_local(spec, frame, argc).await,
+            Kind::Local => self.handle_local(spec, frame, argc),
+            Kind::Exec => Box::pin(self.handle_exec()).await,
             Kind::AnyMaster => self.forward_any_master(frame).await,
             Kind::MultiSum | Kind::Mget | Kind::Mset => self.fan_out(spec, &frame, argc),
             Kind::Blocking => self.forward_blocking(spec, frame, argc),
@@ -282,7 +284,7 @@ impl Session {
         slot: u16,
         readonly: bool,
         frame: Bytes,
-    ) -> Option<(Rc<crate::backend::Conn>, Outbound)> {
+    ) -> Option<Box<(Rc<crate::backend::Conn>, Outbound)>> {
         let seq = self.alloc_seq();
         let conn = {
             let topo = self.shared.topo.load();
@@ -297,7 +299,7 @@ impl Session {
         self.track_inflight(seq, &frame, 1);
         match conn.try_send(self.client_out(seq, frame)) {
             Ok(()) => None,
-            Err(out) => Some((conn, out)),
+            Err(out) => Some(Box::new((conn, out))),
         }
     }
 
@@ -377,7 +379,8 @@ impl Session {
             self.spawn_blocking(slot, frame);
             return;
         }
-        if let Some((conn, out)) = self.route_single(slot, spec.is_readonly(), frame) {
+        if let Some(cold) = self.route_single(slot, spec.is_readonly(), frame) {
+            let (conn, out) = *cold;
             conn.send_wait(out).await;
         }
     }
@@ -626,13 +629,9 @@ impl Session {
         }
     }
 
-    async fn handle_local(&self, spec: &Spec, frame: Bytes, argc: usize) {
+    fn handle_local(&self, spec: &Spec, frame: Bytes, argc: usize) {
         if spec.name == "ping" && argc == 1 {
             self.emit_local(Bytes::from_static(b"+PONG\r\n"));
-            return;
-        }
-        if spec.name == "exec" {
-            Box::pin(self.handle_exec()).await;
             return;
         }
         let reply: Option<Bytes> = {
@@ -1481,10 +1480,10 @@ fn backfill_acks(link: &Rc<WriterLink>, reply_tx: &Rc<ReplyTx>) {
 }
 
 // out-of-order replies indexed by sequence distance; O(1) park and drain
+// (the back slot is always Some, so emptiness needs no live counter)
 #[derive(Default)]
 struct ParkedRing {
     base: u64,
-    live: usize,
     slots: VecDeque<Option<Bytes>>,
 }
 
@@ -1493,17 +1492,17 @@ impl ParkedRing {
         if self.slots.is_empty() {
             self.base = seq;
         } else if seq < self.base {
-            for _ in seq + 1..self.base {
+            self.slots.reserve((self.base - seq) as usize);
+            for _ in seq..self.base {
                 self.slots.push_front(None);
             }
-            self.slots.push_front(None);
             self.base = seq;
         }
         let idx = (seq - self.base) as usize;
         if idx >= self.slots.len() {
             self.slots.resize(idx + 1, None);
         }
-        self.live += usize::from(self.slots[idx].replace(frame).is_none());
+        self.slots[idx] = Some(frame);
     }
 
     fn take(&mut self, seq: u64) -> Option<Bytes> {
@@ -1517,12 +1516,15 @@ impl ParkedRing {
         let frame = self.slots.front_mut()?.take()?;
         self.slots.pop_front();
         self.base += 1;
-        self.live -= 1;
+        // a drained ring must not retain a large excursion's capacity for the connection's life
+        if self.slots.is_empty() && self.slots.capacity() > 1024 {
+            self.slots = VecDeque::new();
+        }
         Some(frame)
     }
 
     fn is_empty(&self) -> bool {
-        self.live == 0
+        self.slots.is_empty()
     }
 }
 
@@ -1558,7 +1560,7 @@ async fn write_loop(
     let mut close_at: Option<u64> = None;
     let mut close_now = false;
     let mut parked = ParkedRing::default();
-    let mut parked_acks: BTreeMap<u64, Bytes> = BTreeMap::new();
+    let mut parked_acks = ParkedRing::default();
     let mut held_pushes: VecDeque<(u64, Bytes)> = VecDeque::new();
     let mut batch: Vec<Reply> = Vec::with_capacity(crate::backend::BATCH);
     let mut ready: Vec<Bytes> = Vec::with_capacity(crate::backend::BATCH);
@@ -1603,7 +1605,7 @@ async fn write_loop(
                 }
                 Reply::Ack(seq, frame) => {
                     if seq >= next_emit {
-                        parked_acks.insert(seq, frame);
+                        parked_acks.put(seq, frame);
                     }
                     continue;
                 }
@@ -1654,7 +1656,7 @@ async fn write_loop(
                 link.proto_switches.apply(next_emit, &mut cur_proto);
                 ready.push(convert_nil(frame, cur_proto));
                 next_emit += 1;
-            } else if let Some(frame) = parked_acks.remove(&next_emit) {
+            } else if let Some(frame) = parked_acks.take(next_emit) {
                 link.proto_switches.apply(next_emit, &mut cur_proto);
                 push_pubsub_frame(&mut ready, frame, cur_proto);
                 next_emit += 1;

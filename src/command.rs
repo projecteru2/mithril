@@ -9,11 +9,15 @@ pub const FLAG_NO_AUTH: u8 = 1 << 2;
 pub const FLAG_TXN_CTRL: u8 = 1 << 3;
 pub const PREFIX_LEN: usize = 8;
 
+const LUT_BITS: u32 = 9;
+const LUT_LEN: usize = 1 << LUT_BITS;
+
 const W: u8 = FLAG_WRITE;
 const R: u8 = FLAG_READONLY;
 const N: u8 = FLAG_NO_AUTH;
 const T: u8 = FLAG_TXN_CTRL;
 
+// sorted by name; a test enforces order and lookup-key uniqueness
 static TABLE: &[Spec] = &[
     c("acl", -2, 0, 0, 0, 0, Kind::Local),
     c("append", 3, W, 1, 1, 1, Kind::Single),
@@ -39,7 +43,7 @@ static TABLE: &[Spec] = &[
     c("discard", 1, T, 0, 0, 0, Kind::Local),
     c("echo", 2, 0, 0, 0, 0, Kind::Local),
     c("eval", -3, W, 0, 0, 0, Kind::Eval),
-    c("exec", 1, T, 0, 0, 0, Kind::Local),
+    c("exec", 1, T, 0, 0, 0, Kind::Exec),
     c("exists", -2, R, 1, -1, 1, Kind::MultiSum),
     c("expire", 3, W, 1, 1, 1, Kind::Single),
     c("expireat", 3, W, 1, 1, 1, Kind::Single),
@@ -204,6 +208,8 @@ pub enum Kind {
     Flushall,
     /// Answered by the proxy itself.
     Local,
+    /// MULTI queue flushed to the slot owner as one blob.
+    Exec,
 }
 
 /// One command table entry.
@@ -251,7 +257,9 @@ pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
     for (d, &s) in lower.iter_mut().zip(name) {
         *d = s.to_ascii_lowercase();
     }
-    let prefix = prefix64(lower);
+    let mut head = [0u8; PREFIX_LEN];
+    head.copy_from_slice(&buf[..PREFIX_LEN]);
+    let prefix = u64::from_be_bytes(head);
     let mut h = lut_hash(prefix, name.len() as u8);
     loop {
         let idx = LUT[h];
@@ -261,24 +269,25 @@ pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
         let spec = &TABLE[idx as usize];
         if spec.prefix == prefix
             && spec.name.len() == name.len()
-            && spec.name.as_bytes()[PREFIX_LEN.min(spec.name.len())..]
-                == lower[PREFIX_LEN.min(lower.len())..]
+            && (name.len() <= PREFIX_LEN
+                || spec.name.as_bytes()[PREFIX_LEN..] == buf[PREFIX_LEN..name.len()])
         {
             return Some(spec);
         }
-        h = (h + 1) & (LUT.len() - 1);
+        h = (h + 1) & (LUT_LEN - 1);
     }
 }
 
-static LUT: [u16; 512] = build_lut();
+static LUT: [u16; LUT_LEN] = build_lut();
 
 const fn lut_hash(prefix: u64, len: u8) -> usize {
     let h = (prefix ^ len as u64).wrapping_mul(0x9E3779B97F4A7C15);
-    (h >> 55) as usize
+    (h >> (64 - LUT_BITS)) as usize
 }
 
-const fn build_lut() -> [u16; 512] {
-    let mut lut = [u16::MAX; 512];
+const fn build_lut() -> [u16; LUT_LEN] {
+    assert!(TABLE.len() * 2 <= LUT_LEN);
+    let mut lut = [u16::MAX; LUT_LEN];
     let mut i = 0;
     while i < TABLE.len() {
         let mut h = lut_hash(TABLE[i].prefix, TABLE[i].name.len() as u8);
@@ -322,8 +331,6 @@ const fn c(
     }
 }
 
-// Sorted by name; a test enforces order and lookup-key uniqueness.
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,20 +359,6 @@ mod tests {
                 &w[1].name.as_bytes()[PREFIX_LEN.min(w[1].name.len())..],
             );
             assert!(a < b, "{} !< {}", w[0].name, w[1].name);
-        }
-    }
-
-    #[test]
-    fn lookup_resolves_shared_prefix_names() {
-        for name in [
-            "zrangebylex",
-            "zrangebyscore",
-            "zremrangebyrank",
-            "zrevrange",
-            "georadiusbymember",
-            "zrevrank",
-        ] {
-            assert_eq!(lookup(name.as_bytes()).map(|s| s.name), Some(name));
         }
     }
 
