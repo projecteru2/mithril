@@ -116,29 +116,6 @@ pub fn command_reply(args: &[&[u8]], table: &[Spec], proto: u8) -> Vec<u8> {
     out
 }
 
-fn command_entry(out: &mut Vec<u8>, spec: &Spec) {
-    out.extend_from_slice(b"*6\r\n");
-    bulk(out, spec.name.as_bytes());
-    integer(out, i64::from(spec.arity));
-    let mut flags: Vec<&[u8]> = Vec::new();
-    if spec.is_write() {
-        flags.push(b"write");
-        flags.push(b"denyoom");
-    }
-    if spec.is_readonly() {
-        flags.push(b"readonly");
-    }
-    resp::array_header(out, flags.len());
-    for f in flags {
-        out.push(b'+');
-        out.extend_from_slice(f);
-        out.extend_from_slice(b"\r\n");
-    }
-    integer(out, i64::from(spec.first_key));
-    integer(out, i64::from(spec.last_key));
-    integer(out, i64::from(spec.step));
-}
-
 pub fn cluster(args: &[&[u8]], cfg: &Config, proto: u8) -> Vec<u8> {
     let mut out = Vec::new();
     let sub = args
@@ -195,33 +172,6 @@ pub fn cluster(args: &[&[u8]], cfg: &Config, proto: u8) -> Vec<u8> {
         _ => resp::write_error(&mut out, "ERR unsupported CLUSTER subcommand"),
     }
     out
-}
-
-fn shard_node(out: &mut Vec<u8>, cfg: &Config, proto: u8) {
-    let (host, port) = split_announce(&cfg.announce_addr);
-    out.extend_from_slice(if proto >= 3 { b"%6\r\n" } else { b"*12\r\n" });
-    bulk(out, b"id");
-    bulk(out, node_id(&cfg.announce_addr).as_bytes());
-    bulk(out, b"endpoint");
-    bulk(out, host.as_bytes());
-    bulk(out, b"port");
-    integer(out, i64::from(port));
-    bulk(out, b"role");
-    bulk(out, b"master");
-    bulk(out, b"replication-offset");
-    integer(out, 0);
-    bulk(out, b"health");
-    bulk(out, b"online");
-}
-
-fn split_announce(announce: &str) -> (String, u16) {
-    match announce.rsplit_once(':') {
-        Some((h, p)) => (
-            h.to_string(),
-            p.parse().unwrap_or(crate::config::DEFAULT_PORT),
-        ),
-        None => (announce.to_string(), crate::config::DEFAULT_PORT),
-    }
 }
 
 pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
@@ -301,6 +251,56 @@ pub fn config_cmd(args: &[&[u8]], cfg: &Config) -> Vec<u8> {
         _ => resp::write_error(&mut out, "ERR unsupported CONFIG subcommand"),
     }
     out
+}
+
+fn command_entry(out: &mut Vec<u8>, spec: &Spec) {
+    out.extend_from_slice(b"*6\r\n");
+    bulk(out, spec.name.as_bytes());
+    integer(out, i64::from(spec.arity));
+    let mut flags: Vec<&[u8]> = Vec::new();
+    if spec.is_write() {
+        flags.push(b"write");
+        flags.push(b"denyoom");
+    }
+    if spec.is_readonly() {
+        flags.push(b"readonly");
+    }
+    resp::array_header(out, flags.len());
+    for f in flags {
+        out.push(b'+');
+        out.extend_from_slice(f);
+        out.extend_from_slice(b"\r\n");
+    }
+    integer(out, i64::from(spec.first_key));
+    integer(out, i64::from(spec.last_key));
+    integer(out, i64::from(spec.step));
+}
+
+fn shard_node(out: &mut Vec<u8>, cfg: &Config, proto: u8) {
+    let (host, port) = split_announce(&cfg.announce_addr);
+    out.extend_from_slice(if proto >= 3 { b"%6\r\n" } else { b"*12\r\n" });
+    bulk(out, b"id");
+    bulk(out, node_id(&cfg.announce_addr).as_bytes());
+    bulk(out, b"endpoint");
+    bulk(out, host.as_bytes());
+    bulk(out, b"port");
+    integer(out, i64::from(port));
+    bulk(out, b"role");
+    bulk(out, b"master");
+    bulk(out, b"replication-offset");
+    integer(out, 0);
+    bulk(out, b"health");
+    bulk(out, b"online");
+}
+
+fn split_announce(announce: &str) -> (String, u16) {
+    match announce.rsplit_once(':') {
+        Some((h, p)) => (
+            h.to_string(),
+            p.parse().unwrap_or(crate::config::DEFAULT_PORT),
+        ),
+        None => (announce.to_string(), crate::config::DEFAULT_PORT),
+    }
 }
 
 fn config_pairs(cfg: &Config) -> Vec<(&'static str, String)> {

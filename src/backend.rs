@@ -57,8 +57,7 @@ pub struct Conn {
 }
 
 impl Conn {
-    /// Queues a request; delivers an error frame to the sink if the
-    /// connection is gone.
+    /// Queues a request, delivering an error frame if the connection is gone.
     pub async fn send(&self, out: Outbound) {
         if self.dead.get() {
             deliver(out.sink, Bytes::from_static(ERR_BACKEND_LOST));
@@ -73,8 +72,7 @@ impl Conn {
         self.dead.get()
     }
 
-    /// Force-closes the connection; its task drains and the socket drops, so
-    /// the backend cancels any command still blocked on it.
+    /// Force-closes the connection so the backend cancels blocked commands.
     pub fn abort(&self) {
         self.dead.set(true);
         self.abort.notify_one();
@@ -112,9 +110,7 @@ impl Backends {
         conns[idx].clone()
     }
 
-    /// Leases an exclusive connection for blocking commands; the lease
-    /// returns it (or releases its quota slot) on drop, so a cancelled task
-    /// cannot strand quota.
+    /// Leases an exclusive connection; drop returns it or frees its quota.
     pub fn take_exclusive(self: &Rc<Self>, addr: &str) -> Option<ExclusiveLease> {
         let pool = self.pool(addr, false);
         let conn = loop {
@@ -179,8 +175,7 @@ struct Pool {
     exclusive_count: Cell<usize>,
 }
 
-/// Exclusive connection lease; an incomplete drop frees quota instead of
-/// pooling, because the pipeline still carries the abandoned command.
+/// Lease whose incomplete drop frees quota: the pipeline still carries the command.
 pub struct ExclusiveLease {
     conn: Rc<Conn>,
     pool: Rc<Pool>,
@@ -211,6 +206,35 @@ impl Drop for ExclusiveLease {
                 .set(self.pool.exclusive_count.get().saturating_sub(1));
         }
     }
+}
+
+/// Dials a raw authenticated backend connection for relays and the refresher.
+pub async fn dial_raw(addr: &str, cfg: &Config) -> std::io::Result<TcpStream> {
+    let stream = connect(addr, cfg.tcp_keepalive_secs).await?;
+    if cfg.backend_pass.is_empty() {
+        return Ok(stream);
+    }
+    let (mut r, mut w) = stream.into_split();
+    handshake(&mut r, &mut w, false, &cfg.backend_user, &cfg.backend_pass)
+        .await
+        .map_err(std::io::Error::other)?;
+    r.reunite(w).map_err(std::io::Error::other)
+}
+
+/// Writes every slice fully, advancing across partial writes.
+pub async fn write_slices<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    slices: &mut [IoSlice<'_>],
+) -> std::io::Result<()> {
+    let mut rest = &mut slices[..];
+    while !rest.is_empty() {
+        let n = w.write_vectored(rest).await?;
+        if n == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+        }
+        IoSlice::advance_slices(&mut rest, n);
+    }
+    Ok(())
 }
 
 async fn run_conn(
@@ -249,8 +273,7 @@ async fn run_conn(
         }
     };
 
-    // Single task owns both directions: no cross-task pending state, and a
-    // dead connection can still drain queued requests with error replies.
+    // one task owns both directions; a dead connection still drains its queue
     let mut pending: VecDeque<Pending> = VecDeque::new();
     let mut front_err: Option<Bytes> = None;
     let mut batch: Vec<Outbound> = Vec::with_capacity(BATCH);
@@ -272,8 +295,7 @@ async fn run_conn(
                         }
                         _ => {
                             if let Some(d) = pending.pop_front() {
-                                // an aborted MULTI reports the first queued
-                                // error, not the terminal EXECABORT.
+                                // an aborted MULTI reports its first queued error
                                 let reply = match front_err.take() {
                                     Some(err) if is_err => err,
                                     _ => frame,
@@ -358,20 +380,6 @@ fn drain_channel(rx: &mut mpsc::Receiver<Outbound>) {
     }
 }
 
-/// Dials a raw backend connection with auth applied; used by pubsub relays
-/// and the topology refresher.
-pub async fn dial_raw(addr: &str, cfg: &Config) -> std::io::Result<TcpStream> {
-    let stream = connect(addr, cfg.tcp_keepalive_secs).await?;
-    if cfg.backend_pass.is_empty() {
-        return Ok(stream);
-    }
-    let (mut r, mut w) = stream.into_split();
-    handshake(&mut r, &mut w, false, &cfg.backend_user, &cfg.backend_pass)
-        .await
-        .map_err(std::io::Error::other)?;
-    r.reunite(w).map_err(std::io::Error::other)
-}
-
 async fn connect(addr: &str, keepalive_secs: u64) -> std::io::Result<TcpStream> {
     let stream = TcpStream::connect(addr).await?;
     stream.set_nodelay(true)?;
@@ -425,22 +433,6 @@ async fn handshake(
         if n == 0 {
             return Err("closed during handshake".to_string());
         }
-    }
-    Ok(())
-}
-
-/// Writes every slice fully, advancing across partial writes.
-pub async fn write_slices<W: tokio::io::AsyncWrite + Unpin>(
-    w: &mut W,
-    slices: &mut [IoSlice<'_>],
-) -> std::io::Result<()> {
-    let mut rest = &mut slices[..];
-    while !rest.is_empty() {
-        let n = w.write_vectored(rest).await?;
-        if n == 0 {
-            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
-        }
-        IoSlice::advance_slices(&mut rest, n);
     }
     Ok(())
 }

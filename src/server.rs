@@ -25,18 +25,11 @@ pub const BOOTSTRAP_RETRY: Duration = Duration::from_secs(1);
 pub const BOOTSTRAP_ROUNDS: usize = 30;
 pub const LISTEN_BACKLOG: i32 = 1024;
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_POLL: Duration = Duration::from_millis(200);
 const DRAIN_POLL: Duration = Duration::from_millis(50);
-pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 static TOPO_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn next_epoch() -> u64 {
-    TOPO_EPOCH.fetch_add(1, Ordering::Relaxed) + 1
-}
-
-/// Set on SIGINT/SIGTERM; accept loops stop taking new connections.
-pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Runs the proxy until SIGINT/SIGTERM; Err on fatal startup failure.
 pub fn run(cfg: Config) -> Result<(), String> {
@@ -95,6 +88,13 @@ pub fn run(cfg: Config) -> Result<(), String> {
     }
     std::process::exit(0);
 }
+
+fn next_epoch() -> u64 {
+    TOPO_EPOCH.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Set on SIGINT/SIGTERM; accept loops stop taking new connections.
+pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn wait_for_signal() {
     let rt = match tokio::runtime::Builder::new_current_thread()

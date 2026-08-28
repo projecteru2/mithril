@@ -198,7 +198,7 @@ impl Session {
         self.route_and_send(slot, spec.is_readonly(), frame).await;
     }
 
-    // one Vec index per request once warm; re-resolves on epoch or death.
+    // one Vec index per request once warm; re-resolves on epoch or death
     fn cached_conn(&self, topo: &Topology, idx: u16, is_replica: bool) -> Rc<crate::backend::Conn> {
         let mut cache = self.conns.borrow_mut();
         if cache.epoch != topo.epoch {
@@ -249,8 +249,7 @@ impl Session {
         out
     }
 
-    // resolves the master connection for a slot, emitting ERR_NO_OWNER at
-    // seq when the slot is unassigned.
+    // resolves a slot's master connection, emitting ERR_NO_OWNER at seq if unowned
     fn owner_conn(&self, seq: u64, slot: Option<u16>) -> Option<Rc<crate::backend::Conn>> {
         let topo = self.shared.topo.load();
         let Some(idx) = slot.and_then(|sl| topo.owner(sl)) else {
@@ -438,7 +437,7 @@ impl Session {
             let mut redirected: Vec<(multikey::Part, bool, String)> = Vec::new();
             for (part, rx) in parts.into_iter().zip(receivers) {
                 let reply = recv_or_lost(rx).await;
-                // a redirected part executed nothing: one resend is idempotent.
+                // a redirected part executed nothing: one resend is idempotent
                 match parse_redirect(&reply) {
                     Some((ask, target)) => redirected.push((part, ask, target)),
                     None => results.push((part.positions, reply)),
@@ -840,8 +839,7 @@ impl Session {
         }
     }
 
-    // the reader mirrors the subscription set, so mode exit only drains
-    // already-promised confirmations before dropping the relay.
+    // drains already-promised confirmations before dropping the relay
     async fn exit_pubsub_if_done(&self) -> bool {
         if !self.relay_dead() {
             if !self.subs.borrow().is_empty() {
@@ -905,8 +903,7 @@ impl Session {
             .as_ref()
             .is_some_and(|ps| ps.tx.try_send(frame).is_ok());
         if !sent {
-            // the backfilled confirmation sequences already answer this
-            // command; an extra error reply would desynchronize the stream.
+            // the backfilled confirmations answer this command; more would desync
             self.stop_pubsub();
         }
     }
@@ -999,8 +996,7 @@ struct PubsubHandle {
     task: tokio::task::JoinHandle<()>,
 }
 
-/// Reader-side mirror of the subscription set; confirmation counts derive
-/// from it, so mode exit never waits on the relay.
+/// Reader-side subscription mirror; confirmation counts derive from it.
 #[derive(Default)]
 struct PubsubSim {
     channels: std::collections::HashSet<Vec<u8>>,
@@ -1090,7 +1086,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
 
     let mut buf = BytesMut::with_capacity(READ_CHUNK);
     'main: loop {
-        // a dead writer must not let a half-open client keep executing writes.
+        // a dead writer must not let a half-open client keep executing writes
         if reply_tx.is_closed() {
             break;
         }
@@ -1348,12 +1344,11 @@ async fn pubsub_relay(
     }
     writer.abort();
     backfill_acks(&link, &reply_tx);
-    // a dead pubsub backend would otherwise leave an idle subscriber silently
-    // missing publications forever.
+    // an idle subscriber must not outlive its dead pubsub backend
     let _ = reply_tx.send(Reply::Close);
 }
 
-// every emitted push holds one window slot until the writer emits it.
+// a push holds one window slot from here until the writer emits it
 async fn charge_push(link: &Rc<WriterLink>, reply_tx: &ReplyTx) -> bool {
     while link.oob_budget.get() >= PUBSUB_PUSH_WINDOW {
         if reply_tx.is_closed() {
@@ -1365,8 +1360,7 @@ async fn charge_push(link: &Rc<WriterLink>, reply_tx: &ReplyTx) -> bool {
     true
 }
 
-// promised confirmation sequences must always resolve, or the writer can
-// never drain past them.
+// promised confirmation sequences must resolve or the writer never drains past them
 fn backfill_acks(link: &Rc<WriterLink>, reply_tx: &ReplyTx) {
     let drained: Vec<u64> = link.ack_seqs.borrow_mut().drain(..).collect();
     for seq in drained {
@@ -1399,9 +1393,9 @@ async fn write_loop(
         link: &link,
     };
     let mut next_emit: u64 = 0;
-    // protocol flips apply at the HELLO reply's sequence, not before.
+    // protocol flips apply at the HELLO reply's sequence, not before
     let mut cur_proto: u8 = 2;
-    // reader's final sequence; draining to it lets a departed client close.
+    // reader's final sequence; draining to it lets a departed client close
     let mut close_at: Option<u64> = None;
     let mut close_now = false;
     let mut parked: BTreeMap<u64, Bytes> = BTreeMap::new();
@@ -1441,8 +1435,7 @@ async fn write_loop(
                     close_now = true;
                     continue;
                 }
-                // a push never overtakes the confirmation it followed; held
-                // pushes stay charged against the window until emitted.
+                // a push never overtakes the confirmation it followed
                 Reply::Push { after, frame } => {
                     match after {
                         Some(a) if a >= next_emit => held_pushes.push_back((a, frame)),
@@ -1479,7 +1472,7 @@ async fn write_loop(
                     .await;
                     continue;
                 }
-                // clients believe the proxy owns every slot: never leak redirects.
+                // clients believe the proxy owns every slot: never leak redirects
                 frame = Bytes::from_static(ERR_TRYAGAIN);
             }
             if seq == next_emit {
@@ -1537,8 +1530,7 @@ async fn write_loop(
     }
 }
 
-// marks the entry retried only when the redirect is actually retryable:
-// single-reply requests always, multi-reply blobs only for MOVED.
+// retryable redirects: single-reply requests always, multi-reply blobs only for MOVED
 fn take_retry_frame(inflight: &InflightMap, seq: u64, ask: bool) -> Option<(Bytes, u32)> {
     let mut inf = inflight.borrow_mut();
     match inf.get_mut(&seq) {
@@ -1550,8 +1542,7 @@ fn take_retry_frame(inflight: &InflightMap, seq: u64, ask: bool) -> Option<(Byte
     }
 }
 
-/// True for published messages; everything else on a pubsub connection is a
-/// reply to a forwarded command consuming its promised sequence.
+/// True for published messages; every other pubsub frame consumes a promised sequence.
 fn is_publication(frame: &[u8]) -> bool {
     if frame.first() != Some(&b'*') {
         return false;
@@ -1572,7 +1563,7 @@ fn pubsub_allowed(spec: &Spec) -> bool {
     spec.kind == Kind::Subscribe || matches!(spec.name, "ping" | "quit" | "reset")
 }
 
-// the single window-release site: a push frees its slot when it becomes ready.
+// the single window-release site: a push frees its slot on emission
 fn emit_push(link: &WriterLink, ready: &mut Vec<Bytes>, frame: Bytes, proto: u8) {
     let left = link.oob_budget.get().saturating_sub(1);
     link.oob_budget.set(left);
@@ -1582,8 +1573,7 @@ fn emit_push(link: &WriterLink, ready: &mut Vec<Bytes>, frame: Bytes, proto: u8)
     push_pubsub_frame(ready, frame, proto);
 }
 
-// RESP3 clients receive pubsub frames as push type; the leading '*' becomes
-// '>' via a zero-copy two-segment write.
+// RESP3 push conversion: the leading '*' becomes '>' via a two-segment write
 fn push_pubsub_frame(ready: &mut Vec<Bytes>, frame: Bytes, proto: u8) {
     if proto >= 3 && frame.first() == Some(&b'*') {
         ready.push(Bytes::from_static(b">"));

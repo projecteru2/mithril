@@ -80,10 +80,7 @@ pub fn table() -> &'static [Spec] {
     TABLE
 }
 
-/// Looks up a command by name, case-insensitively. The search key is the
-/// big-endian first-8-bytes integer plus name length, so probes compare one
-/// u64 instead of running memcmp; only same-prefix long names fall back to a
-/// tail comparison.
+/// Case-insensitive lookup; the u64-prefix key makes a probe one integer compare.
 pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
     if name.len() > MAX_NAME {
         return None;

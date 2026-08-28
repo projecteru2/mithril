@@ -36,6 +36,48 @@ pub enum ReqScan {
     Invalid(&'static str),
 }
 
+/// Iterator over argument payload slices of a scanned array-form request.
+pub struct Args<'a> {
+    buf: &'a [u8],
+    pos: usize,
+    remaining: usize,
+}
+
+impl<'a> Args<'a> {
+    /// Walks a request already validated by [`scan_request`].
+    pub fn new(frame: &'a [u8], argc: usize) -> Self {
+        let pos = frame
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(frame.len(), |i| i + 1);
+        Args {
+            buf: frame,
+            pos,
+            remaining: argc,
+        }
+    }
+}
+
+impl<'a> Iterator for Args<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        match scan_bulk(self.buf, self.pos)? {
+            Ok((payload, end)) => {
+                self.pos = end;
+                Some(&self.buf[payload.0..payload.1])
+            }
+            Err(_) => None,
+        }
+    }
+}
+
+type BulkScan = Option<Result<((usize, usize), usize), &'static str>>;
+
 /// Scans one complete RESP value of any protocol version at `buf[0..]`.
 pub fn scan_value(buf: &[u8]) -> Scan {
     scan_at(buf, 0, 0).unwrap_or(Scan::Incomplete)
@@ -78,46 +120,6 @@ pub fn scan_request(buf: &[u8]) -> ReqScan {
     }
 }
 
-/// Iterator over argument payload slices of a scanned array-form request.
-pub struct Args<'a> {
-    buf: &'a [u8],
-    pos: usize,
-    remaining: usize,
-}
-
-impl<'a> Args<'a> {
-    /// Walks a request already validated by [`scan_request`].
-    pub fn new(frame: &'a [u8], argc: usize) -> Self {
-        let pos = frame
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(frame.len(), |i| i + 1);
-        Args {
-            buf: frame,
-            pos,
-            remaining: argc,
-        }
-    }
-}
-
-impl<'a> Iterator for Args<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<&'a [u8]> {
-        if self.remaining == 0 {
-            return None;
-        }
-        self.remaining -= 1;
-        match scan_bulk(self.buf, self.pos)? {
-            Ok((payload, end)) => {
-                self.pos = end;
-                Some(&self.buf[payload.0..payload.1])
-            }
-            Err(_) => None,
-        }
-    }
-}
-
 /// Serializes argument slices as a RESP array of bulk strings into `out`.
 pub fn write_command(out: &mut Vec<u8>, args: &[&[u8]]) {
     out.reserve(args.iter().map(|a| a.len() + 13).sum::<usize>() + 13);
@@ -143,52 +145,6 @@ pub fn write_error(out: &mut Vec<u8>, msg: &str) {
     out.push(b'-');
     out.extend_from_slice(msg.as_bytes());
     out.extend_from_slice(b"\r\n");
-}
-
-fn scan_at(buf: &[u8], pos: usize, depth: usize) -> Option<Scan> {
-    if depth > MAX_DEPTH {
-        return Some(Scan::Invalid("nesting too deep"));
-    }
-    let &kind = buf.get(pos)?;
-    match kind {
-        b'+' | b'-' | b':' | b',' | b'#' | b'(' | b'_' => {
-            let end = find_crlf(buf, pos + 1)?;
-            Some(Scan::Complete(end - pos))
-        }
-        b'$' | b'=' => match scan_bulk(buf, pos)? {
-            Ok((_, end)) => Some(Scan::Complete(end - pos)),
-            Err(e) => Some(Scan::Invalid(e)),
-        },
-        b'*' | b'~' | b'>' | b'%' => {
-            let (n, mut cur) = scan_int_line(buf, pos + 1)?;
-            if n < -1 {
-                return Some(Scan::Invalid("bad aggregate length"));
-            }
-            let items = if n <= 0 {
-                0
-            } else if kind == b'%' {
-                (n as usize).checked_mul(2)?
-            } else {
-                n as usize
-            };
-            for _ in 0..items {
-                match scan_at(buf, cur, depth + 1)? {
-                    Scan::Complete(len) => cur += len,
-                    other => return Some(other),
-                }
-            }
-            Some(Scan::Complete(cur - pos))
-        }
-        _ => Some(Scan::Invalid("bad type byte")),
-    }
-}
-
-fn scan_inline(buf: &[u8]) -> ReqScan {
-    match buf.iter().position(|&b| b == b'\n') {
-        Some(i) => ReqScan::Inline { len: i + 1 },
-        None if buf.len() > MAX_INLINE_LEN => ReqScan::Invalid("inline request too long"),
-        None => ReqScan::Incomplete,
-    }
 }
 
 /// Splits an inline request per redis quoting rules; None on bad syntax.
@@ -279,51 +235,6 @@ pub fn split_inline(line: &[u8]) -> Option<Vec<Vec<u8>>> {
     Some(args)
 }
 
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn trim_crlf(mut line: &[u8]) -> &[u8] {
-    while let Some((&last, rest)) = line.split_last() {
-        if last == b'\r' || last == b'\n' {
-            line = rest;
-        } else {
-            break;
-        }
-    }
-    line
-}
-
-type BulkScan = Option<Result<((usize, usize), usize), &'static str>>;
-
-fn scan_bulk(buf: &[u8], pos: usize) -> BulkScan {
-    match buf.get(pos) {
-        Some(b'$') | Some(b'=') => {}
-        Some(_) => return Some(Err("expected bulk string")),
-        None => return None,
-    }
-    let (n, body) = scan_int_line(buf, pos + 1)?;
-    if n == -1 {
-        return Some(Ok(((body, body), body)));
-    }
-    if n < 0 || n as usize > MAX_BULK_LEN {
-        return Some(Err("bad bulk length"));
-    }
-    let end = body + n as usize + 2;
-    if buf.len() < end {
-        return None;
-    }
-    if &buf[end - 2..end] != b"\r\n" {
-        return Some(Err("bulk missing terminator"));
-    }
-    Some(Ok(((body, end - 2), end)))
-}
-
 // i64::MIN marks a malformed integer line; every caller rejects negatives.
 pub(crate) fn scan_int_line(buf: &[u8], pos: usize) -> Option<(i64, usize)> {
     let end = find_crlf(buf, pos)?;
@@ -364,15 +275,6 @@ pub(crate) fn push_i64(out: &mut Vec<u8>, n: i64) {
     }
 }
 
-fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
-    let rel = buf.get(from..)?.iter().position(|&b| b == b'\n')?;
-    let end = from + rel + 1;
-    if end - from < 2 || buf[end - 2] != b'\r' {
-        return None;
-    }
-    Some(end)
-}
-
 pub(crate) fn push_usize(out: &mut Vec<u8>, n: usize) {
     let mut tmp = [0u8; DEC_BUF];
     out.extend_from_slice(u64_digits(&mut tmp, n as u64));
@@ -390,6 +292,104 @@ pub(crate) fn u64_digits(buf: &mut [u8; DEC_BUF], mut n: u64) -> &[u8] {
         }
     }
     &buf[i..]
+}
+
+fn scan_at(buf: &[u8], pos: usize, depth: usize) -> Option<Scan> {
+    if depth > MAX_DEPTH {
+        return Some(Scan::Invalid("nesting too deep"));
+    }
+    let &kind = buf.get(pos)?;
+    match kind {
+        b'+' | b'-' | b':' | b',' | b'#' | b'(' | b'_' => {
+            let end = find_crlf(buf, pos + 1)?;
+            Some(Scan::Complete(end - pos))
+        }
+        b'$' | b'=' => match scan_bulk(buf, pos)? {
+            Ok((_, end)) => Some(Scan::Complete(end - pos)),
+            Err(e) => Some(Scan::Invalid(e)),
+        },
+        b'*' | b'~' | b'>' | b'%' => {
+            let (n, mut cur) = scan_int_line(buf, pos + 1)?;
+            if n < -1 {
+                return Some(Scan::Invalid("bad aggregate length"));
+            }
+            let items = if n <= 0 {
+                0
+            } else if kind == b'%' {
+                (n as usize).checked_mul(2)?
+            } else {
+                n as usize
+            };
+            for _ in 0..items {
+                match scan_at(buf, cur, depth + 1)? {
+                    Scan::Complete(len) => cur += len,
+                    other => return Some(other),
+                }
+            }
+            Some(Scan::Complete(cur - pos))
+        }
+        _ => Some(Scan::Invalid("bad type byte")),
+    }
+}
+
+fn scan_inline(buf: &[u8]) -> ReqScan {
+    match buf.iter().position(|&b| b == b'\n') {
+        Some(i) => ReqScan::Inline { len: i + 1 },
+        None if buf.len() > MAX_INLINE_LEN => ReqScan::Invalid("inline request too long"),
+        None => ReqScan::Incomplete,
+    }
+}
+
+fn scan_bulk(buf: &[u8], pos: usize) -> BulkScan {
+    match buf.get(pos) {
+        Some(b'$') | Some(b'=') => {}
+        Some(_) => return Some(Err("expected bulk string")),
+        None => return None,
+    }
+    let (n, body) = scan_int_line(buf, pos + 1)?;
+    if n == -1 {
+        return Some(Ok(((body, body), body)));
+    }
+    if n < 0 || n as usize > MAX_BULK_LEN {
+        return Some(Err("bad bulk length"));
+    }
+    let end = body + n as usize + 2;
+    if buf.len() < end {
+        return None;
+    }
+    if &buf[end - 2..end] != b"\r\n" {
+        return Some(Err("bulk missing terminator"));
+    }
+    Some(Ok(((body, end - 2), end)))
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn trim_crlf(mut line: &[u8]) -> &[u8] {
+    while let Some((&last, rest)) = line.split_last() {
+        if last == b'\r' || last == b'\n' {
+            line = rest;
+        } else {
+            break;
+        }
+    }
+    line
+}
+
+fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
+    let rel = buf.get(from..)?.iter().position(|&b| b == b'\n')?;
+    let end = from + rel + 1;
+    if end - from < 2 || buf[end - 2] != b'\r' {
+        return None;
+    }
+    Some(end)
 }
 
 #[cfg(test)]
