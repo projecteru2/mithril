@@ -1480,6 +1480,52 @@ fn backfill_acks(link: &Rc<WriterLink>, reply_tx: &Rc<ReplyTx>) {
     link.acks_drained.notify_one();
 }
 
+// out-of-order replies indexed by sequence distance; O(1) park and drain
+#[derive(Default)]
+struct ParkedRing {
+    base: u64,
+    live: usize,
+    slots: VecDeque<Option<Bytes>>,
+}
+
+impl ParkedRing {
+    fn put(&mut self, seq: u64, frame: Bytes) {
+        if self.slots.is_empty() {
+            self.base = seq;
+        } else if seq < self.base {
+            for _ in seq + 1..self.base {
+                self.slots.push_front(None);
+            }
+            self.slots.push_front(None);
+            self.base = seq;
+        }
+        let idx = (seq - self.base) as usize;
+        if idx >= self.slots.len() {
+            self.slots.resize(idx + 1, None);
+        }
+        self.live += usize::from(self.slots[idx].replace(frame).is_none());
+    }
+
+    fn take(&mut self, seq: u64) -> Option<Bytes> {
+        while self.base < seq && !self.slots.is_empty() {
+            self.slots.pop_front();
+            self.base += 1;
+        }
+        if self.base != seq {
+            return None;
+        }
+        let frame = self.slots.front_mut()?.take()?;
+        self.slots.pop_front();
+        self.base += 1;
+        self.live -= 1;
+        Some(frame)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.live == 0
+    }
+}
+
 async fn write_loop(
     shared: Rc<Shared>,
     mut write_half: OwnedWriteHalf,
@@ -1511,7 +1557,7 @@ async fn write_loop(
     // reader's final sequence; draining to it lets a departed client close
     let mut close_at: Option<u64> = None;
     let mut close_now = false;
-    let mut parked: BTreeMap<u64, Bytes> = BTreeMap::new();
+    let mut parked = ParkedRing::default();
     let mut parked_acks: BTreeMap<u64, Bytes> = BTreeMap::new();
     let mut held_pushes: VecDeque<(u64, Bytes)> = VecDeque::new();
     let mut batch: Vec<Reply> = Vec::with_capacity(crate::backend::BATCH);
@@ -1592,7 +1638,7 @@ async fn write_loop(
                 ready.push(convert_nil(frame, cur_proto));
                 next_emit += 1;
             } else {
-                parked.insert(seq, frame);
+                parked.put(seq, frame);
             }
         }
         loop {
@@ -1604,7 +1650,7 @@ async fn write_loop(
                 }
                 continue;
             }
-            if let Some(frame) = parked.remove(&next_emit) {
+            if let Some(frame) = parked.take(next_emit) {
                 link.proto_switches.apply(next_emit, &mut cur_proto);
                 ready.push(convert_nil(frame, cur_proto));
                 next_emit += 1;
@@ -1728,6 +1774,27 @@ mod tests {
         assert_eq!(rename, vec![1, 2]);
         let ping: Vec<usize> = key_indices(spec("ping"), 1).collect();
         assert!(ping.is_empty());
+    }
+
+    #[test]
+    fn parked_ring_orders_sparse_sequences() {
+        let f = |n: u64| Bytes::from(n.to_string());
+        let mut ring = ParkedRing::default();
+        assert!(ring.is_empty());
+        ring.put(5, f(5));
+        ring.put(7, f(7));
+        ring.put(4, f(4));
+        assert!(!ring.is_empty());
+        assert_eq!(ring.take(3), None);
+        assert_eq!(ring.take(4), Some(f(4)));
+        assert_eq!(ring.take(5), Some(f(5)));
+        assert_eq!(ring.take(6), None);
+        assert_eq!(ring.take(7), Some(f(7)));
+        assert!(ring.is_empty());
+        ring.put(10, f(10));
+        assert_eq!(ring.take(10), Some(f(10)));
+        assert!(ring.is_empty());
+        assert_eq!(ring.take(11), None);
     }
 
     #[test]
