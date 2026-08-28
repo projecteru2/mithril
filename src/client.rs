@@ -29,6 +29,8 @@ const GATE_PROBE: std::time::Duration = std::time::Duration::from_millis(100);
 pub const READ_CHUNK: usize = crate::backend::READ_CHUNK;
 /// Sequence for out-of-band frames (pubsub pushes) that bypass ordering.
 pub const SEQ_OOB: u64 = u64::MAX;
+/// Sentinel telling the writer to close the client connection.
+pub const SEQ_CLOSE: u64 = u64::MAX - 1;
 /// High bit marking an ordered pubsub confirmation needing push conversion.
 pub const PUBSUB_ACK_BIT: u64 = 1 << 63;
 
@@ -834,8 +836,6 @@ impl Session {
             .as_ref()
             .is_none_or(|ps| ps.task.is_finished());
         if relay_dead {
-            self.subs.borrow_mut().channels.clear();
-            self.subs.borrow_mut().patterns.clear();
             self.stop_pubsub();
             return true;
         }
@@ -851,7 +851,10 @@ impl Session {
             if finished || self.reply_tx.is_closed() {
                 break;
             }
-            self.link.acks_drained.notified().await;
+            tokio::select! {
+                _ = self.link.acks_drained.notified() => {}
+                _ = self.reply_tx.closed() => break,
+            }
         }
         self.stop_pubsub();
         true
@@ -861,6 +864,8 @@ impl Session {
         if let Some(ps) = self.pubsub.borrow_mut().take() {
             ps.task.abort();
         }
+        self.subs.borrow_mut().channels.clear();
+        self.subs.borrow_mut().patterns.clear();
         let drained: Vec<u64> = self.link.ack_seqs.borrow_mut().drain(..).collect();
         for seq in drained {
             let _ = self
@@ -878,8 +883,6 @@ impl Session {
             }
             "reset" => {
                 self.stop_pubsub();
-                self.subs.borrow_mut().channels.clear();
-                self.subs.borrow_mut().patterns.clear();
                 self.do_reset();
                 self.emit_local(Bytes::from_static(b"+RESET\r\n"));
                 return;
@@ -1344,6 +1347,9 @@ async fn pubsub_relay(
     }
     writer.abort();
     backfill_acks(&link, &reply_tx);
+    // a dead pubsub backend would otherwise leave an idle subscriber silently
+    // missing publications forever.
+    let _ = reply_tx.send((SEQ_CLOSE, Bytes::new()));
 }
 
 // promised confirmation sequences must always resolve, or the writer can
@@ -1380,7 +1386,8 @@ async fn write_loop(
     let mut close_at: Option<u64> = None;
     let mut parked: BTreeMap<u64, Bytes> = BTreeMap::new();
     let mut parked_acks: BTreeMap<u64, Bytes> = BTreeMap::new();
-    let mut held_pushes: Vec<Bytes> = Vec::new();
+    let mut held_pushes: std::collections::VecDeque<(u64, Bytes)> =
+        std::collections::VecDeque::new();
     let mut batch: Vec<(u64, Bytes)> = Vec::with_capacity(crate::backend::BATCH);
     let mut ready: Vec<Bytes> = Vec::with_capacity(crate::backend::BATCH);
     loop {
@@ -1409,17 +1416,18 @@ async fn write_loop(
             }
         }
         for (seq, frame) in batch.drain(..) {
+            if seq == SEQ_CLOSE {
+                return;
+            }
             if seq == SEQ_OOB {
-                let left = link.oob_budget.get().saturating_sub(1);
-                link.oob_budget.set(left);
-                if left == PUBSUB_PUSH_WINDOW - 1 {
-                    link.oob_notify.notify_waiters();
-                }
-                // a push observed after a confirmation must not overtake it.
-                if parked_acks.is_empty() {
-                    push_pubsub_frame(&mut ready, frame, cur_proto);
-                } else {
-                    held_pushes.push(frame);
+                // a push observed after a confirmation must not overtake it;
+                // held pushes stay charged against the window until emitted.
+                match parked_acks.last_key_value() {
+                    None => {
+                        release_oob_budget(&link);
+                        push_pubsub_frame(&mut ready, frame, cur_proto);
+                    }
+                    Some((&barrier, _)) => held_pushes.push_back((barrier, frame)),
                 }
                 continue;
             }
@@ -1464,6 +1472,15 @@ async fn write_loop(
             }
         }
         loop {
+            if let Some(&(barrier, _)) = held_pushes.front()
+                && barrier < next_emit
+            {
+                if let Some((_, frame)) = held_pushes.pop_front() {
+                    release_oob_budget(&link);
+                    push_pubsub_frame(&mut ready, frame, cur_proto);
+                }
+                continue;
+            }
             if let Some(frame) = parked.remove(&next_emit) {
                 link.inflight.borrow_mut().remove(&next_emit);
                 link.proto_switches.apply(next_emit, &mut cur_proto);
@@ -1475,11 +1492,6 @@ async fn write_loop(
                 next_emit += 1;
             } else {
                 break;
-            }
-        }
-        if parked_acks.is_empty() {
-            for frame in held_pushes.drain(..) {
-                push_pubsub_frame(&mut ready, frame, cur_proto);
             }
         }
         if !ready.is_empty() {
@@ -1533,6 +1545,14 @@ fn is_publication(frame: &[u8]) -> bool {
 
 // RESP3 clients receive pubsub frames as push type; the leading '*' becomes
 // '>' via a zero-copy two-segment write.
+fn release_oob_budget(link: &Rc<WriterLink>) {
+    let left = link.oob_budget.get().saturating_sub(1);
+    link.oob_budget.set(left);
+    if left == PUBSUB_PUSH_WINDOW - 1 {
+        link.oob_notify.notify_waiters();
+    }
+}
+
 fn push_pubsub_frame(ready: &mut Vec<Bytes>, frame: Bytes, proto: u8) {
     if proto >= 3 && frame.first() == Some(&b'*') {
         ready.push(Bytes::from_static(b">"));

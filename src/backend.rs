@@ -324,7 +324,11 @@ async fn run_conn(
                     frames.push(out.frame);
                 }
                 let mut slices: Vec<IoSlice<'_>> = frames.iter().map(|f| IoSlice::new(f)).collect();
-                if write_slices(&mut write_half, &mut slices).await.is_err() {
+                let wrote = tokio::select! {
+                    _ = conn.abort.notified() => false,
+                    r = write_slices(&mut write_half, &mut slices) => r.is_ok(),
+                };
+                if !wrote {
                     break 'io;
                 }
             }
