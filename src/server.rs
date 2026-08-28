@@ -185,14 +185,27 @@ fn acceptor_thread(
                 continue;
             }
             stats.total_connections.fetch_add(1, Ordering::Relaxed);
-            let handed = match stream.into_std() {
-                Ok(std_stream) => conn_txs[next].send(std_stream).await.is_ok(),
-                Err(_) => false,
+            let Ok(std_stream) = stream.into_std() else {
+                stats.clients.fetch_sub(1, Ordering::Relaxed);
+                continue;
             };
-            if !handed {
+            // a full queue must not stall accepts for the rest
+            let best = next;
+            next = (next + 1) % conn_txs.len();
+            let mut pending = Some(std_stream);
+            for k in 0..conn_txs.len() {
+                let Some(s) = pending.take() else { break };
+                let i = (best + k) % conn_txs.len();
+                match conn_txs[i].try_send(s) {
+                    Ok(()) => {}
+                    Err(e) => pending = Some(e.into_inner()),
+                }
+            }
+            if let Some(s) = pending
+                && conn_txs[best].send(s).await.is_err()
+            {
                 stats.clients.fetch_sub(1, Ordering::Relaxed);
             }
-            next = (next + 1) % conn_txs.len();
         }
     });
 }

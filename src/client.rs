@@ -132,6 +132,12 @@ struct Session {
 
 impl Session {
     async fn dispatch(&self, frame: Bytes, argc: usize) {
+        // no reply can ever be written: executing this command would commit
+        // effects the client can never observe
+        if self.link.closed.get() {
+            self.closing.set(true);
+            return;
+        }
         stats::bump(&self.shared.stats.workers[self.shared.worker].commands);
         if argc == 0 {
             return;
@@ -169,12 +175,6 @@ impl Session {
                 self.dispatch_pubsub(spec, frame, argc);
                 return;
             }
-        }
-        // no reply can ever be written: executing this command would commit
-        // effects the client can never observe
-        if self.link.closed.get() {
-            self.closing.set(true);
-            return;
         }
         if self.multi.borrow().is_some() && spec.flags & command::FLAG_TXN_CTRL == 0 {
             self.queue_multi(spec, frame, argc);
@@ -1099,7 +1099,12 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         if link.closed.get() {
             break;
         }
+        let mut gate_paused = false;
         loop {
+            if session.next_seq.get().saturating_sub(link.emitted.get()) > MAX_INFLIGHT as u64 {
+                gate_paused = true;
+                break;
+            }
             match resp::scan_request(&buf) {
                 ReqScan::Complete { len, argc } => {
                     let frame = buf.split_to(len).freeze();
@@ -1129,7 +1134,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
                 break 'main;
             }
         }
-        if buf.len() > shared.cfg.query_buffer_limit {
+        if !gate_paused && buf.len() > shared.cfg.query_buffer_limit {
             session.emit_error("ERR query buffer exceeds limit");
             break;
         }
