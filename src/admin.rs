@@ -12,6 +12,7 @@ use crate::resp;
 use crate::stats::Stats;
 
 pub const SERVER_VERSION: &str = "7.4.0";
+pub const CLUSTER_BUS_OFFSET: u32 = 10000;
 pub const OK: &[u8] = b"+OK\r\n";
 pub const PONG: &[u8] = b"+PONG\r\n";
 
@@ -167,7 +168,7 @@ pub fn cluster(args: &[&[u8]], cfg: &Config, proto: u8) -> Vec<u8> {
             let line = format!(
                 "{} {host}:{port}@{} myself,master - 0 0 1 connected 0-16383\n",
                 node_id(&cfg.announce_addr),
-                port as u32 + 10000,
+                port as u32 + CLUSTER_BUS_OFFSET,
             );
             bulk(&mut out, line.as_bytes());
         }

@@ -5,6 +5,11 @@ pub const MAX_NAME: usize = 24;
 pub const FLAG_WRITE: u8 = 1;
 pub const FLAG_READONLY: u8 = 1 << 1;
 pub const FLAG_NO_AUTH: u8 = 1 << 2;
+pub const PREFIX_LEN: usize = 8;
+
+const W: u8 = FLAG_WRITE;
+const R: u8 = FLAG_READONLY;
+const N: u8 = FLAG_NO_AUTH;
 
 /// How the proxy routes or handles a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,7 +96,8 @@ pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
             (spec.prefix, spec.name.len() as u8)
                 .cmp(&key)
                 .then_with(|| {
-                    spec.name.as_bytes()[8.min(spec.name.len())..].cmp(&lower[8.min(lower.len())..])
+                    spec.name.as_bytes()[PREFIX_LEN.min(spec.name.len())..]
+                        .cmp(&lower[PREFIX_LEN.min(lower.len())..])
                 })
         })
         .ok()?;
@@ -101,16 +107,12 @@ pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
 const fn prefix64(name: &[u8]) -> u64 {
     let mut v: u64 = 0;
     let mut i = 0;
-    while i < 8 && i < name.len() {
+    while i < PREFIX_LEN && i < name.len() {
         v |= (name[i] as u64) << (56 - i * 8);
         i += 1;
     }
     v
 }
-
-const W: u8 = FLAG_WRITE;
-const R: u8 = FLAG_READONLY;
-const N: u8 = FLAG_NO_AUTH;
 
 const fn c(
     name: &'static str,
@@ -306,12 +308,12 @@ mod tests {
             let a = (
                 w[0].prefix,
                 w[0].name.len() as u8,
-                &w[0].name.as_bytes()[8.min(w[0].name.len())..],
+                &w[0].name.as_bytes()[PREFIX_LEN.min(w[0].name.len())..],
             );
             let b = (
                 w[1].prefix,
                 w[1].name.len() as u8,
-                &w[1].name.as_bytes()[8.min(w[1].name.len())..],
+                &w[1].name.as_bytes()[PREFIX_LEN.min(w[1].name.len())..],
             );
             assert!(a < b, "{} !< {}", w[0].name, w[1].name);
         }

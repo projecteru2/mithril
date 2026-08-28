@@ -10,7 +10,6 @@ pub const SCAN_CURSOR_BITS: u32 = 51;
 
 /// Sub-request for one slot: rebuilt command plus original key positions.
 pub struct Part {
-    pub slot: u16,
     pub node: u16,
     pub frame: Bytes,
     pub positions: Vec<usize>,
@@ -28,7 +27,7 @@ where
 {
     type Group<'a> = (u16, u16, Vec<&'a [u8]>, Vec<usize>);
     let mut parts: Vec<Group<'k>> = Vec::new();
-    let mut by_slot: std::collections::HashMap<u16, usize> = HashMap::new();
+    let mut by_slot: HashMap<u16, usize> = HashMap::new();
     for (i, key) in keys.iter().enumerate() {
         let slot = crate::crc16::slot(key);
         let entry = match by_slot.get(&slot) {
@@ -49,14 +48,13 @@ where
     }
     Ok(parts
         .into_iter()
-        .map(|(slot, node, args, positions)| {
+        .map(|(_, node, args, positions)| {
             let mut all: Vec<&[u8]> = Vec::with_capacity(args.len() + 1);
             all.push(name);
             all.extend_from_slice(&args);
             let mut frame = Vec::new();
             resp::write_command(&mut frame, &all);
             Part {
-                slot,
                 node,
                 frame: Bytes::from(frame),
                 positions,

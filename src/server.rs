@@ -25,6 +25,8 @@ pub const BOOTSTRAP_RETRY: Duration = Duration::from_secs(1);
 pub const BOOTSTRAP_ROUNDS: usize = 30;
 pub const LISTEN_BACKLOG: i32 = 1024;
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+const ACCEPT_POLL: Duration = Duration::from_millis(200);
+const DRAIN_POLL: Duration = Duration::from_millis(50);
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 static TOPO_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -85,7 +87,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     SHUTTING_DOWN.store(true, Ordering::Relaxed);
     let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
     while stats.clients.load(Ordering::Relaxed) > 0 && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(DRAIN_POLL);
     }
     let left = stats.clients.load(Ordering::Relaxed);
     if left > 0 {
@@ -162,7 +164,7 @@ fn worker_thread(
         loop {
             let accepted = tokio::select! {
                 a = listener.accept() => a,
-                _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                _ = tokio::time::sleep(ACCEPT_POLL) => {
                     if SHUTTING_DOWN.load(Ordering::Relaxed) {
                         return;
                     }

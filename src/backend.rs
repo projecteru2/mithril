@@ -159,11 +159,9 @@ impl Backends {
         });
         let task_conn = conn.clone();
         let addr = addr.to_string();
-        let user = self.cfg.backend_user.clone();
-        let pass = self.cfg.backend_pass.clone();
-        let keepalive = self.cfg.tcp_keepalive_secs;
+        let cfg = self.cfg.clone();
         tokio::task::spawn_local(async move {
-            run_conn(&addr, rx, readonly, &user, &pass, keepalive).await;
+            run_conn(&addr, rx, readonly, &cfg).await;
             task_conn.dead.set(true);
         });
         conn
@@ -209,15 +207,8 @@ impl Drop for ExclusiveLease {
     }
 }
 
-async fn run_conn(
-    addr: &str,
-    mut rx: mpsc::Receiver<Outbound>,
-    readonly: bool,
-    user: &str,
-    pass: &str,
-    keepalive_secs: u64,
-) {
-    let stream = match connect(addr, keepalive_secs).await {
+async fn run_conn(addr: &str, mut rx: mpsc::Receiver<Outbound>, readonly: bool, cfg: &Config) {
+    let stream = match connect(addr, cfg.tcp_keepalive_secs).await {
         Ok(s) => s,
         Err(e) => {
             log_debug!("dial {addr}: {e}");
@@ -226,7 +217,15 @@ async fn run_conn(
         }
     };
     let (mut read_half, mut write_half) = stream.into_split();
-    if let Err(e) = handshake(&mut read_half, &mut write_half, readonly, user, pass).await {
+    if let Err(e) = handshake(
+        &mut read_half,
+        &mut write_half,
+        readonly,
+        &cfg.backend_user,
+        &cfg.backend_pass,
+    )
+    .await
+    {
         log_debug!("handshake {addr}: {e}");
         drain_channel(&mut rx);
         return;

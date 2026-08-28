@@ -130,7 +130,7 @@ impl Session {
             match command::lookup(name) {
                 Some(spec) => spec,
                 None => {
-                    let name = String::from_utf8_lossy(name).into_owned();
+                    let name = String::from_utf8_lossy(name);
                     self.abort_multi();
                     self.emit_error(&format!("ERR unknown command '{name}'"));
                     return;
@@ -169,8 +169,8 @@ impl Session {
             Kind::Xread => self.forward_xread(spec, frame, argc).await,
             Kind::Subscribe => self.enter_pubsub(frame).await,
             Kind::Scan => self.run_scan(&frame, argc),
-            Kind::Dbsize => self.run_broadcast_frame(frame, Merge::Sum),
-            Kind::Flushall => self.run_broadcast_frame(frame, Merge::Ok),
+            Kind::Dbsize => self.run_broadcast_frame(frame, BroadcastMerge::Sum),
+            Kind::Flushall => self.run_broadcast_frame(frame, BroadcastMerge::Ok),
         }
     }
 
@@ -424,8 +424,13 @@ impl Session {
         let shared = self.shared.clone();
         let reply_tx = self.reply_tx.clone();
         let id = self.id;
-        let kind = spec.kind;
+        let merge = match spec.kind {
+            Kind::Mget => Merge::Mget,
+            Kind::Mset => Merge::Ok,
+            _ => Merge::Sum,
+        };
         let flag_readonly = readonly && mode != SlaveMode::Off;
+        // detached deliberately: completion is bounded by backend replies.
         tokio::task::spawn_local(async move {
             let mut receivers = Vec::with_capacity(parts.len());
             for part in &parts {
@@ -475,11 +480,10 @@ impl Session {
                     results.push((part.positions, reply));
                 }
             }
-            let merged = match kind {
-                Kind::Mget => multikey::merge_mget(total, &results),
-                Kind::Mset => multikey::merge_ok(&results),
-                Kind::MultiSum => multikey::merge_sum(&results),
-                _ => unreachable!("fan_out only handles multi-key kinds"),
+            let merged = match merge {
+                Merge::Mget => multikey::merge_mget(total, &results),
+                Merge::Ok => multikey::merge_ok(&results),
+                Merge::Sum => multikey::merge_sum(&results),
             };
             let out = match merged {
                 Ok(bytes) => Bytes::from(bytes),
@@ -506,6 +510,7 @@ impl Session {
         let shared = self.shared.clone();
         let reply_tx = self.reply_tx.clone();
         let id = self.id;
+        // detached deliberately: completion is bounded by backend replies.
         tokio::task::spawn_local(async move {
             let topo = shared.topo.load_full();
             if master_idx >= topo.masters.len() {
@@ -551,11 +556,12 @@ impl Session {
         });
     }
 
-    fn run_broadcast_frame(&self, frame: Bytes, merge: Merge) {
+    fn run_broadcast_frame(&self, frame: Bytes, merge: BroadcastMerge) {
         let seq = self.alloc_seq();
         let shared = self.shared.clone();
         let reply_tx = self.reply_tx.clone();
         let id = self.id;
+        // detached deliberately: completion is bounded by backend replies.
         tokio::task::spawn_local(async move {
             let topo = shared.topo.load_full();
             let mut receivers = Vec::with_capacity(topo.masters.len());
@@ -579,8 +585,8 @@ impl Session {
                 replies.push((Vec::new(), recv_or_lost(rx).await));
             }
             let merged = match merge {
-                Merge::Sum => multikey::merge_sum(&replies),
-                Merge::Ok => multikey::merge_ok(&replies),
+                BroadcastMerge::Sum => multikey::merge_sum(&replies),
+                BroadcastMerge::Ok => multikey::merge_ok(&replies),
             };
             let out = match merged {
                 Ok(b) => Bytes::from(b),
@@ -634,31 +640,35 @@ impl Session {
                 state.slot = Some(slot);
                 state.frames.push(frame);
                 drop(guard);
-                self.emit_local(b"+QUEUED\r\n".to_vec());
+                self.emit_local(Bytes::from_static(b"+QUEUED\r\n"));
             }
         }
     }
 
     async fn handle_local(&self, spec: &Spec, frame: Bytes, argc: usize) {
-        let reply = {
+        let reply: Option<Bytes> = {
             let args = collect_args(&frame, argc);
             match spec.name {
-                "ping" => Some(admin::ping(&args)),
-                "echo" => Some(admin::echo(&args)),
-                "select" => Some(admin::select(&args)),
-                "time" => Some(admin::time()),
-                "info" => Some(admin::info(
+                "ping" => Some(Bytes::from(admin::ping(&args))),
+                "echo" => Some(Bytes::from(admin::echo(&args))),
+                "select" => Some(Bytes::from(admin::select(&args))),
+                "time" => Some(Bytes::from(admin::time())),
+                "info" => Some(Bytes::from(admin::info(
                     &self.shared.cfg,
                     &self.shared.stats,
                     self.shared.started,
-                )),
-                "config" => Some(admin::config_cmd(&args, &self.shared.cfg)),
-                "cluster" => Some(admin::cluster(&args, &self.shared.cfg, self.proto.get())),
-                "command" => Some(admin::command_reply(
+                ))),
+                "config" => Some(Bytes::from(admin::config_cmd(&args, &self.shared.cfg))),
+                "cluster" => Some(Bytes::from(admin::cluster(
+                    &args,
+                    &self.shared.cfg,
+                    self.proto.get(),
+                ))),
+                "command" => Some(Bytes::from(admin::command_reply(
                     &args,
                     command::table(),
                     self.proto.get(),
-                )),
+                ))),
                 "auth" => {
                     self.handle_auth(&args);
                     None
@@ -671,9 +681,9 @@ impl Session {
                     Some(b"whoami") => {
                         let mut out = Vec::new();
                         admin::bulk(&mut out, b"default");
-                        Some(out)
+                        Some(Bytes::from(out))
                     }
-                    _ => Some(error_frame_vec("ERR unsupported ACL subcommand")),
+                    _ => Some(error_frame("ERR unsupported ACL subcommand")),
                 },
                 "client" => {
                     self.handle_client_cmd(&args);
@@ -681,35 +691,35 @@ impl Session {
                 }
                 "quit" => {
                     self.closing.set(true);
-                    Some(admin::OK.to_vec())
+                    Some(Bytes::from_static(admin::OK))
                 }
                 "reset" => {
                     *self.multi.borrow_mut() = None;
                     self.proto.set(2);
                     self.proto_switches.push(self.next_seq.get(), 2);
                     self.authed.set(self.shared.cfg.requirepass.is_empty());
-                    Some(b"+RESET\r\n".to_vec())
+                    Some(Bytes::from_static(b"+RESET\r\n"))
                 }
                 "multi" => {
                     if self.multi.borrow().is_some() {
-                        Some(error_frame_vec("ERR MULTI calls can not be nested"))
+                        Some(error_frame("ERR MULTI calls can not be nested"))
                     } else {
                         *self.multi.borrow_mut() = Some(MultiState {
                             slot: None,
                             frames: Vec::new(),
                             aborted: false,
                         });
-                        Some(admin::OK.to_vec())
+                        Some(Bytes::from_static(admin::OK))
                     }
                 }
                 "discard" => {
                     if self.multi.borrow_mut().take().is_some() {
-                        Some(admin::OK.to_vec())
+                        Some(Bytes::from_static(admin::OK))
                     } else {
-                        Some(error_frame_vec("ERR DISCARD without MULTI"))
+                        Some(error_frame("ERR DISCARD without MULTI"))
                     }
                 }
-                _ => Some(error_frame_vec("ERR unsupported command")),
+                _ => Some(error_frame("ERR unsupported command")),
             }
         };
         if let Some(bytes) = reply {
@@ -728,7 +738,7 @@ impl Session {
             return;
         }
         if state.frames.is_empty() {
-            self.emit_local(b"*0\r\n".to_vec());
+            self.emit_local(Bytes::from_static(b"*0\r\n"));
             return;
         }
         let seq = self.alloc_seq();
@@ -772,7 +782,7 @@ impl Session {
         };
         if given == Some(pass) {
             self.authed.set(true);
-            self.emit_local(admin::OK.to_vec());
+            self.emit_local(Bytes::from_static(admin::OK));
         } else {
             self.emit_error("WRONGPASS invalid username-password pair or user is disabled.");
         }
@@ -861,7 +871,7 @@ impl Session {
             }
             Some(b"setname") if args.len() == 3 => {
                 *self.name.borrow_mut() = String::from_utf8_lossy(args[2]).into_owned();
-                self.emit_local(admin::OK.to_vec());
+                self.emit_local(Bytes::from_static(admin::OK));
             }
             Some(b"getname") => {
                 let mut out = Vec::new();
@@ -914,7 +924,7 @@ impl Session {
                     }
                     self.proto.set(2);
                     self.proto_switches.push(self.next_seq.get(), 2);
-                    self.emit_local(b"+RESET\r\n".to_vec());
+                    self.emit_local(Bytes::from_static(b"+RESET\r\n"));
                     return;
                 }
                 _ => {
@@ -939,7 +949,7 @@ impl Session {
                 self.emit_error("ERR pubsub backend connection lost");
             }
         } else {
-            self.emit_local(admin::OK.to_vec());
+            self.emit_local(Bytes::from_static(admin::OK));
         }
     }
 
@@ -975,19 +985,47 @@ impl Session {
         seq
     }
 
-    fn emit_local(&self, bytes: Vec<u8>) {
+    fn emit_local(&self, bytes: impl Into<Bytes>) {
         let seq = self.alloc_seq();
-        self.emit_at(seq, Bytes::from(bytes));
+        self.emit_at(seq, bytes.into());
     }
 
     fn emit_error(&self, msg: &str) {
         stats::bump(&self.shared.stats.workers[self.shared.worker].errors);
-        self.emit_local(error_frame_vec(msg));
+        self.emit_local(error_frame(msg));
     }
 
     fn emit_at(&self, seq: u64, frame: Bytes) {
         let _ = self.reply_tx.send((seq, frame));
     }
+}
+
+/// Per-session resolved connections, valid for one topology epoch.
+struct ConnCache {
+    epoch: u64,
+    by_node: Vec<Option<Rc<crate::backend::Conn>>>,
+}
+
+struct MultiState {
+    slot: Option<u16>,
+    frames: Vec<Bytes>,
+    aborted: bool,
+}
+
+struct PubsubHandle {
+    tx: mpsc::Sender<Bytes>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+enum Merge {
+    Mget,
+    Sum,
+    Ok,
+}
+
+enum BroadcastMerge {
+    Sum,
+    Ok,
 }
 
 /// Serves one client connection to completion.
@@ -1036,7 +1074,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         close_rx,
         inflight,
         emitted.clone(),
-        proto_switches.clone(),
+        proto_switches,
         oob_budget,
         proto,
         id,
@@ -1111,27 +1149,6 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
     let _ = close_tx.send(final_seq);
     let _ = writer.await;
     stats::bump(&shared.stats.workers[shared.worker].sessions_closed);
-}
-/// Per-session resolved connections, valid for one topology epoch.
-struct ConnCache {
-    epoch: u64,
-    by_node: Vec<Option<Rc<crate::backend::Conn>>>,
-}
-
-struct MultiState {
-    slot: Option<u16>,
-    frames: Vec<Bytes>,
-    aborted: bool,
-}
-
-struct PubsubHandle {
-    tx: mpsc::Sender<Bytes>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-enum Merge {
-    Sum,
-    Ok,
 }
 
 fn is_pubsub_command(frame: &Bytes, argc: usize) -> bool {

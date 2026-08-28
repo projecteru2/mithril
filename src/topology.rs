@@ -9,7 +9,6 @@ pub const NO_NODE: u16 = u16::MAX;
 pub struct Node {
     pub id: String,
     pub addr: String,
-    pub master: Option<u16>,
     pub fail: bool,
     pub replicas: Vec<u16>,
 }
@@ -28,8 +27,8 @@ impl Topology {
     pub fn parse(raw: &str) -> Result<Topology, String> {
         let mut nodes = Vec::new();
         let mut slot_specs: Vec<(u16, Vec<(u16, u16)>)> = Vec::new();
-        let mut master_ids: Vec<(String, u16)> = Vec::new();
-        let mut replica_refs: Vec<(u16, String)> = Vec::new();
+        let mut master_ids: Vec<(&str, u16)> = Vec::new();
+        let mut replica_refs: Vec<(u16, &str)> = Vec::new();
 
         for line in raw.lines() {
             let mut fields = line.split(' ');
@@ -46,7 +45,7 @@ impl Topology {
             let is_master = flags.contains("master");
             let fail = flags.contains("fail") && !flags.contains("failover");
             if is_master {
-                master_ids.push((id.to_string(), idx));
+                master_ids.push((id, idx));
                 let ranges = fields
                     .skip(4)
                     .filter(|f| !f.starts_with('['))
@@ -54,12 +53,11 @@ impl Topology {
                     .collect::<Vec<_>>();
                 slot_specs.push((idx, ranges));
             } else {
-                replica_refs.push((idx, master_ref.to_string()));
+                replica_refs.push((idx, master_ref));
             }
             nodes.push(Node {
                 id: id.to_string(),
                 addr: addr.to_string(),
-                master: None,
                 fail,
                 replicas: Vec::new(),
             });
@@ -76,7 +74,6 @@ impl Topology {
             let Some((_, midx)) = master_ids.iter().find(|(id, _)| *id == master_ref) else {
                 return Err(format!("replica {} references unknown master", idx));
             };
-            nodes[idx as usize].master = Some(*midx);
             let replica_ok = !nodes[idx as usize].fail;
             if replica_ok {
                 nodes[*midx as usize].replicas.push(idx);
