@@ -197,8 +197,8 @@ impl Session {
             Kind::AnyMaster => self.forward_any_master(frame).await,
             Kind::MultiSum | Kind::Mget | Kind::Mset => self.fan_out(spec, &frame, argc),
             Kind::Blocking => self.forward_blocking(spec, frame, argc),
-            Kind::Eval => self.forward_eval(frame, argc).await,
-            Kind::Xread => self.forward_xread(spec, frame, argc).await,
+            Kind::Eval => Box::pin(self.forward_eval(frame, argc)).await,
+            Kind::Xread => Box::pin(self.forward_xread(spec, frame, argc)).await,
             Kind::Subscribe => self.enter_pubsub(spec, frame, argc),
             Kind::Scan => self.run_scan(frame, argc),
             Kind::Dbsize => self.run_broadcast(frame, true),
@@ -246,7 +246,7 @@ impl Session {
             };
             self.cached_conn(&topo, idx, false)
         };
-        self.send_single(conn, seq, frame).await;
+        conn.send(self.client_out(seq, frame)).await;
     }
 
     fn any_master_addr(&self) -> Option<String> {
@@ -285,24 +285,16 @@ impl Session {
             self.cached_conn(&topo, idx, is_replica)
         };
         self.track_inflight(seq, &frame, 1);
-        // send_single's body inlined: one less future layer on the hot path
-        conn.send(Outbound {
-            head: None,
-            frame,
-            expect: 1,
-            sink: Sink::Client(self.reply_tx.clone(), seq),
-        })
-        .await;
+        conn.send(self.client_out(seq, frame)).await;
     }
 
-    async fn send_single(&self, conn: Rc<crate::backend::Conn>, seq: u64, frame: Bytes) {
-        conn.send(Outbound {
+    fn client_out(&self, seq: u64, frame: Bytes) -> Outbound {
+        Outbound {
             head: None,
             frame,
             expect: 1,
             sink: Sink::Client(self.reply_tx.clone(), seq),
-        })
-        .await;
+        }
     }
 
     fn track_inflight(&self, seq: u64, frame: &Bytes, expect: u32) {
@@ -341,7 +333,7 @@ impl Session {
             return;
         };
         self.track_inflight(seq, &frame, 1);
-        self.send_single(conn, seq, frame).await;
+        conn.send(self.client_out(seq, frame)).await;
     }
 
     async fn forward_xread(&self, spec: &Spec, frame: Bytes, argc: usize) {
@@ -624,6 +616,10 @@ impl Session {
             self.emit_local(Bytes::from_static(b"+PONG\r\n"));
             return;
         }
+        if spec.name == "exec" {
+            Box::pin(self.handle_exec()).await;
+            return;
+        }
         let reply: Option<Bytes> = {
             let args = collect_args(&frame, argc);
             match spec.name {
@@ -687,10 +683,6 @@ impl Session {
                         });
                         Some(Bytes::from_static(admin::OK))
                     }
-                }
-                "exec" => {
-                    self.handle_exec().await;
-                    None
                 }
                 "discard" => {
                     if self.multi.borrow_mut().take().is_some() {
