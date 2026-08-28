@@ -896,7 +896,7 @@ impl Session {
                 self.emit_local(Bytes::from_static(b"+RESET\r\n"));
                 return;
             }
-            _ if self.pubsub_overflow(spec, argc) => {
+            _ if self.pubsub_overflow(spec, &frame, argc) => {
                 self.emit_error("ERR pubsub confirmation backlog exceeds limit");
                 return;
             }
@@ -923,21 +923,37 @@ impl Session {
 
     // every promised confirmation occupies the reply window until emitted, and
     // a bare unsubscribe promises one per live subscription: both need bounds.
-    fn pubsub_overflow(&self, spec: &Spec, argc: usize) -> bool {
-        let live = {
-            let subs = self.subs.borrow();
-            subs.channels.len() + subs.patterns.len()
-        };
+    fn pubsub_overflow(&self, spec: &Spec, frame: &Bytes, argc: usize) -> bool {
+        let subs = self.subs.borrow();
         let expected = if argc > 1 {
             argc - 1
-        } else if spec.kind == Kind::Subscribe {
-            live.max(1)
+        } else if spec.name == "unsubscribe" {
+            subs.channels.len().max(1)
+        } else if spec.name == "punsubscribe" {
+            subs.patterns.len().max(1)
         } else {
             1
         };
-        let growing = matches!(spec.name, "subscribe" | "psubscribe");
         let outstanding = (self.next_seq.get() - self.link.emitted.get()) as usize;
-        (growing && live + expected > SUBS_LIMIT) || outstanding + expected > MAX_INFLIGHT
+        if outstanding + expected > MAX_INFLIGHT {
+            return true;
+        }
+        if !matches!(spec.name, "subscribe" | "psubscribe") {
+            return false;
+        }
+        let target = if spec.name == "psubscribe" {
+            &subs.patterns
+        } else {
+            &subs.channels
+        };
+        let mut grown = subs.channels.len() + subs.patterns.len();
+        let mut fresh: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+        for a in resp::Args::new(frame, argc).skip(1) {
+            if !target.contains(a) && fresh.insert(a) {
+                grown += 1;
+            }
+        }
+        grown > SUBS_LIMIT
     }
 
     fn promise_subscription(&self, frame: &Bytes, argc: usize) {
@@ -956,7 +972,7 @@ impl Session {
     }
 
     fn enter_pubsub(&self, spec: &Spec, first_frame: Bytes, argc: usize) {
-        if self.pubsub_overflow(spec, argc) {
+        if self.pubsub_overflow(spec, &first_frame, argc) {
             self.emit_error("ERR pubsub confirmation backlog exceeds limit");
             return;
         }
