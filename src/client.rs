@@ -1097,6 +1097,10 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
 
     let mut buf = BytesMut::with_capacity(READ_CHUNK);
     'main: loop {
+        // a dead writer must not let a half-open client keep executing writes.
+        if reply_tx.is_closed() {
+            break;
+        }
         loop {
             match resp::scan_request(&buf) {
                 ReqScan::Complete { len, argc } => {
@@ -1142,7 +1146,10 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
                     session.emit_error("ERR query buffer exceeds limit");
                     break 'main;
                 }
-                Ok(Ok(_)) => gated_read = true,
+                Ok(Ok(n)) => {
+                    stats::add(&shared.stats.workers[shared.worker].bytes_in, n as u64);
+                    gated_read = true;
+                }
                 _ => {}
             }
         }
