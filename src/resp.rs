@@ -102,6 +102,10 @@ pub fn scan_request(buf: &[u8]) -> ReqScan {
         return ReqScan::Invalid("bad argument count");
     }
     for _ in 0..argc {
+        // '=' verbatim bulks are reply-only; forwarding one breaks RESP2 backends
+        if buf.get(pos) == Some(&b'=') {
+            return ReqScan::Invalid("verbatim string in request");
+        }
         match scan_bulk(buf, pos) {
             Some(Ok((payload, end))) => {
                 // scan_bulk encodes a null bulk as payload.1 == end.

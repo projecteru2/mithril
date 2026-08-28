@@ -73,6 +73,8 @@ pub type ReplyTx = mpsc::UnboundedSender<Reply>;
 struct WriterLink {
     inflight: InflightRing,
     emitted: Cell<u64>,
+    /// Set when no reply can ever be written again; the reader must stop dispatching.
+    closed: Cell<bool>,
     proto_switches: ProtoSwitchQueue,
     oob_budget: Cell<usize>,
     oob_notify: tokio::sync::Notify,
@@ -167,6 +169,12 @@ impl Session {
                 self.dispatch_pubsub(spec, frame, argc);
                 return;
             }
+        }
+        // no reply can ever be written: executing this command would commit
+        // effects the client can never observe
+        if self.link.closed.get() {
+            self.closing.set(true);
+            return;
         }
         if self.multi.borrow().is_some() && spec.flags & command::FLAG_TXN_CTRL == 0 {
             self.queue_multi(spec, frame, argc);
@@ -1087,8 +1095,8 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
 
     let mut buf = BytesMut::with_capacity(READ_CHUNK);
     'main: loop {
-        // a dead writer must not let a half-open client keep executing writes
-        if reply_tx.is_closed() {
+        // a closing session must not let a half-open client keep executing writes
+        if link.closed.get() {
             break;
         }
         loop {
@@ -1127,17 +1135,17 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         }
         let mut gated_read = false;
         while session.next_seq.get().saturating_sub(link.emitted.get()) > MAX_INFLIGHT as u64 {
-            if reply_tx.is_closed() {
+            if link.closed.get() {
                 break 'main;
             }
             match tokio::time::timeout(GATE_PROBE, read_half.read_buf(&mut buf)).await {
                 Ok(Ok(0)) | Ok(Err(_)) => break 'main,
-                Ok(Ok(_)) if buf.len() > shared.cfg.query_buffer_limit => {
-                    session.emit_error("ERR query buffer exceeds limit");
-                    break 'main;
-                }
                 Ok(Ok(n)) => {
                     stats::add(&shared.stats.workers[shared.worker].bytes_in, n as u64);
+                    if buf.len() > shared.cfg.query_buffer_limit {
+                        session.emit_error("ERR query buffer exceeds limit");
+                        break 'main;
+                    }
                     gated_read = true;
                 }
                 _ => {}
@@ -1296,14 +1304,22 @@ async fn pubsub_relay(
         }
     };
     let (mut read_half, mut write_half) = stream.into_split();
-    let writer = tokio::task::spawn_local(async move {
+    // guard ties the forward-writer to the relay: an aborted relay must not
+    // detach a child blocked in write_all on an unread socket
+    struct AbortOnDrop(tokio::task::JoinHandle<()>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _writer = AbortOnDrop(tokio::task::spawn_local(async move {
         use tokio::io::AsyncWriteExt;
         while let Some(frame) = rx.recv().await {
             if write_half.write_all(&frame).await.is_err() {
                 return;
             }
         }
-    });
+    }));
     let mut buf = BytesMut::with_capacity(READ_CHUNK);
     let mut last_ack: Option<u64> = None;
     'io: loop {
@@ -1343,9 +1359,10 @@ async fn pubsub_relay(
             Ok(_) => {}
         }
     }
-    writer.abort();
     backfill_acks(&link, &reply_tx);
-    // an idle subscriber must not outlive its dead pubsub backend
+    // an idle subscriber must not outlive its dead pubsub backend; the flag
+    // stops the reader dispatching before the writer consumes Close.
+    link.closed.set(true);
     let _ = reply_tx.send(Reply::Close);
 }
 
@@ -1385,6 +1402,7 @@ async fn write_loop(
     }
     impl Drop for ExitBump<'_> {
         fn drop(&mut self) {
+            self.link.closed.set(true);
             stats::bump(&self.shared.stats.workers[self.shared.worker].writers_exited);
             self.link.oob_notify.notify_waiters();
         }
