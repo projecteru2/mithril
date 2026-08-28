@@ -1,0 +1,92 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: Linux_x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            artifact: Linux_arm64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: Darwin_arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Extract VERSION
+        run: echo "VERSION=$(git describe --tags --always)" >> $GITHUB_ENV
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+
+      - name: Build
+        run: |
+          export MITHRIL_VERSION=${{ env.VERSION }}
+          export MITHRIL_REVISION=${GITHUB_SHA::12}
+          cargo build --release --target ${{ matrix.target }}
+          ./target/${{ matrix.target }}/release/mithril --version || true
+
+      - name: Package
+        run: |
+          V=${VERSION#v}
+          mkdir -p dist
+          tar -C target/${{ matrix.target }}/release -czf /tmp/bin.tar.gz mithril
+          mkdir -p pkg && tar -C pkg -xzf /tmp/bin.tar.gz
+          cp LICENSE README.md mithril.conf.sample pkg/
+          tar -C pkg -czf dist/mithril_${V}_${{ matrix.artifact }}.tar.gz .
+          cp dist/mithril_${V}_${{ matrix.artifact }}.tar.gz dist/mithril_${{ matrix.artifact }}.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.artifact }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum *.tar.gz > checksums.txt
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=$(git describe --tags --abbrev=0)
+          gh release create "$TAG" --generate-notes --verify-tag dist/* || \
+            gh release upload "$TAG" dist/* --clobber
