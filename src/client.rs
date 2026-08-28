@@ -189,7 +189,10 @@ impl Session {
             return;
         }
         match spec.kind {
-            Kind::Single => self.forward_single(spec, frame, argc).await,
+            Kind::Single => match self.key_slot(&frame, argc, spec.first_key as usize) {
+                Some(slot) => self.route_and_send(slot, spec.is_readonly(), frame).await,
+                None => self.emit_error("ERR missing key"),
+            },
             Kind::Local => self.handle_local(spec, frame, argc).await,
             Kind::AnyMaster => self.forward_any_master(frame).await,
             Kind::MultiSum | Kind::Mget | Kind::Mset => self.fan_out(spec, &frame, argc),
@@ -206,14 +209,6 @@ impl Session {
     fn key_slot(&self, frame: &Bytes, argc: usize, key_index: usize) -> Option<u16> {
         let mut it = resp::Args::new(frame, argc);
         it.nth(key_index).map(crc16::slot)
-    }
-
-    async fn forward_single(&self, spec: &Spec, frame: Bytes, argc: usize) {
-        let Some(slot) = self.key_slot(&frame, argc, spec.first_key as usize) else {
-            self.emit_error("ERR missing key");
-            return;
-        };
-        self.route_and_send(slot, spec.is_readonly(), frame).await;
     }
 
     // one Vec index per request once warm; re-resolves on epoch or death
@@ -290,7 +285,14 @@ impl Session {
             self.cached_conn(&topo, idx, is_replica)
         };
         self.track_inflight(seq, &frame, 1);
-        self.send_single(conn, seq, frame).await;
+        // send_single's body inlined: one less future layer on the hot path
+        conn.send(Outbound {
+            head: None,
+            frame,
+            expect: 1,
+            sink: Sink::Client(self.reply_tx.clone(), seq),
+        })
+        .await;
     }
 
     async fn send_single(&self, conn: Rc<crate::backend::Conn>, seq: u64, frame: Bytes) {

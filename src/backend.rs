@@ -55,8 +55,17 @@ impl Conn {
             deliver(out.sink, Bytes::from_static(ERR_BACKEND_LOST));
             return;
         }
-        if let Err(e) = self.tx.send(out).await {
-            deliver(e.0.sink, Bytes::from_static(ERR_BACKEND_LOST));
+        match self.tx.try_send(out) {
+            Ok(()) => {}
+            // boxed so the rare full-queue wait stays out of every caller's future
+            Err(mpsc::error::TrySendError::Full(out)) => {
+                if let Err(e) = Box::pin(self.tx.send(out)).await {
+                    deliver(e.0.sink, Bytes::from_static(ERR_BACKEND_LOST));
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(out)) => {
+                deliver(out.sink, Bytes::from_static(ERR_BACKEND_LOST));
+            }
         }
     }
 
