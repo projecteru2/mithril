@@ -12,7 +12,7 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::backend::{ASKING_FRAME, Backends, ERR_BACKEND_LOST, Outbound, Sink};
+use crate::backend::{ASKING_FRAME, Backends, ERR_BACKEND_LOST, Outbound, Sink, ensure_read_room};
 use crate::command::{self, Kind, Spec};
 use crate::log_debug;
 use crate::multikey;
@@ -26,7 +26,6 @@ const SUBS_LIMIT: usize = 32768;
 const PUBSUB_FORWARD_QUEUE: usize = 64;
 const PUBSUB_PUSH_WINDOW: usize = 4096;
 const GATE_PROBE: std::time::Duration = std::time::Duration::from_millis(100);
-const READ_CHUNK: usize = crate::backend::READ_CHUNK;
 
 const ERR_NOAUTH: &[u8] = b"-NOAUTH Authentication required.\r\n";
 const ERR_CROSSSLOT: &[u8] = b"-CROSSSLOT Keys in request don't hash to the same slot\r\n";
@@ -1167,7 +1166,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         id,
     ));
 
-    let mut buf = BytesMut::with_capacity(READ_CHUNK);
+    let mut buf = BytesMut::with_capacity(crate::backend::READ_INIT);
     'main: loop {
         // a closing session must not let a half-open client keep executing writes
         if link.closed.get() {
@@ -1211,6 +1210,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
                 if link.closed.get() {
                     break 'main;
                 }
+                ensure_read_room(&mut buf);
                 match tokio::time::timeout(GATE_PROBE, read_half.read_buf(&mut buf)).await {
                     Ok(Ok(0)) | Ok(Err(_)) => break 'main,
                     Ok(Ok(n)) => {
@@ -1229,6 +1229,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
             session.emit_error("ERR query buffer exceeds limit");
             break;
         }
+        ensure_read_room(&mut buf);
         // only a relay can close the session while the read is parked; a dead
         // writer without one implies a dead socket the read observes itself
         let read = if link.has_relay.get() {
@@ -1418,7 +1419,7 @@ async fn pubsub_relay(
             }
         }
     }));
-    let mut buf = BytesMut::with_capacity(READ_CHUNK);
+    let mut buf = BytesMut::with_capacity(crate::backend::READ_INIT);
     let mut last_ack: Option<u64> = None;
     'io: loop {
         loop {
@@ -1452,6 +1453,7 @@ async fn pubsub_relay(
                 resp::Scan::Incomplete => break,
             }
         }
+        ensure_read_room(&mut buf);
         match read_half.read_buf(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(_) => {}

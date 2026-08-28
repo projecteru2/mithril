@@ -19,6 +19,7 @@ use crate::resp;
 
 pub const OUTBOUND_QUEUE: usize = 8192;
 pub const READ_CHUNK: usize = 64 * 1024;
+pub const READ_INIT: usize = 8 * 1024;
 pub const BATCH: usize = 256;
 pub const MAX_EXCLUSIVE_PER_NODE: usize = 512;
 
@@ -298,7 +299,7 @@ async fn run_conn(
     let mut front_err: Option<Bytes> = None;
     let mut batch: Vec<Outbound> = Vec::with_capacity(BATCH);
     let mut frames: Vec<Bytes> = Vec::with_capacity(BATCH * 2);
-    let mut buf = BytesMut::with_capacity(READ_CHUNK);
+    let mut buf = BytesMut::with_capacity(READ_INIT);
     let mut tx_open = true;
     'io: loop {
         loop {
@@ -335,6 +336,7 @@ async fn run_conn(
         if !tx_open && pending.is_empty() {
             break 'io;
         }
+        ensure_read_room(&mut buf);
         tokio::select! {
             _ = conn.abort.notified(), if abortable => {
                 break 'io;
@@ -380,6 +382,13 @@ async fn run_conn(
         deliver(p.sink, Bytes::from_static(ERR_BACKEND_LOST));
     }
     drain_channel(&mut rx);
+}
+
+/// Grows a read buffer geometrically to READ_CHUNK; idle sessions stay small.
+pub fn ensure_read_room(buf: &mut BytesMut) {
+    if buf.capacity() - buf.len() < 2048 {
+        buf.reserve(buf.capacity().clamp(READ_INIT, READ_CHUNK));
+    }
 }
 
 fn deliver(sink: Sink, frame: Bytes) {
