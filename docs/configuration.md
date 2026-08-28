@@ -4,7 +4,7 @@
 
 | key | default | notes |
 |---|---|---|
-| bind / port | 0.0.0.0 / 7979 | SO_REUSEPORT, one listener per worker |
+| bind / port | 0.0.0.0 / 7979 | one listener, owned by the acceptor thread |
 | announce-addr | bind:port | address advertised by cluster emulation |
 | bootstrap | (required) | comma-separated seed node list |
 | worker-threads | CPU count | |

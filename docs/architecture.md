@@ -1,8 +1,9 @@
 # Architecture
 
 Thread-per-core: each worker thread runs a single-threaded tokio runtime with
-its own SO_REUSEPORT listener, its own backend connection pools, and no
-cross-worker communication on the request path. The cluster topology is a
+its own backend connection pools and no cross-worker communication on the
+request path; a central acceptor thread owns the listener and places
+connections round-robin (see below). The cluster topology is a
 shared immutable snapshot behind `arc-swap`, refreshed by a dedicated thread
 every `topology-refresh-secs` and on demand after MOVED/ASK redirects.
 
