@@ -67,6 +67,8 @@ struct WriterLink {
     oob_notify: tokio::sync::Notify,
     /// Pre-allocated sequences for pending pubsub confirmations, in order.
     ack_seqs: RefCell<std::collections::VecDeque<u64>>,
+    /// Signalled whenever ack_seqs drains or the relay backfills.
+    acks_drained: tokio::sync::Notify,
 }
 /// Pending protocol flips; `armed` keeps the hot path off the RefCell.
 #[derive(Default)]
@@ -826,6 +828,17 @@ impl Session {
     // the reader mirrors the subscription set, so mode exit is its own call;
     // it only drains already-promised confirmations before dropping the relay.
     async fn exit_pubsub_if_done(&self) -> bool {
+        let relay_dead = self
+            .pubsub
+            .borrow()
+            .as_ref()
+            .is_none_or(|ps| ps.task.is_finished());
+        if relay_dead {
+            self.subs.borrow_mut().channels.clear();
+            self.subs.borrow_mut().patterns.clear();
+            self.stop_pubsub();
+            return true;
+        }
         if !self.subs.borrow().is_empty() {
             return false;
         }
@@ -838,7 +851,7 @@ impl Session {
             if finished || self.reply_tx.is_closed() {
                 break;
             }
-            tokio::task::yield_now().await;
+            self.link.acks_drained.notified().await;
         }
         self.stop_pubsub();
         true
@@ -899,8 +912,9 @@ impl Session {
             .as_ref()
             .is_some_and(|ps| ps.tx.try_send(frame).is_ok());
         if !sent {
+            // the backfilled confirmation sequences already answer this
+            // command; an extra error reply would desynchronize the stream.
             self.stop_pubsub();
-            self.emit_error("ERR pubsub backend connection lost");
         }
     }
 
@@ -1114,6 +1128,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
             session.emit_error("ERR query buffer exceeds limit");
             break;
         }
+        let mut gated_read = false;
         while session.next_seq.get().saturating_sub(link.emitted.get()) > MAX_INFLIGHT as u64 {
             if reply_tx.is_closed() {
                 break 'main;
@@ -1124,8 +1139,12 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
                     session.emit_error("ERR query buffer exceeds limit");
                     break 'main;
                 }
+                Ok(Ok(_)) => gated_read = true,
                 _ => {}
             }
+        }
+        if gated_read {
+            continue 'main;
         }
         match read_half.read_buf(&mut buf).await {
             Ok(0) | Err(_) => break,
@@ -1292,10 +1311,12 @@ async fn pubsub_relay(
             match resp::scan_value(&buf) {
                 resp::Scan::Complete(len) => {
                     let frame = buf.split_to(len).freeze();
-                    let ack = subscription_count(&frame).is_some();
-                    let tagged = if ack {
+                    let tagged = if !is_publication(&frame) {
                         match link.ack_seqs.borrow_mut().pop_front() {
-                            Some(seq) => (seq | PUBSUB_ACK_BIT, frame),
+                            Some(seq) => {
+                                link.acks_drained.notify_one();
+                                (seq | PUBSUB_ACK_BIT, frame)
+                            }
                             None => (SEQ_OOB, frame),
                         }
                     } else {
@@ -1332,6 +1353,7 @@ fn backfill_acks(link: &Rc<WriterLink>, reply_tx: &ReplyTx) {
     for seq in drained {
         let _ = reply_tx.send((seq | PUBSUB_ACK_BIT, Bytes::from_static(ERR_BACKEND_LOST)));
     }
+    link.acks_drained.notify_one();
 }
 
 async fn write_loop(
@@ -1358,6 +1380,7 @@ async fn write_loop(
     let mut close_at: Option<u64> = None;
     let mut parked: BTreeMap<u64, Bytes> = BTreeMap::new();
     let mut parked_acks: BTreeMap<u64, Bytes> = BTreeMap::new();
+    let mut held_pushes: Vec<Bytes> = Vec::new();
     let mut batch: Vec<(u64, Bytes)> = Vec::with_capacity(crate::backend::BATCH);
     let mut ready: Vec<Bytes> = Vec::with_capacity(crate::backend::BATCH);
     loop {
@@ -1365,6 +1388,7 @@ async fn write_loop(
             && next_emit >= n
             && parked.is_empty()
             && parked_acks.is_empty()
+            && held_pushes.is_empty()
         {
             return;
         }
@@ -1391,7 +1415,12 @@ async fn write_loop(
                 if left == PUBSUB_PUSH_WINDOW - 1 {
                     link.oob_notify.notify_waiters();
                 }
-                push_pubsub_frame(&mut ready, frame, cur_proto);
+                // a push observed after a confirmation must not overtake it.
+                if parked_acks.is_empty() {
+                    push_pubsub_frame(&mut ready, frame, cur_proto);
+                } else {
+                    held_pushes.push(frame);
+                }
                 continue;
             }
             if seq & PUBSUB_ACK_BIT != 0 {
@@ -1448,6 +1477,11 @@ async fn write_loop(
                 break;
             }
         }
+        if parked_acks.is_empty() {
+            for frame in held_pushes.drain(..) {
+                push_pubsub_frame(&mut ready, frame, cur_proto);
+            }
+        }
         if !ready.is_empty() {
             let mut total = 0usize;
             let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(ready.len());
@@ -1482,24 +1516,19 @@ fn take_retry_frame(inflight: &InflightMap, seq: u64, ask: bool) -> Option<(Byte
     }
 }
 
-/// Returns the remaining-subscriptions count of a (p|un)subscribe
-/// confirmation frame, or None for any other frame.
-fn subscription_count(frame: &[u8]) -> Option<i64> {
-    let items = multikey::split_array(frame)?;
-    if items.len() != 3 {
-        return None;
+/// True for published messages; everything else on a pubsub connection is a
+/// reply to a forwarded command and must consume its promised sequence.
+fn is_publication(frame: &[u8]) -> bool {
+    let Some(items) = multikey::split_array(frame) else {
+        return false;
+    };
+    if items.len() < 3 {
+        return false;
     }
-    let kind = resp::bulk_payload(items[0])?;
-    let known = [
-        b"subscribe".as_ref(),
-        b"unsubscribe".as_ref(),
-        b"psubscribe".as_ref(),
-        b"punsubscribe".as_ref(),
-    ];
-    if !known.iter().any(|k| kind.eq_ignore_ascii_case(k)) {
-        return None;
-    }
-    multikey::parse_int(items[2])
+    let Some(kind) = resp::bulk_payload(items[0]) else {
+        return false;
+    };
+    kind.eq_ignore_ascii_case(b"message") || kind.eq_ignore_ascii_case(b"pmessage")
 }
 
 // RESP3 clients receive pubsub frames as push type; the leading '*' becomes

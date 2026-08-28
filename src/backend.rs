@@ -224,24 +224,35 @@ async fn run_conn(
     cfg: &Config,
     conn: &Conn,
 ) {
-    let stream = match connect(addr, cfg.tcp_keepalive_secs).await {
-        Ok(s) => s,
-        Err(e) => {
-            log_debug!("dial {addr}: {e}");
+    let stream = tokio::select! {
+        _ = conn.abort.notified() => {
             drain_channel(&mut rx);
             return;
         }
+        r = connect(addr, cfg.tcp_keepalive_secs) => match r {
+            Ok(s) => s,
+            Err(e) => {
+                log_debug!("dial {addr}: {e}");
+                drain_channel(&mut rx);
+                return;
+            }
+        },
     };
     let (mut read_half, mut write_half) = stream.into_split();
-    if let Err(e) = handshake(
-        &mut read_half,
-        &mut write_half,
-        readonly,
-        &cfg.backend_user,
-        &cfg.backend_pass,
-    )
-    .await
-    {
+    let hs = tokio::select! {
+        _ = conn.abort.notified() => {
+            drain_channel(&mut rx);
+            return;
+        }
+        r = handshake(
+            &mut read_half,
+            &mut write_half,
+            readonly,
+            &cfg.backend_user,
+            &cfg.backend_pass,
+        ) => r,
+    };
+    if let Err(e) = hs {
         log_debug!("handshake {addr}: {e}");
         drain_channel(&mut rx);
         return;
