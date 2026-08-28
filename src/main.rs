@@ -3,6 +3,14 @@
 use mithril::config::Config;
 
 const USAGE: &str = "usage: mithril <conf-file> [--<key> <value>]...";
+const VERSION: &str = match option_env!("MITHRIL_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+const REVISION: &str = match option_env!("MITHRIL_REVISION") {
+    Some(v) => v,
+    None => "unknown",
+};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -11,7 +19,7 @@ fn main() {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--version" => {
-                println!("mithril {}", env!("CARGO_PKG_VERSION"));
+                println!("mithril {VERSION} ({REVISION})");
                 return;
             }
             "--help" => {

@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
 publish = false
-description = "Redis Cluster proxy"
+description = "Fast thread-per-core Redis Cluster proxy with RESP3 support"
+license = "AGPL-3.0-only"
+repository = "https://github.com/projecteru2/mithril"
+homepage = "https://projecteru2.github.io/mithril/"
 
 [dependencies]
 arc-swap = "1"

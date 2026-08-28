@@ -1,0 +1,25 @@
+name: test
+
+on:
+  push:
+    tags:
+      - '!v*'
+    branches:
+      - '**'
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Test
+        run: make test
+
+      - name: Build release binary
+        run: make build

@@ -1,0 +1,31 @@
+# mithril sample configuration; every key can be overridden on the command
+# line as --<key> <value>.
+
+bind 0.0.0.0
+port 7979
+
+# address clients should be told to connect to (cluster emulation)
+# announce-addr 127.0.0.1:7979
+
+# seed nodes of the backing Redis Cluster
+bootstrap 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
+
+# worker threads; defaults to the number of CPU cores
+# worker-threads 4
+
+# sticky shared connections per node per worker
+backend-conns 1
+
+# client auth (empty = no auth) and backend auth
+# requirepass secret
+# backend-auth-user default
+# backend-auth-pass secret
+
+# replica read splitting: off | master_readwrite | master_writeonly
+slave-mode off
+
+maxclients 10000
+tcp-keepalive 300
+query-buffer-limit 1gb
+topology-refresh-secs 15
+loglevel notice

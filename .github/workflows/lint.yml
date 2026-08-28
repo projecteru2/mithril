@@ -1,0 +1,27 @@
+name: lint
+
+on:
+  push:
+    tags:
+      - '!v*'
+    branches:
+      - '**'
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy, rustfmt
+
+      - name: Clippy
+        run: make lint
+
+      - name: Check formatting
+        run: make fmt-check
