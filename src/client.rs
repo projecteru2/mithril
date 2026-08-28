@@ -170,10 +170,17 @@ impl Session {
             self.emit_error_frame(Bytes::from_static(ERR_NOAUTH));
             return;
         }
-        if self.pubsub.borrow().is_some() && !self.exit_pubsub_if_done().await {
-            let passthrough = self.proto.get() >= 3 && !pubsub_allowed(spec);
-            if !passthrough {
-                self.dispatch_pubsub(spec, frame, argc);
+        if self.pubsub.borrow().is_some() {
+            if !self.exit_pubsub_if_done().await {
+                let passthrough = self.proto.get() >= 3 && !pubsub_allowed(spec);
+                if !passthrough {
+                    self.dispatch_pubsub(spec, frame, argc);
+                    return;
+                }
+            }
+            // the ack-drain wait can observe the relay dying: re-check
+            if self.link.closed.get() {
+                self.closing.set(true);
                 return;
             }
         }

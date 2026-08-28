@@ -18,9 +18,10 @@ make build
 
 ./target/release/mithril mithril.conf.sample --bootstrap 127.0.0.1:7001
 
-# or in docker
+# or in docker: announce-addr must be the address clients can reach
 docker run --rm -p 7979:7979 ghcr.io/projecteru2/mithril \
-  /etc/mithril/mithril.conf.sample --bootstrap host:port
+  /etc/mithril/mithril.conf.sample --bootstrap host:port \
+  --announce-addr <externally-routable-ip>:7979
 ```
 
 Point any Redis client — cluster-aware or not — at port 7979.
