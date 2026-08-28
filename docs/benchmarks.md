@@ -8,15 +8,15 @@ Every proxy runs 4 worker threads.
 
 | target | pipeline=1 ops/s | pipeline=16 ops/s |
 |---|---|---|
-| direct to cluster (no proxy) | 766k | 4.08M |
-| **mithril** | **946k** | **4.64M** |
-| mt-proxy (C++) | 963k | 3.28M |
-| predixy | 866k | 4.35M |
+| direct to cluster (no proxy) | 763k | 4.09M |
+| **mithril** | **944k** | **4.62M** |
+| mt-proxy (C++) | 961k | 3.28M |
+| predixy | 865k | 4.35M |
 
 At pipeline 16 mithril is the fastest of everything measured — including the
 direct arm, because request batching reduces per-op syscall load on the
 single-threaded redis processes. At pipeline 1 mithril trails mt-proxy by
-~1.4%: mt-proxy handles a request inline in a single epoll loop, while
+~1.7%: mt-proxy handles a request inline in a single epoll loop, while
 mithril pays reader-to-writer task handoffs that pipelining amortizes.
 
 Numbers from Docker-for-Mac invert the ranking and must not be used for
