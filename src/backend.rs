@@ -1,6 +1,4 @@
-//! Backend connections: pipelined writer/reader task pairs per node, with
-//! shared connections for regular traffic and exclusive ones for blocking
-//! commands and pubsub relays.
+//! Backend connections: shared pipelined conns per node, exclusive ones for blocking.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -43,12 +41,6 @@ pub struct Outbound {
     pub sink: Sink,
 }
 
-// reply pairing assumes RESP2 backends: no unsolicited pushes.
-struct Pending {
-    expect: u32,
-    sink: Sink,
-}
-
 /// A live backend connection; cheap to clone via Rc.
 pub struct Conn {
     tx: mpsc::Sender<Outbound>,
@@ -78,8 +70,6 @@ impl Conn {
         self.abort.notify_one();
     }
 }
-
-type PoolPair = [Option<Rc<Pool>>; 2];
 
 /// Per-worker backend pools keyed by node address, split by readonly role.
 pub struct Backends {
@@ -169,12 +159,6 @@ impl Backends {
     }
 }
 
-struct Pool {
-    shared: RefCell<Vec<Rc<Conn>>>,
-    idle_exclusive: RefCell<Vec<Rc<Conn>>>,
-    exclusive_count: Cell<usize>,
-}
-
 /// Lease whose incomplete drop frees quota: the pipeline still carries the command.
 pub struct ExclusiveLease {
     conn: Rc<Conn>,
@@ -208,6 +192,14 @@ impl Drop for ExclusiveLease {
     }
 }
 
+type PoolPair = [Option<Rc<Pool>>; 2];
+
+struct Pool {
+    shared: RefCell<Vec<Rc<Conn>>>,
+    idle_exclusive: RefCell<Vec<Rc<Conn>>>,
+    exclusive_count: Cell<usize>,
+}
+
 /// Dials a raw authenticated backend connection for relays and the refresher.
 pub async fn dial_raw(addr: &str, cfg: &Config) -> std::io::Result<TcpStream> {
     let stream = connect(addr, cfg.tcp_keepalive_secs).await?;
@@ -235,6 +227,12 @@ pub async fn write_slices<W: tokio::io::AsyncWrite + Unpin>(
         IoSlice::advance_slices(&mut rest, n);
     }
     Ok(())
+}
+
+// reply pairing assumes RESP2 backends: no unsolicited pushes
+struct Pending {
+    expect: u32,
+    sink: Sink,
 }
 
 async fn run_conn(

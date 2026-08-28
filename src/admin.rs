@@ -1,6 +1,4 @@
-//! Proxy-answered commands: connection handshake, introspection, and the
-//! single-virtual-node cluster emulation that lets cluster-aware clients
-//! treat the proxy as the whole cluster.
+//! Proxy-answered commands and single-virtual-node cluster emulation.
 
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -1,5 +1,4 @@
-//! RESP frame scanning: locates frame boundaries and argument slices without
-//! materializing values, so requests and replies forward as byte ranges.
+//! RESP frame scanning: byte-range boundaries, nothing materialized.
 
 pub const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
 pub const MAX_INLINE_LEN: usize = 64 * 1024;

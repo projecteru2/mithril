@@ -1,8 +1,7 @@
-//! Client session: request parsing, dispatch, ordered reply emission, MULTI,
-//! blocking commands, pubsub relay, and MOVED/ASK retries.
+//! Client sessions: dispatch, ordered replies, MULTI, pubsub, redirects.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::IoSlice;
 use std::rc::Rc;
 
@@ -45,16 +44,6 @@ pub struct Shared {
     pub started: u64,
 }
 
-struct InFlight {
-    seq: u64,
-    frame: Bytes,
-    expect: u32,
-    retried: bool,
-}
-
-// sequences are allocated monotonically, so the ring stays sorted.
-type InflightRing = RefCell<std::collections::VecDeque<InFlight>>;
-
 /// One frame travelling to the client writer.
 pub enum Reply {
     /// Ordered reply at its sequence.
@@ -69,28 +58,36 @@ pub enum Reply {
 
 pub type ReplyTx = mpsc::UnboundedSender<Reply>;
 
-/// State shared between a session's reader, writer, and pubsub relay.
+struct InFlight {
+    seq: u64,
+    frame: Bytes,
+    expect: u32,
+    retried: bool,
+}
+
+// sequences are allocated monotonically, so the ring stays sorted
+type InflightRing = RefCell<VecDeque<InFlight>>;
+
+// state shared between a session's reader, writer, and pubsub relay
 #[derive(Default)]
 struct WriterLink {
     inflight: InflightRing,
     emitted: Cell<u64>,
-    /// Set when no reply can ever be written again; the reader must stop dispatching.
+    // set when no reply can ever be written again; reader must stop dispatching
     closed: Cell<bool>,
-    /// Wakes a reader parked on read_buf when `closed` is set.
     closed_notify: tokio::sync::Notify,
     proto_switches: ProtoSwitchQueue,
     oob_budget: Cell<usize>,
     oob_notify: tokio::sync::Notify,
-    /// Pre-allocated sequences for pending pubsub confirmations, in order.
-    ack_seqs: RefCell<std::collections::VecDeque<u64>>,
-    /// Signalled whenever ack_seqs drains or the relay backfills.
+    // pre-allocated sequences for pending pubsub confirmations, in order
+    ack_seqs: RefCell<VecDeque<u64>>,
     acks_drained: tokio::sync::Notify,
 }
-/// Pending protocol flips; `armed` keeps the hot path off the RefCell.
+// pending protocol flips; `armed` keeps the hot path off the RefCell
 #[derive(Default)]
 struct ProtoSwitchQueue {
     armed: Cell<usize>,
-    queue: RefCell<std::collections::VecDeque<(u64, u8)>>,
+    queue: RefCell<VecDeque<(u64, u8)>>,
 }
 
 impl ProtoSwitchQueue {
@@ -135,8 +132,7 @@ struct Session {
 
 impl Session {
     async fn dispatch(&self, frame: Bytes, argc: usize) {
-        // no reply can ever be written: executing this command would commit
-        // effects the client can never observe
+        // a command must not commit effects its client can never observe
         if self.link.closed.get() {
             self.closing.set(true);
             return;
@@ -293,7 +289,7 @@ impl Session {
             head: None,
             frame,
             expect: 1,
-            sink: Sink::Client(Rc::clone(&self.reply_tx), seq),
+            sink: Sink::Client(self.reply_tx.clone(), seq),
         })
         .await;
     }
@@ -379,7 +375,7 @@ impl Session {
     fn spawn_blocking(&self, slot: u16, frame: Bytes) {
         let seq = self.alloc_seq();
         let shared = self.shared.clone();
-        let reply_tx = Rc::clone(&self.reply_tx);
+        let reply_tx = self.reply_tx.clone();
         let task = tokio::task::spawn_local(async move {
             let reply = blocking_round(&shared, slot, frame, None, false).await;
             let _ = reply_tx.send(Reply::At(seq, reply));
@@ -428,7 +424,7 @@ impl Session {
             }
         };
         let shared = self.shared.clone();
-        let reply_tx = Rc::clone(&self.reply_tx);
+        let reply_tx = self.reply_tx.clone();
         let id = self.id;
         let merge = match spec.kind {
             Kind::Mget => Merge::Mget,
@@ -440,6 +436,7 @@ impl Session {
             let mut receivers = Vec::with_capacity(parts.len());
             for part in &parts {
                 let addr = &topo.nodes[part.node as usize].addr;
+                // the clone retains the frame for a possible redirect resend
                 let rx =
                     scatter_one(&shared, addr, id, part.readonly, None, part.frame.clone()).await;
                 receivers.push(rx);
@@ -489,7 +486,7 @@ impl Session {
         let (master_idx, node_cursor) = multikey::unpack_cursor(cursor);
         let seq = self.alloc_seq();
         let shared = self.shared.clone();
-        let reply_tx = Rc::clone(&self.reply_tx);
+        let reply_tx = self.reply_tx.clone();
         let id = self.id;
         // detached deliberately: completion is bounded by backend replies.
         tokio::task::spawn_local(async move {
@@ -532,7 +529,7 @@ impl Session {
     fn run_broadcast(&self, frame: Bytes, sum: bool) {
         let seq = self.alloc_seq();
         let shared = self.shared.clone();
-        let reply_tx = Rc::clone(&self.reply_tx);
+        let reply_tx = self.reply_tx.clone();
         let id = self.id;
         // detached deliberately: completion is bounded by backend replies.
         tokio::task::spawn_local(async move {
@@ -731,7 +728,7 @@ impl Session {
             head: None,
             frame: blob,
             expect,
-            sink: Sink::Client(Rc::clone(&self.reply_tx), seq),
+            sink: Sink::Client(self.reply_tx.clone(), seq),
         })
         .await;
     }
@@ -856,7 +853,7 @@ impl Session {
                 return false;
             }
             while !self.link.ack_seqs.borrow().is_empty() {
-                if self.relay_dead() || self.reply_tx.is_closed() {
+                if self.relay_dead() || self.link.closed.get() {
                     break;
                 }
                 tokio::select! {
@@ -922,20 +919,11 @@ impl Session {
         }
     }
 
-    // every promised confirmation occupies the reply window until emitted, and
-    // a bare unsubscribe promises one per live subscription: both need bounds.
+    // promised confirmations occupy the reply window until emitted: bound them
     fn pubsub_overflow(&self, spec: &Spec, frame: &Bytes, argc: usize) -> bool {
         let subs = self.subs.borrow();
-        let expected = if argc > 1 {
-            argc - 1
-        } else if spec.name == "unsubscribe" {
-            subs.channels.len().max(1)
-        } else if spec.name == "punsubscribe" {
-            subs.patterns.len().max(1)
-        } else {
-            1
-        };
-        let outstanding = (self.next_seq.get() - self.link.emitted.get()) as usize;
+        let expected = subs.ack_count(spec.name.as_bytes(), argc);
+        let outstanding = self.next_seq.get().saturating_sub(self.link.emitted.get()) as usize;
         if outstanding + expected > MAX_INFLIGHT {
             return true;
         }
@@ -948,7 +936,7 @@ impl Session {
             &subs.channels
         };
         let mut grown = subs.channels.len() + subs.patterns.len();
-        let mut fresh: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+        let mut fresh: HashSet<&[u8]> = HashSet::new();
         for a in resp::Args::new(frame, argc).skip(1) {
             if !target.contains(a) && fresh.insert(a) {
                 grown += 1;
@@ -985,7 +973,7 @@ impl Session {
         let (tx, rx) = mpsc::channel::<Bytes>(PUBSUB_FORWARD_QUEUE);
         let _ = tx.try_send(first_frame);
         let shared = self.shared.clone();
-        let reply_tx = Rc::clone(&self.reply_tx);
+        let reply_tx = self.reply_tx.clone();
         let link = self.link.clone();
         let task = tokio::task::spawn_local(async move {
             pubsub_relay(shared, addr, rx, reply_tx, link).await;
@@ -1004,6 +992,10 @@ impl Session {
         if let Some(state) = self.multi.borrow_mut().as_mut() {
             state.aborted = true;
         }
+    }
+
+    fn window_full(&self) -> bool {
+        self.next_seq.get().saturating_sub(self.link.emitted.get()) > MAX_INFLIGHT as u64
     }
 
     fn alloc_seq(&self) -> u64 {
@@ -1031,7 +1023,7 @@ impl Session {
     }
 }
 
-/// Per-session resolved connections, valid for one topology epoch.
+// per-session resolved connections, valid for one topology epoch
 struct ConnCache {
     epoch: u64,
     by_node: Vec<Option<Rc<crate::backend::Conn>>>,
@@ -1049,11 +1041,11 @@ struct PubsubHandle {
     task: tokio::task::JoinHandle<()>,
 }
 
-/// Reader-side subscription mirror; confirmation counts derive from it.
+// reader-side subscription mirror; confirmation counts derive from it
 #[derive(Default)]
 struct PubsubSim {
-    channels: std::collections::HashSet<Vec<u8>>,
-    patterns: std::collections::HashSet<Vec<u8>>,
+    channels: HashSet<Vec<u8>>,
+    patterns: HashSet<Vec<u8>>,
 }
 
 impl PubsubSim {
@@ -1061,8 +1053,21 @@ impl PubsubSim {
         self.channels.is_empty() && self.patterns.is_empty()
     }
 
-    /// Applies one forwarded pubsub command; returns its confirmation count.
+    // acks per command: named channels, or the matching set for a bare unsubscribe
+    fn ack_count(&self, name: &[u8], argc: usize) -> usize {
+        if argc > 1 {
+            argc - 1
+        } else if name.eq_ignore_ascii_case(b"unsubscribe") {
+            self.channels.len().max(1)
+        } else if name.eq_ignore_ascii_case(b"punsubscribe") {
+            self.patterns.len().max(1)
+        } else {
+            1
+        }
+    }
+
     fn apply(&mut self, name: &[u8], args: &[&[u8]]) -> usize {
+        let acks = self.ack_count(name, args.len());
         let target = if name.eq_ignore_ascii_case(b"psubscribe")
             || name.eq_ignore_ascii_case(b"punsubscribe")
         {
@@ -1070,23 +1075,18 @@ impl PubsubSim {
         } else {
             &mut self.channels
         };
-        let subscribe =
-            name.eq_ignore_ascii_case(b"subscribe") || name.eq_ignore_ascii_case(b"psubscribe");
-        if subscribe {
+        if name.eq_ignore_ascii_case(b"subscribe") || name.eq_ignore_ascii_case(b"psubscribe") {
             for a in &args[1..] {
                 target.insert(a.to_vec());
             }
-            args.len() - 1
         } else if args.len() > 1 {
             for a in &args[1..] {
                 target.remove(*a);
             }
-            args.len() - 1
         } else {
-            let n = target.len().max(1);
             target.clear();
-            n
         }
+        acks
     }
 }
 
@@ -1109,7 +1109,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
     let session = Session {
         shared: shared.clone(),
         id,
-        reply_tx: Rc::clone(&reply_tx),
+        reply_tx: reply_tx.clone(),
         link: link.clone(),
         proto: Cell::new(2),
         authed: Cell::new(shared.cfg.requirepass.is_empty()),
@@ -1132,7 +1132,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         shared.clone(),
         write_half,
         reply_rx,
-        Rc::clone(&reply_tx),
+        reply_tx.clone(),
         close_rx,
         link.clone(),
         id,
@@ -1144,10 +1144,8 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         if link.closed.get() {
             break;
         }
-        let mut gate_paused = false;
         loop {
-            if session.next_seq.get().saturating_sub(link.emitted.get()) > MAX_INFLIGHT as u64 {
-                gate_paused = true;
+            if session.window_full() {
                 break;
             }
             match resp::scan_request(&buf) {
@@ -1179,30 +1177,28 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
                 break 'main;
             }
         }
-        if !gate_paused && buf.len() > shared.cfg.query_buffer_limit {
+        if session.window_full() {
+            while session.window_full() {
+                if link.closed.get() {
+                    break 'main;
+                }
+                match tokio::time::timeout(GATE_PROBE, read_half.read_buf(&mut buf)).await {
+                    Ok(Ok(0)) | Ok(Err(_)) => break 'main,
+                    Ok(Ok(n)) => {
+                        stats::add(&shared.stats.workers[shared.worker].bytes_in, n as u64);
+                        if buf.len() > shared.cfg.query_buffer_limit {
+                            session.emit_error("ERR query buffer exceeds limit");
+                            break 'main;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            continue 'main;
+        }
+        if buf.len() > shared.cfg.query_buffer_limit {
             session.emit_error("ERR query buffer exceeds limit");
             break;
-        }
-        let mut gated_read = false;
-        while session.next_seq.get().saturating_sub(link.emitted.get()) > MAX_INFLIGHT as u64 {
-            if link.closed.get() {
-                break 'main;
-            }
-            match tokio::time::timeout(GATE_PROBE, read_half.read_buf(&mut buf)).await {
-                Ok(Ok(0)) | Ok(Err(_)) => break 'main,
-                Ok(Ok(n)) => {
-                    stats::add(&shared.stats.workers[shared.worker].bytes_in, n as u64);
-                    if buf.len() > shared.cfg.query_buffer_limit {
-                        session.emit_error("ERR query buffer exceeds limit");
-                        break 'main;
-                    }
-                    gated_read = true;
-                }
-                _ => {}
-            }
-        }
-        if gated_read || gate_paused {
-            continue 'main;
         }
         let read = tokio::select! {
             _ = link.closed_notify.notified() => break,
@@ -1234,7 +1230,7 @@ fn collect_args(frame: &Bytes, argc: usize) -> Vec<&[u8]> {
     resp::Args::new(frame, argc).collect()
 }
 
-/// Argument indices holding keys, per the spec's first/last/step triple.
+// argument indices holding keys, per the spec's first/last/step triple
 fn key_indices(spec: &Spec, argc: usize) -> impl Iterator<Item = usize> {
     let first = spec.first_key as usize;
     let last = if spec.last_key < 0 {
@@ -1276,8 +1272,7 @@ async fn recv_or_lost(rx: oneshot::Receiver<Bytes>) -> Bytes {
         .unwrap_or_else(|_| Bytes::from_static(ERR_BACKEND_LOST))
 }
 
-// a command name is echoed into an error reply; cap it and strip CR/LF so an
-// argument cannot inject a second frame.
+// echoed names are CR/LF-stripped and capped so they cannot forge a second frame
 fn display_name(raw: &[u8]) -> String {
     const CAP: usize = 128;
     let mut out = String::with_capacity(raw.len().min(CAP));
@@ -1373,8 +1368,7 @@ async fn pubsub_relay(
         }
     };
     let (mut read_half, mut write_half) = stream.into_split();
-    // guard ties the forward-writer to the relay: an aborted relay must not
-    // detach a child blocked in write_all on an unread socket
+    // an aborted relay must not detach a child blocked in write_all
     struct AbortOnDrop(tokio::task::JoinHandle<()>);
     impl Drop for AbortOnDrop {
         fn drop(&mut self) {
@@ -1406,7 +1400,7 @@ async fn pubsub_relay(
                             Reply::Ack(seq, frame)
                         }
                         None => {
-                            if !charge_push(&link, &reply_tx).await {
+                            if !charge_push(&link).await {
                                 return;
                             }
                             Reply::Push {
@@ -1429,8 +1423,7 @@ async fn pubsub_relay(
         }
     }
     backfill_acks(&link, &reply_tx);
-    // an idle subscriber sends nothing, so the reader must be woken, not just
-    // flagged, when its pubsub backend dies.
+    // an idle subscriber sends nothing: the parked reader needs a wakeup
     mark_closed(&link);
     let _ = reply_tx.send(Reply::Close);
 }
@@ -1441,9 +1434,9 @@ fn mark_closed(link: &WriterLink) {
 }
 
 // a push holds one window slot from here until the writer emits it
-async fn charge_push(link: &Rc<WriterLink>, reply_tx: &Rc<ReplyTx>) -> bool {
+async fn charge_push(link: &Rc<WriterLink>) -> bool {
     while link.oob_budget.get() >= PUBSUB_PUSH_WINDOW {
-        if reply_tx.is_closed() {
+        if link.closed.get() {
             return false;
         }
         link.oob_notify.notified().await;
@@ -1486,6 +1479,7 @@ async fn write_loop(
         link: &link,
     };
     let mut next_emit: u64 = 0;
+    let mut swept_to: u64 = 0;
     // protocol flips apply at the HELLO reply's sequence, not before
     let mut cur_proto: u8 = 2;
     // reader's final sequence; draining to it lets a departed client close
@@ -1493,8 +1487,7 @@ async fn write_loop(
     let mut close_now = false;
     let mut parked: BTreeMap<u64, Bytes> = BTreeMap::new();
     let mut parked_acks: BTreeMap<u64, Bytes> = BTreeMap::new();
-    let mut held_pushes: std::collections::VecDeque<(u64, Bytes)> =
-        std::collections::VecDeque::new();
+    let mut held_pushes: VecDeque<(u64, Bytes)> = VecDeque::new();
     let mut batch: Vec<Reply> = Vec::with_capacity(crate::backend::BATCH);
     let mut ready: Vec<Bytes> = Vec::with_capacity(crate::backend::BATCH);
     loop {
@@ -1560,7 +1553,7 @@ async fn write_loop(
                         head: ask.then(|| Bytes::from_static(ASKING_FRAME)),
                         frame: req,
                         expect: base_expect + u32::from(ask),
-                        sink: Sink::Client(Rc::clone(&reply_tx), seq),
+                        sink: Sink::Client(reply_tx.clone(), seq),
                     })
                     .await;
                     continue;
@@ -1597,11 +1590,12 @@ async fn write_loop(
                 break;
             }
         }
-        {
+        if next_emit > swept_to {
             let mut inf = link.inflight.borrow_mut();
             while inf.front().is_some_and(|e| e.seq < next_emit) {
                 inf.pop_front();
             }
+            swept_to = next_emit;
         }
         if !ready.is_empty() {
             let mut total = 0usize;
@@ -1631,16 +1625,15 @@ async fn write_loop(
 fn take_retry_frame(inflight: &InflightRing, seq: u64, ask: bool) -> Option<(Bytes, u32)> {
     let mut inf = inflight.borrow_mut();
     let idx = inf.binary_search_by_key(&seq, |e| e.seq).ok()?;
-    match inf.get_mut(idx) {
-        Some(entry) if !entry.retried && (entry.expect == 1 || !ask) => {
-            entry.retried = true;
-            Some((entry.frame.clone(), entry.expect))
-        }
-        _ => None,
+    let entry = &mut inf[idx];
+    if entry.retried || (entry.expect > 1 && ask) {
+        return None;
     }
+    entry.retried = true;
+    Some((entry.frame.clone(), entry.expect))
 }
 
-/// True for published messages; every other pubsub frame consumes a promised sequence.
+// true for publications; every other pubsub frame consumes a promised sequence
 fn is_publication(frame: &[u8]) -> bool {
     if frame.first() != Some(&b'*') {
         return false;

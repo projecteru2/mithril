@@ -1,5 +1,4 @@
-//! Worker startup: one acceptor round-robins connections onto per-core
-//! runtimes, plus the topology refresher and shutdown.
+//! Acceptor, per-core worker runtimes, topology refresher, and shutdown.
 
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -31,6 +30,8 @@ const ACCEPT_QUEUE: usize = 1024;
 const DRAIN_POLL: Duration = Duration::from_millis(50);
 
 static TOPO_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Set on SIGINT/SIGTERM; accept loops stop taking new connections.
+pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Runs the proxy until SIGINT/SIGTERM; Err on fatal startup failure.
 pub fn run(cfg: Config) -> Result<(), String> {
@@ -65,20 +66,18 @@ pub fn run(cfg: Config) -> Result<(), String> {
 
     let listener = bind_listener(&cfg.bind, cfg.port)
         .map_err(|e| format!("bind {}:{}: {e}", cfg.bind, cfg.port))?;
-    let mut handles = Vec::with_capacity(cfg.workers);
     let mut conn_txs = Vec::with_capacity(cfg.workers);
     for worker in 0..cfg.workers {
-        let (conn_tx, conn_rx) = mpsc::channel::<std::net::TcpStream>(ACCEPT_QUEUE);
+        let (conn_tx, conn_rx) = mpsc::channel::<Admitted>(ACCEPT_QUEUE);
         conn_txs.push(conn_tx);
         let cfg = cfg.clone();
         let topo = topo.clone();
         let stats = stats.clone();
         let refresh = refresh_tx.clone();
-        let handle = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name(format!("mithril-{worker}"))
             .spawn(move || worker_thread(cfg, topo, stats, refresh, worker, started, conn_rx))
             .map_err(|e| format!("spawn worker: {e}"))?;
-        handles.push(handle);
     }
     let acceptor_cfg = cfg.clone();
     let acceptor_stats = stats.clone();
@@ -105,18 +104,24 @@ fn next_epoch() -> u64 {
     TOPO_EPOCH.fetch_add(1, Ordering::Relaxed) + 1
 }
 
-/// Set on SIGINT/SIGTERM; accept loops stop taking new connections.
-pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-fn wait_for_signal() {
-    let rt = match tokio::runtime::Builder::new_current_thread()
+fn current_thread_rt(name: &str) -> Option<tokio::runtime::Runtime> {
+    match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
-        Ok(rt) => rt,
-        Err(_) => loop {
+        Ok(rt) => Some(rt),
+        Err(e) => {
+            log_warn!("{name}: runtime: {e}");
+            None
+        }
+    }
+}
+
+fn wait_for_signal() {
+    let Some(rt) = current_thread_rt("signal") else {
+        loop {
             std::thread::park();
-        },
+        }
     };
     rt.block_on(async {
         let mut term =
@@ -135,23 +140,27 @@ fn wait_for_signal() {
     });
 }
 
-// kernel reuseport hashing skews connections across workers; a single
-// acceptor round-robins them so no worker becomes the latency floor.
+/// Admission ticket holding one maxclients slot; drop returns the slot.
+struct Admitted {
+    stream: Option<std::net::TcpStream>,
+    stats: Arc<Stats>,
+}
+
+impl Drop for Admitted {
+    fn drop(&mut self) {
+        self.stats.clients.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+// kernel reuseport hashing skews connections binomially; one acceptor round-robins
 fn acceptor_thread(
     listener: std::net::TcpListener,
     cfg: Arc<Config>,
     stats: Arc<Stats>,
-    conn_txs: Vec<mpsc::Sender<std::net::TcpStream>>,
+    conn_txs: Vec<mpsc::Sender<Admitted>>,
 ) {
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            log_warn!("acceptor: runtime: {e}");
-            return;
-        }
+    let Some(rt) = current_thread_rt("acceptor") else {
+        return;
     };
     rt.block_on(async move {
         let listener = match TcpListener::from_std(listener) {
@@ -185,31 +194,26 @@ fn acceptor_thread(
                 continue;
             }
             stats.total_connections.fetch_add(1, Ordering::Relaxed);
-            let Ok(std_stream) = stream.into_std() else {
-                stats.clients.fetch_sub(1, Ordering::Relaxed);
-                continue;
+            let mut admitted = Admitted {
+                stream: stream.into_std().ok(),
+                stats: stats.clone(),
             };
+            if admitted.stream.is_none() {
+                continue;
+            }
             // a full queue must not stall accepts for the rest
-            let best = next;
-            next = (next + 1) % conn_txs.len();
-            let mut pending = Some(std_stream);
-            loop {
+            'place: loop {
                 for k in 0..conn_txs.len() {
-                    let Some(s) = pending.take() else {
-                        break;
-                    };
-                    let i = (best + k) % conn_txs.len();
-                    match conn_txs[i].try_send(s) {
-                        Ok(()) => {}
-                        Err(e) => pending = Some(e.into_inner()),
+                    let i = (next + k) % conn_txs.len();
+                    match conn_txs[i].try_send(admitted) {
+                        Ok(()) => {
+                            next = (i + 1) % conn_txs.len();
+                            break 'place;
+                        }
+                        Err(e) => admitted = e.into_inner(),
                     }
                 }
-                // a handed-off socket is owned by its worker: never decrement for it
-                if pending.is_none() {
-                    break;
-                }
                 if SHUTTING_DOWN.load(Ordering::Relaxed) {
-                    stats.clients.fetch_sub(1, Ordering::Relaxed);
                     break;
                 }
                 tokio::time::sleep(DRAIN_POLL).await;
@@ -225,17 +229,10 @@ fn worker_thread(
     refresh: mpsc::UnboundedSender<()>,
     worker: usize,
     started: u64,
-    mut conn_rx: mpsc::Receiver<std::net::TcpStream>,
+    mut conn_rx: mpsc::Receiver<Admitted>,
 ) {
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            log_warn!("worker {worker}: runtime: {e}");
-            return;
-        }
+    let Some(rt) = current_thread_rt("worker") else {
+        return;
     };
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
@@ -250,25 +247,24 @@ fn worker_thread(
             started,
         });
         let mut next_client: u64 = worker as u64;
-        while let Some(std_stream) = conn_rx.recv().await {
-            let Ok(stream) = TcpStream::from_std(std_stream) else {
-                stats.clients.fetch_sub(1, Ordering::Relaxed);
+        while let Some(mut admitted) = conn_rx.recv().await {
+            let stream = admitted
+                .stream
+                .take()
+                .and_then(|s| TcpStream::from_std(s).ok());
+            let Some(stream) = stream else {
                 continue;
             };
             let shared = shared.clone();
             let id = next_client;
             next_client += shared.cfg.workers as u64;
-            let session_stats = stats.clone();
             tokio::task::spawn_local(async move {
                 serve(shared, stream, id).await;
-                session_stats.clients.fetch_sub(1, Ordering::Relaxed);
+                drop(admitted);
             });
         }
-        // channel closed: acceptor is gone; keep serving until drained
-        let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
-        while stats.clients.load(Ordering::Relaxed) > 0 && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(DRAIN_POLL).await;
-        }
+        // channel closed: keep the LocalSet alive so open sessions drain
+        tokio::time::sleep(DRAIN_TIMEOUT).await;
     });
 }
 
@@ -302,15 +298,8 @@ fn refresher_thread(
     topo: Arc<ArcSwap<Topology>>,
     mut notify: mpsc::UnboundedReceiver<()>,
 ) {
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            log_warn!("refresher: runtime: {e}");
-            return;
-        }
+    let Some(rt) = current_thread_rt("refresher") else {
+        return;
     };
     rt.block_on(async move {
         let period = Duration::from_secs(cfg.topology_refresh_secs);

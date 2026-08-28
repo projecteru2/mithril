@@ -14,128 +14,6 @@ const R: u8 = FLAG_READONLY;
 const N: u8 = FLAG_NO_AUTH;
 const T: u8 = FLAG_TXN_CTRL;
 
-/// How the proxy routes or handles a command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    /// Route to the node owning the first key.
-    Single,
-    /// Split keys per node, sum integer replies (DEL/UNLINK/EXISTS/TOUCH/PFCOUNT).
-    MultiSum,
-    /// Split keys per node, restore reply order (MGET).
-    Mget,
-    /// Split key/value pairs per node, all replies must be OK (MSET).
-    Mset,
-    /// Route to any master.
-    AnyMaster,
-    /// Blocking single-key family; uses a dedicated backend connection.
-    Blocking,
-    /// Subscribe family; switches the client into pubsub relay mode.
-    Subscribe,
-    /// EVAL: numkeys at argv[2], keys follow.
-    Eval,
-    /// XREAD/XREADGROUP: keys follow the STREAMS token.
-    Xread,
-    /// Cluster-wide SCAN with synthetic cursors.
-    Scan,
-    /// Cluster-wide DBSIZE (sum over masters).
-    Dbsize,
-    /// FLUSHALL ASYNC broadcast to all masters.
-    Flushall,
-    /// Answered by the proxy itself.
-    Local,
-}
-
-/// One command table entry.
-#[derive(Debug, Clone, Copy)]
-pub struct Spec {
-    pub name: &'static str,
-    pub prefix: u64,
-    pub arity: i8,
-    pub flags: u8,
-    pub first_key: u8,
-    pub last_key: i8,
-    pub step: u8,
-    pub kind: Kind,
-}
-
-impl Spec {
-    pub fn is_write(&self) -> bool {
-        self.flags & FLAG_WRITE != 0
-    }
-
-    pub fn is_readonly(&self) -> bool {
-        self.flags & FLAG_READONLY != 0
-    }
-
-    /// Validates argc against redis arity conventions.
-    pub fn arity_ok(&self, argc: usize) -> bool {
-        let argc = argc as i64;
-        let a = i64::from(self.arity);
-        if a >= 0 { argc == a } else { argc >= -a }
-    }
-}
-
-/// Returns the full command table.
-pub fn table() -> &'static [Spec] {
-    TABLE
-}
-
-/// Case-insensitive lookup; the u64-prefix key makes a probe one integer compare.
-pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
-    if name.len() > MAX_NAME {
-        return None;
-    }
-    let mut buf = [0u8; MAX_NAME];
-    let lower = &mut buf[..name.len()];
-    for (d, &s) in lower.iter_mut().zip(name) {
-        *d = s.to_ascii_lowercase();
-    }
-    let key = (prefix64(lower), name.len() as u8);
-    let idx = TABLE
-        .binary_search_by(|spec| {
-            (spec.prefix, spec.name.len() as u8)
-                .cmp(&key)
-                .then_with(|| {
-                    spec.name.as_bytes()[PREFIX_LEN.min(spec.name.len())..]
-                        .cmp(&lower[PREFIX_LEN.min(lower.len())..])
-                })
-        })
-        .ok()?;
-    Some(&TABLE[idx])
-}
-
-const fn prefix64(name: &[u8]) -> u64 {
-    let mut v: u64 = 0;
-    let mut i = 0;
-    while i < PREFIX_LEN && i < name.len() {
-        v |= (name[i] as u64) << (56 - i * 8);
-        i += 1;
-    }
-    v
-}
-
-const fn c(
-    name: &'static str,
-    arity: i8,
-    flags: u8,
-    first_key: u8,
-    last_key: i8,
-    step: u8,
-    kind: Kind,
-) -> Spec {
-    Spec {
-        name,
-        prefix: prefix64(name.as_bytes()),
-        arity,
-        flags,
-        first_key,
-        last_key,
-        step,
-        kind,
-    }
-}
-
-// Sorted by name; lookup binary-searches and a test enforces the order.
 static TABLE: &[Spec] = &[
     c("acl", -2, 0, 0, 0, 0, Kind::Local),
     c("append", 3, W, 1, 1, 1, Kind::Single),
@@ -296,6 +174,129 @@ static TABLE: &[Spec] = &[
     c("zscore", 3, R, 1, 1, 1, Kind::Single),
     c("zunionstore", -4, W, 1, 1, 1, Kind::Single),
 ];
+
+/// How the proxy routes or handles a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// Route to the node owning the first key.
+    Single,
+    /// Split keys per node, sum integer replies (DEL/UNLINK/EXISTS/TOUCH/PFCOUNT).
+    MultiSum,
+    /// Split keys per node, restore reply order (MGET).
+    Mget,
+    /// Split key/value pairs per node, all replies must be OK (MSET).
+    Mset,
+    /// Route to any master.
+    AnyMaster,
+    /// Blocking single-key family; uses a dedicated backend connection.
+    Blocking,
+    /// Subscribe family; switches the client into pubsub relay mode.
+    Subscribe,
+    /// EVAL: numkeys at argv[2], keys follow.
+    Eval,
+    /// XREAD/XREADGROUP: keys follow the STREAMS token.
+    Xread,
+    /// Cluster-wide SCAN with synthetic cursors.
+    Scan,
+    /// Cluster-wide DBSIZE (sum over masters).
+    Dbsize,
+    /// FLUSHALL ASYNC broadcast to all masters.
+    Flushall,
+    /// Answered by the proxy itself.
+    Local,
+}
+
+/// One command table entry.
+#[derive(Debug, Clone, Copy)]
+pub struct Spec {
+    pub name: &'static str,
+    pub prefix: u64,
+    pub arity: i8,
+    pub flags: u8,
+    pub first_key: u8,
+    pub last_key: i8,
+    pub step: u8,
+    pub kind: Kind,
+}
+
+impl Spec {
+    pub fn is_write(&self) -> bool {
+        self.flags & FLAG_WRITE != 0
+    }
+
+    pub fn is_readonly(&self) -> bool {
+        self.flags & FLAG_READONLY != 0
+    }
+
+    /// Validates argc against redis arity conventions.
+    pub fn arity_ok(&self, argc: usize) -> bool {
+        let argc = argc as i64;
+        let a = i64::from(self.arity);
+        if a >= 0 { argc == a } else { argc >= -a }
+    }
+}
+
+/// Returns the full command table.
+pub fn table() -> &'static [Spec] {
+    TABLE
+}
+
+/// Case-insensitive lookup; the u64-prefix key makes a probe one integer compare.
+pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
+    if name.len() > MAX_NAME {
+        return None;
+    }
+    let mut buf = [0u8; MAX_NAME];
+    let lower = &mut buf[..name.len()];
+    for (d, &s) in lower.iter_mut().zip(name) {
+        *d = s.to_ascii_lowercase();
+    }
+    let key = (prefix64(lower), name.len() as u8);
+    let idx = TABLE
+        .binary_search_by(|spec| {
+            (spec.prefix, spec.name.len() as u8)
+                .cmp(&key)
+                .then_with(|| {
+                    spec.name.as_bytes()[PREFIX_LEN.min(spec.name.len())..]
+                        .cmp(&lower[PREFIX_LEN.min(lower.len())..])
+                })
+        })
+        .ok()?;
+    Some(&TABLE[idx])
+}
+
+const fn prefix64(name: &[u8]) -> u64 {
+    let mut v: u64 = 0;
+    let mut i = 0;
+    while i < PREFIX_LEN && i < name.len() {
+        v |= (name[i] as u64) << (56 - i * 8);
+        i += 1;
+    }
+    v
+}
+
+const fn c(
+    name: &'static str,
+    arity: i8,
+    flags: u8,
+    first_key: u8,
+    last_key: i8,
+    step: u8,
+    kind: Kind,
+) -> Spec {
+    Spec {
+        name,
+        prefix: prefix64(name.as_bytes()),
+        arity,
+        flags,
+        first_key,
+        last_key,
+        step,
+        kind,
+    }
+}
+
+// Sorted by name; lookup binary-searches and a test enforces the order.
 
 #[cfg(test)]
 mod tests {
