@@ -1,5 +1,5 @@
-//! Worker startup: SO_REUSEPORT listeners, per-core runtimes, the topology
-//! refresher, and shutdown.
+//! Worker startup: one acceptor round-robins connections onto per-core
+//! runtimes, plus the topology refresher and shutdown.
 
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -27,6 +27,7 @@ pub const LISTEN_BACKLOG: i32 = 1024;
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_POLL: Duration = Duration::from_millis(200);
+const ACCEPT_QUEUE: usize = 1024;
 const DRAIN_POLL: Duration = Duration::from_millis(50);
 
 static TOPO_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -62,18 +63,29 @@ pub fn run(cfg: Config) -> Result<(), String> {
         .spawn(move || refresher_thread(refresher_cfg, refresher_topo, refresh_rx))
         .map_err(|e| format!("spawn refresher: {e}"))?;
 
+    let listener = bind_listener(&cfg.bind, cfg.port)
+        .map_err(|e| format!("bind {}:{}: {e}", cfg.bind, cfg.port))?;
     let mut handles = Vec::with_capacity(cfg.workers);
+    let mut conn_txs = Vec::with_capacity(cfg.workers);
     for worker in 0..cfg.workers {
+        let (conn_tx, conn_rx) = mpsc::channel::<std::net::TcpStream>(ACCEPT_QUEUE);
+        conn_txs.push(conn_tx);
         let cfg = cfg.clone();
         let topo = topo.clone();
         let stats = stats.clone();
         let refresh = refresh_tx.clone();
         let handle = std::thread::Builder::new()
             .name(format!("mithril-{worker}"))
-            .spawn(move || worker_thread(cfg, topo, stats, refresh, worker, started))
+            .spawn(move || worker_thread(cfg, topo, stats, refresh, worker, started, conn_rx))
             .map_err(|e| format!("spawn worker: {e}"))?;
         handles.push(handle);
     }
+    let acceptor_cfg = cfg.clone();
+    let acceptor_stats = stats.clone();
+    std::thread::Builder::new()
+        .name("mithril-accept".to_string())
+        .spawn(move || acceptor_thread(listener, acceptor_cfg, acceptor_stats, conn_txs))
+        .map_err(|e| format!("spawn acceptor: {e}"))?;
 
     wait_for_signal();
     log_notice!("shutting down: draining clients");
@@ -123,13 +135,13 @@ fn wait_for_signal() {
     });
 }
 
-fn worker_thread(
+// kernel reuseport hashing skews connections across workers; a single
+// acceptor round-robins them so no worker becomes the latency floor.
+fn acceptor_thread(
+    listener: std::net::TcpListener,
     cfg: Arc<Config>,
-    topo: Arc<ArcSwap<Topology>>,
     stats: Arc<Stats>,
-    refresh: mpsc::UnboundedSender<()>,
-    worker: usize,
-    started: u64,
+    conn_txs: Vec<mpsc::Sender<std::net::TcpStream>>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -137,30 +149,19 @@ fn worker_thread(
     {
         Ok(rt) => rt,
         Err(e) => {
-            log_warn!("worker {worker}: runtime: {e}");
+            log_warn!("acceptor: runtime: {e}");
             return;
         }
     };
-    let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, async move {
-        let listener = match bind_reuseport(&cfg.bind, cfg.port) {
+    rt.block_on(async move {
+        let listener = match TcpListener::from_std(listener) {
             Ok(l) => l,
             Err(e) => {
-                log_warn!("worker {worker}: bind {}:{}: {e}", cfg.bind, cfg.port);
+                log_warn!("acceptor: listener: {e}");
                 return;
             }
         };
-        let local_cfg = Rc::new((*cfg).clone());
-        let shared = Rc::new(Shared {
-            cfg: local_cfg.clone(),
-            topo,
-            backends: Backends::new(local_cfg),
-            stats: stats.clone(),
-            worker,
-            refresh,
-            started,
-        });
-        let mut next_client: u64 = worker as u64;
+        let mut next = 0usize;
         loop {
             let accepted = tokio::select! {
                 a = listener.accept() => a,
@@ -178,12 +179,61 @@ fn worker_thread(
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if stats.clients.fetch_add(1, Ordering::Relaxed) >= shared.cfg.maxclients {
+            if stats.clients.fetch_add(1, Ordering::Relaxed) >= cfg.maxclients {
                 stats.clients.fetch_sub(1, Ordering::Relaxed);
                 reject_maxclients(stream);
                 continue;
             }
             stats.total_connections.fetch_add(1, Ordering::Relaxed);
+            let handed = match stream.into_std() {
+                Ok(std_stream) => conn_txs[next].send(std_stream).await.is_ok(),
+                Err(_) => false,
+            };
+            if !handed {
+                stats.clients.fetch_sub(1, Ordering::Relaxed);
+            }
+            next = (next + 1) % conn_txs.len();
+        }
+    });
+}
+
+fn worker_thread(
+    cfg: Arc<Config>,
+    topo: Arc<ArcSwap<Topology>>,
+    stats: Arc<Stats>,
+    refresh: mpsc::UnboundedSender<()>,
+    worker: usize,
+    started: u64,
+    mut conn_rx: mpsc::Receiver<std::net::TcpStream>,
+) {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            log_warn!("worker {worker}: runtime: {e}");
+            return;
+        }
+    };
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async move {
+        let local_cfg = Rc::new((*cfg).clone());
+        let shared = Rc::new(Shared {
+            cfg: local_cfg.clone(),
+            topo,
+            backends: Backends::new(local_cfg),
+            stats: stats.clone(),
+            worker,
+            refresh,
+            started,
+        });
+        let mut next_client: u64 = worker as u64;
+        while let Some(std_stream) = conn_rx.recv().await {
+            let Ok(stream) = TcpStream::from_std(std_stream) else {
+                stats.clients.fetch_sub(1, Ordering::Relaxed);
+                continue;
+            };
             let shared = shared.clone();
             let id = next_client;
             next_client += shared.cfg.workers as u64;
@@ -193,11 +243,16 @@ fn worker_thread(
                 session_stats.clients.fetch_sub(1, Ordering::Relaxed);
             });
         }
+        // channel closed: acceptor is gone; keep serving until drained
+        let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
+        while stats.clients.load(Ordering::Relaxed) > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(DRAIN_POLL).await;
+        }
     });
 }
 
 fn reject_maxclients(stream: TcpStream) {
-    tokio::task::spawn_local(async move {
+    tokio::spawn(async move {
         let mut stream = stream;
         let _ = stream
             .write_all(b"-ERR max number of clients reached\r\n")
@@ -205,7 +260,7 @@ fn reject_maxclients(stream: TcpStream) {
     });
 }
 
-fn bind_reuseport(bind: &str, port: u16) -> std::io::Result<TcpListener> {
+fn bind_listener(bind: &str, port: u16) -> std::io::Result<std::net::TcpListener> {
     let addr: SocketAddr = format!("{bind}:{port}")
         .parse()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
@@ -215,11 +270,10 @@ fn bind_reuseport(bind: &str, port: u16) -> std::io::Result<TcpListener> {
         Some(socket2::Protocol::TCP),
     )?;
     socket.set_reuse_address(true)?;
-    socket.set_reuse_port(true)?;
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     socket.listen(LISTEN_BACKLOG)?;
-    TcpListener::from_std(socket.into())
+    Ok(socket.into())
 }
 
 fn refresher_thread(
