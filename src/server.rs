@@ -180,9 +180,19 @@ fn acceptor_thread(
         let mut placed = vec![0u64; conn_txs.len()];
         let mut order: Vec<usize> = Vec::with_capacity(conn_txs.len());
         let mut snap_at = tokio::time::Instant::now();
+        let lb = cfg.placement == Placement::LeastLoaded;
+        let mut tick = tokio::time::interval(SNAP_WINDOW);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let accepted = tokio::select! {
                 a = listener.accept() => a,
+                // rates must stay fresh through accept gaps, or a burst on
+                // one worker dilutes across the whole gap and reads as idle
+                _ = tick.tick(), if lb => {
+                    refresh_rates(&stats, &mut cmd_snap, &mut cmd_rate, &mut placed, 1);
+                    snap_at = tokio::time::Instant::now();
+                    continue;
+                }
                 _ = tokio::time::sleep(ACCEPT_POLL) => {
                     if SHUTTING_DOWN.load(Ordering::Relaxed) {
                         return;
@@ -219,26 +229,20 @@ fn acceptor_thread(
             // next-best key instead of a cyclic neighbor
             // a full queue must not stall accepts for the rest
             'place: loop {
-                if cfg.placement == Placement::LeastLoaded {
+                if lb {
                     let now = tokio::time::Instant::now();
                     let elapsed = now.duration_since(snap_at);
                     if elapsed >= SNAP_WINDOW {
-                        snap_at = now;
-                        // normalize to per-window units: a long gap since the
-                        // last accept must not read as current activity
+                        // full-queue retries block the tick arm; keep per-window units
                         let scale =
                             (elapsed.as_millis() as u64 / SNAP_WINDOW.as_millis() as u64).max(1);
-                        for i in 0..conn_txs.len() {
-                            let c = stats.workers[i].commands.load(Ordering::Relaxed);
-                            cmd_rate[i] = (c - cmd_snap[i]) / scale;
-                            cmd_snap[i] = c;
-                            placed[i] = 0;
-                        }
+                        refresh_rates(&stats, &mut cmd_snap, &mut cmd_rate, &mut placed, scale);
+                        snap_at = now;
                     }
                 }
                 order.clear();
                 order.extend(0..conn_txs.len());
-                if cfg.placement == Placement::LeastLoaded {
+                if lb {
                     let total: u64 = cmd_rate.iter().sum();
                     let share = (total / conn_txs.len() as u64).max(1);
                     let quiet = total < QUIET_FLOOR;
@@ -314,6 +318,21 @@ fn worker_thread(
         // channel closed: keep the LocalSet alive so open sessions drain
         tokio::time::sleep(DRAIN_TIMEOUT).await;
     });
+}
+
+fn refresh_rates(
+    stats: &Stats,
+    snap: &mut [u64],
+    rate: &mut [u64],
+    placed: &mut [u64],
+    scale: u64,
+) {
+    for i in 0..snap.len() {
+        let c = stats.workers[i].commands.load(Ordering::Relaxed);
+        rate[i] = (c - snap[i]) / scale;
+        snap[i] = c;
+        placed[i] = 0;
+    }
 }
 
 fn reject_maxclients(stream: TcpStream) {
