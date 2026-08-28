@@ -162,6 +162,7 @@ fn acceptor_thread(
             }
         };
         let mut next = 0usize;
+        let mut cmd_snap = vec![0u64; conn_txs.len()];
         loop {
             let accepted = tokio::select! {
                 a = listener.accept() => a,
@@ -189,8 +190,20 @@ fn acceptor_thread(
                 stats.clients.fetch_sub(1, Ordering::Relaxed);
                 continue;
             };
-            // a full queue must not stall accepts for the rest
-            let best = next;
+            // place on the least recently active worker; ties fall back to
+            // rotation, and a full queue must not stall accepts for the rest
+            let mut best = next;
+            let mut best_delta = u64::MAX;
+            for k in 0..conn_txs.len() {
+                let i = (next + k) % conn_txs.len();
+                let now = stats.workers[i].commands.load(Ordering::Relaxed);
+                let delta = now - cmd_snap[i];
+                cmd_snap[i] = now;
+                if delta < best_delta {
+                    best_delta = delta;
+                    best = i;
+                }
+            }
             next = (next + 1) % conn_txs.len();
             let mut pending = Some(std_stream);
             for k in 0..conn_txs.len() {
