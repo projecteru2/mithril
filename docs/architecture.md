@@ -9,7 +9,7 @@ reference-count traffic per request (`Rc`, not `Arc`, everywhere inside a
 worker).
 
 One acceptor thread owns the listen socket and hands accepted connections to
-workers round-robin over bounded channels. Kernel `SO_REUSEPORT` hashing was
+workers over bounded channels, placed least-loaded by default (configurable). Kernel `SO_REUSEPORT` hashing was
 measured to skew connections binomially (26% worker imbalance at 100
 connections); at saturation the heaviest worker sets the throughput floor,
 and central placement recovered +3.2% at pipeline depth 16. Placement is

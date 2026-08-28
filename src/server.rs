@@ -217,20 +217,25 @@ fn acceptor_thread(
             // least-active worker, a near-idle proxy never tiers on
             // stray-command noise, and a full queue falls back to the
             // next-best key instead of a cyclic neighbor
-            if cfg.placement == Placement::LeastLoaded {
-                let now = tokio::time::Instant::now();
-                if now.duration_since(snap_at) >= SNAP_WINDOW {
-                    snap_at = now;
-                    for i in 0..conn_txs.len() {
-                        let c = stats.workers[i].commands.load(Ordering::Relaxed);
-                        cmd_rate[i] = c - cmd_snap[i];
-                        cmd_snap[i] = c;
-                        placed[i] = 0;
-                    }
-                }
-            }
             // a full queue must not stall accepts for the rest
             'place: loop {
+                if cfg.placement == Placement::LeastLoaded {
+                    let now = tokio::time::Instant::now();
+                    let elapsed = now.duration_since(snap_at);
+                    if elapsed >= SNAP_WINDOW {
+                        snap_at = now;
+                        // normalize to per-window units: a long gap since the
+                        // last accept must not read as current activity
+                        let scale =
+                            (elapsed.as_millis() as u64 / SNAP_WINDOW.as_millis() as u64).max(1);
+                        for i in 0..conn_txs.len() {
+                            let c = stats.workers[i].commands.load(Ordering::Relaxed);
+                            cmd_rate[i] = (c - cmd_snap[i]) / scale;
+                            cmd_snap[i] = c;
+                            placed[i] = 0;
+                        }
+                    }
+                }
                 order.clear();
                 order.extend(0..conn_txs.len());
                 if cfg.placement == Placement::LeastLoaded {
