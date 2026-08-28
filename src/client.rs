@@ -190,7 +190,11 @@ impl Session {
         }
         match spec.kind {
             Kind::Single => match self.key_slot(&frame, argc, spec.first_key as usize) {
-                Some(slot) => self.route_and_send(slot, spec.is_readonly(), frame).await,
+                Some(slot) => {
+                    if let Some((conn, out)) = self.route_single(slot, spec.is_readonly(), frame) {
+                        conn.send_wait(out).await;
+                    }
+                }
                 None => self.emit_error("ERR missing key"),
             },
             Kind::Local => self.handle_local(spec, frame, argc).await,
@@ -272,7 +276,13 @@ impl Session {
         Some(self.cached_conn(&topo, idx, false))
     }
 
-    async fn route_and_send(&self, slot: u16, readonly: bool, frame: Bytes) {
+    // sync fast path: the returned pair is the rare full-queue leftover to await
+    fn route_single(
+        &self,
+        slot: u16,
+        readonly: bool,
+        frame: Bytes,
+    ) -> Option<(Rc<crate::backend::Conn>, Outbound)> {
         let seq = self.alloc_seq();
         let conn = {
             let topo = self.shared.topo.load();
@@ -280,12 +290,15 @@ impl Session {
                 .with_rng(|r| route::pick(&topo, slot, readonly, self.shared.cfg.slave_mode, r));
             let Some((idx, is_replica)) = picked else {
                 self.emit_at(seq, Bytes::from_static(ERR_NO_OWNER));
-                return;
+                return None;
             };
             self.cached_conn(&topo, idx, is_replica)
         };
         self.track_inflight(seq, &frame, 1);
-        conn.send(self.client_out(seq, frame)).await;
+        match conn.try_send(self.client_out(seq, frame)) {
+            Ok(()) => None,
+            Err(out) => Some((conn, out)),
+        }
     }
 
     fn client_out(&self, seq: u64, frame: Bytes) -> Outbound {
@@ -364,7 +377,9 @@ impl Session {
             self.spawn_blocking(slot, frame);
             return;
         }
-        self.route_and_send(slot, spec.is_readonly(), frame).await;
+        if let Some((conn, out)) = self.route_single(slot, spec.is_readonly(), frame) {
+            conn.send_wait(out).await;
+        }
     }
 
     fn forward_blocking(&self, spec: &Spec, frame: Bytes, argc: usize) {

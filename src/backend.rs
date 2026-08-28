@@ -51,21 +51,31 @@ pub struct Conn {
 impl Conn {
     /// Queues a request, delivering an error frame if the connection is gone.
     pub async fn send(&self, out: Outbound) {
+        if let Err(out) = self.try_send(out) {
+            self.send_wait(out).await;
+        }
+    }
+
+    /// Queues without waiting; a full queue hands the request back.
+    pub fn try_send(&self, out: Outbound) -> Result<(), Outbound> {
         if self.dead.get() {
             deliver(out.sink, Bytes::from_static(ERR_BACKEND_LOST));
-            return;
+            return Ok(());
         }
         match self.tx.try_send(out) {
-            Ok(()) => {}
-            // boxed so the rare full-queue wait stays out of every caller's future
-            Err(mpsc::error::TrySendError::Full(out)) => {
-                if let Err(e) = Box::pin(self.tx.send(out)).await {
-                    deliver(e.0.sink, Bytes::from_static(ERR_BACKEND_LOST));
-                }
-            }
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(out)) => Err(out),
             Err(mpsc::error::TrySendError::Closed(out)) => {
                 deliver(out.sink, Bytes::from_static(ERR_BACKEND_LOST));
+                Ok(())
             }
+        }
+    }
+
+    /// Full-queue slow path; boxed so the wait stays out of every caller's future.
+    pub async fn send_wait(&self, out: Outbound) {
+        if let Err(e) = Box::pin(self.tx.send(out)).await {
+            deliver(e.0.sink, Bytes::from_static(ERR_BACKEND_LOST));
         }
     }
 
