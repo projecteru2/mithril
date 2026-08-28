@@ -76,6 +76,8 @@ struct WriterLink {
     emitted: Cell<u64>,
     /// Set when no reply can ever be written again; the reader must stop dispatching.
     closed: Cell<bool>,
+    /// Wakes a reader parked on read_buf when `closed` is set.
+    closed_notify: tokio::sync::Notify,
     proto_switches: ProtoSwitchQueue,
     oob_budget: Cell<usize>,
     oob_notify: tokio::sync::Notify,
@@ -151,7 +153,7 @@ impl Session {
             match command::lookup(name) {
                 Some(spec) => spec,
                 None => {
-                    let name = String::from_utf8_lossy(name);
+                    let name = display_name(name);
                     self.abort_multi();
                     self.emit_error(&format!("ERR unknown command '{name}'"));
                     return;
@@ -190,7 +192,7 @@ impl Session {
             Kind::Eval => self.forward_eval(frame, argc).await,
             Kind::Xread => self.forward_xread(spec, frame, argc).await,
             Kind::Subscribe => self.enter_pubsub(spec, frame, argc),
-            Kind::Scan => self.run_scan(&frame, argc),
+            Kind::Scan => self.run_scan(frame, argc),
             Kind::Dbsize => self.run_broadcast(frame, true),
             Kind::Flushall => self.run_broadcast(frame, false),
         }
@@ -475,8 +477,8 @@ impl Session {
         });
     }
 
-    fn run_scan(&self, frame: &Bytes, argc: usize) {
-        let cursor = resp::Args::new(frame, argc)
+    fn run_scan(&self, frame: Bytes, argc: usize) {
+        let cursor = resp::Args::new(&frame, argc)
             .nth(1)
             .and_then(|a| std::str::from_utf8(a).ok())
             .and_then(|v| v.parse::<u64>().ok());
@@ -484,7 +486,6 @@ impl Session {
             self.emit_error("ERR invalid cursor");
             return;
         };
-        let frame = frame.clone();
         let (master_idx, node_cursor) = multikey::unpack_cursor(cursor);
         let seq = self.alloc_seq();
         let shared = self.shared.clone();
@@ -1203,7 +1204,11 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         if gated_read || gate_paused {
             continue 'main;
         }
-        match read_half.read_buf(&mut buf).await {
+        let read = tokio::select! {
+            _ = link.closed_notify.notified() => break,
+            r = read_half.read_buf(&mut buf) => r,
+        };
+        match read {
             Ok(0) | Err(_) => break,
             Ok(n) => stats::add(&shared.stats.workers[shared.worker].bytes_in, n as u64),
         }
@@ -1269,6 +1274,21 @@ async fn scatter_one(
 async fn recv_or_lost(rx: oneshot::Receiver<Bytes>) -> Bytes {
     rx.await
         .unwrap_or_else(|_| Bytes::from_static(ERR_BACKEND_LOST))
+}
+
+// a command name is echoed into an error reply; cap it and strip CR/LF so an
+// argument cannot inject a second frame.
+fn display_name(raw: &[u8]) -> String {
+    const CAP: usize = 128;
+    let mut out = String::with_capacity(raw.len().min(CAP));
+    for &b in raw.iter().take(CAP) {
+        out.push(if b == b'\r' || b == b'\n' {
+            ' '
+        } else {
+            b as char
+        });
+    }
+    out
 }
 
 fn error_frame(msg: &str) -> Bytes {
@@ -1409,10 +1429,15 @@ async fn pubsub_relay(
         }
     }
     backfill_acks(&link, &reply_tx);
-    // an idle subscriber must not outlive its dead pubsub backend; the flag
-    // stops the reader dispatching before the writer consumes Close.
-    link.closed.set(true);
+    // an idle subscriber sends nothing, so the reader must be woken, not just
+    // flagged, when its pubsub backend dies.
+    mark_closed(&link);
     let _ = reply_tx.send(Reply::Close);
+}
+
+fn mark_closed(link: &WriterLink) {
+    link.closed.set(true);
+    link.closed_notify.notify_waiters();
 }
 
 // a push holds one window slot from here until the writer emits it
@@ -1451,7 +1476,7 @@ async fn write_loop(
     }
     impl Drop for ExitBump<'_> {
         fn drop(&mut self) {
-            self.link.closed.set(true);
+            mark_closed(self.link);
             stats::bump(&self.shared.stats.workers[self.shared.worker].writers_exited);
             self.link.oob_notify.notify_waiters();
         }
