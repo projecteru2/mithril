@@ -11,21 +11,22 @@ pub const SCAN_CURSOR_BITS: u32 = 51;
 /// Sub-request for one slot: rebuilt command plus original key positions.
 pub struct Part {
     pub node: u16,
+    pub readonly: bool,
     pub frame: Bytes,
     pub positions: Vec<usize>,
 }
 
 /// Groups keys per slot (nodes reject cross-slot multi-key commands).
 pub fn split<'k, F>(
-    name: &[u8],
+    name: &'k [u8],
     keys: &[&'k [u8]],
     values: Option<&[&'k [u8]]>,
     mut route: F,
 ) -> Result<Vec<Part>, String>
 where
-    F: FnMut(u16) -> Option<u16>,
+    F: FnMut(u16) -> Option<(u16, bool)>,
 {
-    type Group<'a> = (u16, Vec<&'a [u8]>, Vec<usize>);
+    type Group<'a> = ((u16, bool), Vec<&'a [u8]>, Vec<usize>);
     let mut parts: Vec<Group<'k>> = Vec::new();
     let mut by_slot: HashMap<u16, usize> = HashMap::new();
     for (i, key) in keys.iter().enumerate() {
@@ -35,7 +36,7 @@ where
             None => {
                 let node = route(slot).ok_or_else(|| "slot has no owner".to_string())?;
                 by_slot.insert(slot, parts.len());
-                parts.push((node, Vec::new(), Vec::new()));
+                parts.push((node, vec![name], Vec::new()));
                 let last = parts.len() - 1;
                 &mut parts[last]
             }
@@ -48,14 +49,12 @@ where
     }
     Ok(parts
         .into_iter()
-        .map(|(node, args, positions)| {
-            let mut all: Vec<&[u8]> = Vec::with_capacity(args.len() + 1);
-            all.push(name);
-            all.extend_from_slice(&args);
+        .map(|((node, readonly), args, positions)| {
             let mut frame = Vec::new();
-            resp::write_command(&mut frame, &all);
+            resp::write_command(&mut frame, &args);
             Part {
                 node,
+                readonly,
                 frame: Bytes::from(frame),
                 positions,
             }
@@ -102,7 +101,7 @@ pub fn merge_mget(total: usize, parts: &[(Vec<usize>, Bytes)]) -> Result<Vec<u8>
             slots[*i] = item;
         }
     }
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(slots.iter().map(|s| s.len()).sum::<usize>() + 16);
     resp::array_header(&mut out, total);
     for s in slots {
         out.extend_from_slice(s);
@@ -111,9 +110,9 @@ pub fn merge_mget(total: usize, parts: &[(Vec<usize>, Bytes)]) -> Result<Vec<u8>
 }
 
 /// Sums integer part replies (DEL/UNLINK/EXISTS/TOUCH/PFCOUNT).
-pub fn merge_sum(parts: &[(Vec<usize>, Bytes)]) -> Result<Vec<u8>, Bytes> {
+pub fn merge_sum<'r>(parts: impl Iterator<Item = &'r Bytes>) -> Result<Vec<u8>, Bytes> {
     let mut total: i64 = 0;
-    for (_, reply) in parts {
+    for reply in parts {
         match parse_int(reply) {
             Some(n) => total += n,
             None => return Err(reply.clone()),
@@ -125,8 +124,8 @@ pub fn merge_sum(parts: &[(Vec<usize>, Bytes)]) -> Result<Vec<u8>, Bytes> {
 }
 
 /// Requires every part to reply +OK (MSET).
-pub fn merge_ok(parts: &[(Vec<usize>, Bytes)]) -> Result<Vec<u8>, Bytes> {
-    for (_, reply) in parts {
+pub fn merge_ok<'r>(parts: impl Iterator<Item = &'r Bytes>) -> Result<Vec<u8>, Bytes> {
+    for reply in parts {
         if reply.as_ref() != crate::admin::OK {
             return Err(reply.clone());
         }
@@ -183,7 +182,7 @@ mod tests {
     #[test]
     fn splits_by_slot_even_on_one_node() {
         let keys: Vec<&[u8]> = vec![b"{t}a", b"b", b"{t}c"];
-        let parts = split(b"MGET", &keys, None, |_slot| Some(7)).unwrap();
+        let parts = split(b"MGET", &keys, None, |_slot| Some((7, false))).unwrap();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].positions, vec![0, 2]);
         assert_eq!(
@@ -204,15 +203,15 @@ mod tests {
 
     #[test]
     fn merges_sums_and_oks() {
-        let parts = vec![
+        let parts = [
             (vec![0], Bytes::from_static(b":2\r\n")),
             (vec![1], Bytes::from_static(b":1\r\n")),
         ];
-        assert_eq!(merge_sum(&parts).unwrap(), b":3\r\n");
-        let oks = vec![(vec![0], Bytes::from_static(b"+OK\r\n"))];
-        assert_eq!(merge_ok(&oks).unwrap(), b"+OK\r\n");
-        let bad = vec![(vec![0], Bytes::from_static(b"-ERR nope\r\n"))];
-        assert!(merge_sum(&bad).is_err());
+        assert_eq!(merge_sum(parts.iter().map(|(_, r)| r)).unwrap(), b":3\r\n");
+        let oks = [(vec![0], Bytes::from_static(b"+OK\r\n"))];
+        assert_eq!(merge_ok(oks.iter().map(|(_, r)| r)).unwrap(), b"+OK\r\n");
+        let bad = [(vec![0], Bytes::from_static(b"-ERR nope\r\n"))];
+        assert!(merge_sum(bad.iter().map(|(_, r)| r)).is_err());
     }
 
     #[test]

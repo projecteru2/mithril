@@ -5,11 +5,14 @@ pub const MAX_NAME: usize = 24;
 pub const FLAG_WRITE: u8 = 1;
 pub const FLAG_READONLY: u8 = 1 << 1;
 pub const FLAG_NO_AUTH: u8 = 1 << 2;
+/// Transaction-control commands dispatch normally inside MULTI.
+pub const FLAG_TXN_CTRL: u8 = 1 << 3;
 pub const PREFIX_LEN: usize = 8;
 
 const W: u8 = FLAG_WRITE;
 const R: u8 = FLAG_READONLY;
 const N: u8 = FLAG_NO_AUTH;
+const T: u8 = FLAG_TXN_CTRL;
 
 /// How the proxy routes or handles a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,10 +161,10 @@ static TABLE: &[Spec] = &[
     c("decr", 2, W, 1, 1, 1, Kind::Single),
     c("decrby", 3, W, 1, 1, 1, Kind::Single),
     c("del", -2, W, 1, -1, 1, Kind::MultiSum),
-    c("discard", 1, 0, 0, 0, 0, Kind::Local),
+    c("discard", 1, T, 0, 0, 0, Kind::Local),
     c("echo", 2, 0, 0, 0, 0, Kind::Local),
     c("eval", -3, W, 0, 0, 0, Kind::Eval),
-    c("exec", 1, 0, 0, 0, 0, Kind::Local),
+    c("exec", 1, T, 0, 0, 0, Kind::Local),
     c("exists", -2, R, 1, -1, 1, Kind::MultiSum),
     c("expire", 3, W, 1, 1, 1, Kind::Single),
     c("expireat", 3, W, 1, 1, 1, Kind::Single),
@@ -212,7 +215,7 @@ static TABLE: &[Spec] = &[
     c("mget", -2, R, 1, -1, 1, Kind::Mget),
     c("mset", -3, W, 1, -1, 2, Kind::Mset),
     c("msetnx", -3, W, 1, -1, 2, Kind::Single),
-    c("multi", 1, 0, 0, 0, 0, Kind::Local),
+    c("multi", 1, T, 0, 0, 0, Kind::Local),
     c("persist", 2, W, 1, 1, 1, Kind::Single),
     c("pexpire", 3, W, 1, 1, 1, Kind::Single),
     c("pexpireat", 3, W, 1, 1, 1, Kind::Single),
@@ -225,7 +228,7 @@ static TABLE: &[Spec] = &[
     c("publish", 3, 0, 0, 0, 0, Kind::AnyMaster),
     c("pubsub", -2, 0, 0, 0, 0, Kind::AnyMaster),
     c("punsubscribe", -1, 0, 0, 0, 0, Kind::Subscribe),
-    c("quit", 1, N, 0, 0, 0, Kind::Local),
+    c("quit", 1, N | T, 0, 0, 0, Kind::Local),
     c("randomkey", 1, R, 0, 0, 0, Kind::AnyMaster),
     c("rename", 3, W, 1, 2, 1, Kind::Single),
     c("renamenx", 3, W, 1, 2, 1, Kind::Single),

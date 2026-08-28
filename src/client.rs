@@ -15,7 +15,6 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::backend::{ASKING_FRAME, Backends, ERR_BACKEND_LOST, Outbound, Sink};
 use crate::command::{self, Kind, Spec};
-use crate::config::SlaveMode;
 use crate::log_debug;
 use crate::multikey;
 use crate::resp::{self, ReqScan};
@@ -32,9 +31,9 @@ pub const READ_CHUNK: usize = crate::backend::READ_CHUNK;
 /// Sequence for out-of-band frames (pubsub pushes) that bypass ordering.
 pub const SEQ_OOB: u64 = u64::MAX;
 
-const ERR_NOAUTH: &str = "NOAUTH Authentication required.";
-const ERR_CROSSSLOT: &str = "CROSSSLOT Keys in request don't hash to the same slot";
-const ERR_NO_OWNER: &str = "CLUSTERDOWN Hash slot not served";
+const ERR_NOAUTH: &[u8] = b"-NOAUTH Authentication required.\r\n";
+const ERR_CROSSSLOT: &[u8] = b"-CROSSSLOT Keys in request don't hash to the same slot\r\n";
+const ERR_NO_OWNER: &[u8] = b"-CLUSTERDOWN Hash slot not served\r\n";
 const ERR_TRYAGAIN: &[u8] = b"-TRYAGAIN slot is migrating, retry later\r\n";
 
 /// Everything a session needs from its worker.
@@ -54,11 +53,18 @@ struct InFlight {
     retried: bool,
 }
 
-type InflightMap = Rc<RefCell<HashMap<u64, InFlight>>>;
+type InflightMap = RefCell<HashMap<u64, InFlight>>;
 type ReplyTx = mpsc::UnboundedSender<(u64, Bytes)>;
-type Emitted = Rc<Cell<u64>>;
-type ProtoSwitches = Rc<ProtoSwitchQueue>;
 
+/// State shared between a session's reader, writer, and pubsub relay.
+#[derive(Default)]
+struct WriterLink {
+    inflight: InflightMap,
+    emitted: Cell<u64>,
+    proto_switches: ProtoSwitchQueue,
+    oob_budget: Cell<usize>,
+    oob_notify: tokio::sync::Notify,
+}
 /// Pending protocol flips; `armed` keeps the hot path off the RefCell.
 #[derive(Default)]
 pub struct ProtoSwitchQueue {
@@ -92,7 +98,7 @@ struct Session {
     shared: Rc<Shared>,
     id: u64,
     reply_tx: ReplyTx,
-    inflight: InflightMap,
+    link: Rc<WriterLink>,
     proto: Rc<Cell<u8>>,
     authed: Cell<bool>,
     name: RefCell<String>,
@@ -102,10 +108,8 @@ struct Session {
     pubsub: RefCell<Option<PubsubHandle>>,
     pubsub_done: Rc<Cell<bool>>,
     unsub_inflight: Cell<bool>,
-    oob_pending: Rc<Cell<usize>>,
     blocking: RefCell<Vec<(u64, tokio::task::JoinHandle<()>)>>,
     closing: Cell<bool>,
-    proto_switches: ProtoSwitches,
     conns: RefCell<ConnCache>,
 }
 
@@ -146,12 +150,10 @@ impl Session {
             return;
         }
         if !self.authed.get() && spec.flags & command::FLAG_NO_AUTH == 0 {
-            self.emit_error(ERR_NOAUTH);
+            self.emit_error_frame(Bytes::from_static(ERR_NOAUTH));
             return;
         }
-        if self.multi.borrow().is_some()
-            && !matches!(spec.name, "exec" | "discard" | "multi" | "quit")
-        {
+        if self.multi.borrow().is_some() && spec.flags & command::FLAG_TXN_CTRL == 0 {
             self.queue_multi(spec, frame, argc);
             return;
         }
@@ -213,7 +215,7 @@ impl Session {
             let topo = self.shared.topo.load();
             let picked = self.with_rng(|r| route::any_master(&topo, r));
             let Some(idx) = picked else {
-                self.emit_at(seq, error_frame(ERR_NO_OWNER));
+                self.emit_at(seq, Bytes::from_static(ERR_NO_OWNER));
                 return;
             };
             self.cached_conn(&topo, idx, false)
@@ -239,7 +241,7 @@ impl Session {
     fn owner_conn(&self, seq: u64, slot: Option<u16>) -> Option<Rc<crate::backend::Conn>> {
         let topo = self.shared.topo.load();
         let Some(idx) = slot.and_then(|sl| topo.owner(sl)) else {
-            self.emit_at(seq, error_frame(ERR_NO_OWNER));
+            self.emit_at(seq, Bytes::from_static(ERR_NO_OWNER));
             return None;
         };
         Some(self.cached_conn(&topo, idx, false))
@@ -252,7 +254,7 @@ impl Session {
             let picked = self
                 .with_rng(|r| route::pick(&topo, slot, readonly, self.shared.cfg.slave_mode, r));
             let Some((idx, is_replica)) = picked else {
-                self.emit_at(seq, error_frame(ERR_NO_OWNER));
+                self.emit_at(seq, Bytes::from_static(ERR_NO_OWNER));
                 return;
             };
             self.cached_conn(&topo, idx, is_replica)
@@ -266,8 +268,7 @@ impl Session {
             head: None,
             frame,
             expect: 1,
-            seq,
-            sink: Sink::Client(self.reply_tx.clone()),
+            sink: Sink::Client(self.reply_tx.clone(), seq),
         })
         .await;
     }
@@ -277,7 +278,7 @@ impl Session {
     }
 
     fn track_inflight_expect(&self, seq: u64, frame: &Bytes, expect: u32) {
-        self.inflight.borrow_mut().insert(
+        self.link.inflight.borrow_mut().insert(
             seq,
             InFlight {
                 frame: frame.clone(),
@@ -389,7 +390,7 @@ impl Session {
             let topo = self.shared.topo.load_full();
             let parts = self.with_rng(|rng| {
                 multikey::split(spec.name.as_bytes(), &keys, values.as_deref(), |slot| {
-                    route::pick(&topo, slot, readonly, mode, rng).map(|(i, _)| i)
+                    route::pick(&topo, slot, readonly, mode, rng)
                 })
             });
             parts.map(|p| (p, total, topo))
@@ -409,14 +410,13 @@ impl Session {
             Kind::Mset => Merge::Ok,
             _ => Merge::Sum,
         };
-        let flag_readonly = readonly && mode != SlaveMode::Off;
         // detached deliberately: completion is bounded by backend replies.
         tokio::task::spawn_local(async move {
             let mut receivers = Vec::with_capacity(parts.len());
             for part in &parts {
                 let addr = &topo.nodes[part.node as usize].addr;
                 let rx =
-                    scatter_one(&shared, addr, id, flag_readonly, None, part.frame.clone()).await;
+                    scatter_one(&shared, addr, id, part.readonly, None, part.frame.clone()).await;
                 receivers.push(rx);
             }
             let mut results: Vec<(Vec<usize>, Bytes)> = Vec::with_capacity(parts.len());
@@ -445,8 +445,8 @@ impl Session {
             }
             let merged = match merge {
                 Merge::Mget => multikey::merge_mget(total, &results),
-                Merge::Ok => multikey::merge_ok(&results),
-                Merge::Sum => multikey::merge_sum(&results),
+                Merge::Ok => multikey::merge_ok(results.iter().map(|(_, r)| r)),
+                Merge::Sum => multikey::merge_sum(results.iter().map(|(_, r)| r)),
             };
             let out = match merged {
                 Ok(bytes) => Bytes::from(bytes),
@@ -457,12 +457,10 @@ impl Session {
     }
 
     fn run_scan(&self, frame: &Bytes, argc: usize) {
-        let cursor = {
-            let args = collect_args(frame, argc);
-            std::str::from_utf8(args[1])
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-        };
+        let cursor = resp::Args::new(frame, argc)
+            .nth(1)
+            .and_then(|a| std::str::from_utf8(a).ok())
+            .and_then(|v| v.parse::<u64>().ok());
         let Some(cursor) = cursor else {
             self.emit_error("ERR invalid cursor");
             return;
@@ -524,13 +522,13 @@ impl Session {
                 let rx = scatter_one(&shared, addr, id, false, None, frame.clone()).await;
                 receivers.push(rx);
             }
-            let mut replies: Vec<(Vec<usize>, Bytes)> = Vec::with_capacity(receivers.len());
+            let mut replies: Vec<Bytes> = Vec::with_capacity(receivers.len());
             for rx in receivers {
-                replies.push((Vec::new(), recv_or_lost(rx).await));
+                replies.push(recv_or_lost(rx).await);
             }
             let merged = match merge {
-                BroadcastMerge::Sum => multikey::merge_sum(&replies),
-                BroadcastMerge::Ok => multikey::merge_ok(&replies),
+                BroadcastMerge::Sum => multikey::merge_sum(replies.iter()),
+                BroadcastMerge::Ok => multikey::merge_ok(replies.iter()),
             };
             let out = match merged {
                 Ok(b) => Bytes::from(b),
@@ -578,7 +576,7 @@ impl Session {
             None => {
                 state.aborted = true;
                 drop(guard);
-                self.emit_error(ERR_CROSSSLOT);
+                self.emit_error_frame(Bytes::from_static(ERR_CROSSSLOT));
             }
             Some(slot) => {
                 state.slot = Some(slot);
@@ -640,7 +638,7 @@ impl Session {
                 "reset" => {
                     *self.multi.borrow_mut() = None;
                     self.proto.set(2);
-                    self.proto_switches.push(self.next_seq.get(), 2);
+                    self.link.proto_switches.push(self.next_seq.get(), 2);
                     self.authed.set(self.shared.cfg.requirepass.is_empty());
                     Some(Bytes::from_static(b"+RESET\r\n"))
                 }
@@ -706,8 +704,7 @@ impl Session {
             head: None,
             frame: blob,
             expect,
-            seq,
-            sink: Sink::Client(self.reply_tx.clone()),
+            sink: Sink::Client(self.reply_tx.clone(), seq),
         })
         .await;
     }
@@ -781,7 +778,7 @@ impl Session {
             return;
         }
         self.proto.set(proto);
-        self.proto_switches.push(self.next_seq.get(), proto);
+        self.link.proto_switches.push(self.next_seq.get(), proto);
         let mut out = Vec::new();
         if proto >= 3 {
             out.extend_from_slice(b"%7\r\n");
@@ -866,7 +863,7 @@ impl Session {
                         ps.task.abort();
                     }
                     self.proto.set(2);
-                    self.proto_switches.push(self.next_seq.get(), 2);
+                    self.link.proto_switches.push(self.next_seq.get(), 2);
                     self.emit_local(Bytes::from_static(b"+RESET\r\n"));
                     return;
                 }
@@ -898,7 +895,7 @@ impl Session {
 
     async fn enter_pubsub(&self, first_frame: Bytes) {
         let Some(addr) = self.any_master_addr() else {
-            self.emit_error(ERR_NO_OWNER);
+            self.emit_error_frame(Bytes::from_static(ERR_NO_OWNER));
             return;
         };
         let first_seq = self.alloc_seq();
@@ -909,9 +906,9 @@ impl Session {
         let reply_tx = self.reply_tx.clone();
         let proto = self.proto.clone();
         let done = self.pubsub_done.clone();
-        let budget = self.oob_pending.clone();
+        let link = self.link.clone();
         let task = tokio::task::spawn_local(async move {
-            pubsub_relay(shared, addr, rx, reply_tx, proto, done, budget, first_seq).await;
+            pubsub_relay(shared, addr, rx, reply_tx, proto, done, link, first_seq).await;
         });
         *self.pubsub.borrow_mut() = Some(PubsubHandle { tx, task });
     }
@@ -934,8 +931,12 @@ impl Session {
     }
 
     fn emit_error(&self, msg: &str) {
+        self.emit_error_frame(error_frame(msg));
+    }
+
+    fn emit_error_frame(&self, frame: Bytes) {
         stats::bump(&self.shared.stats.workers[self.shared.worker].errors);
-        self.emit_local(error_frame(msg));
+        self.emit_local(frame);
     }
 
     fn emit_at(&self, seq: u64, frame: Bytes) {
@@ -978,17 +979,14 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
     }
     let (mut read_half, write_half) = stream.into_split();
     let (reply_tx, reply_rx) = mpsc::unbounded_channel();
-    let inflight: InflightMap = Rc::new(RefCell::new(HashMap::new()));
     let proto = Rc::new(Cell::new(2u8));
-    let emitted: Emitted = Rc::new(Cell::new(0));
-    let proto_switches: ProtoSwitches = Rc::new(ProtoSwitchQueue::default());
-    let oob_budget: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+    let link: Rc<WriterLink> = Rc::new(WriterLink::default());
 
     let session = Session {
         shared: shared.clone(),
         id,
         reply_tx: reply_tx.clone(),
-        inflight: inflight.clone(),
+        link: link.clone(),
         proto: proto.clone(),
         authed: Cell::new(shared.cfg.requirepass.is_empty()),
         name: RefCell::new(String::new()),
@@ -998,10 +996,8 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         pubsub: RefCell::new(None),
         pubsub_done: Rc::new(Cell::new(false)),
         unsub_inflight: Cell::new(false),
-        oob_pending: oob_budget.clone(),
         blocking: RefCell::new(Vec::new()),
         closing: Cell::new(false),
-        proto_switches: proto_switches.clone(),
         conns: RefCell::new(ConnCache {
             epoch: 0,
             by_node: Vec::new(),
@@ -1015,10 +1011,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         reply_rx,
         reply_tx.clone(),
         close_rx,
-        inflight,
-        emitted.clone(),
-        proto_switches,
-        oob_budget,
+        link.clone(),
         id,
     ));
 
@@ -1041,7 +1034,6 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
                         let refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
                         let mut rebuilt = Vec::new();
                         resp::write_command(&mut rebuilt, &refs);
-                        drop(refs);
                         session.dispatch(Bytes::from(rebuilt), argc).await;
                     }
                 }
@@ -1059,7 +1051,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
             session.emit_error("ERR query buffer exceeds limit");
             break;
         }
-        while session.next_seq.get().saturating_sub(emitted.get()) > MAX_INFLIGHT as u64 {
+        while session.next_seq.get().saturating_sub(link.emitted.get()) > MAX_INFLIGHT as u64 {
             if reply_tx.is_closed() {
                 break 'main;
             }
@@ -1135,7 +1127,6 @@ async fn scatter_one(
         head,
         frame,
         expect,
-        seq: 0,
         sink: Sink::One(tx),
     })
     .await;
@@ -1170,7 +1161,7 @@ async fn blocking_round(
         ),
     };
     let Some(addr) = addr else {
-        return error_frame(ERR_NO_OWNER);
+        return Bytes::from_static(ERR_NO_OWNER);
     };
     let Some(lease) = shared.backends.take_exclusive(addr, false) else {
         return error_frame("ERR too many blocking connections");
@@ -1182,7 +1173,6 @@ async fn blocking_round(
             head: asking.then(|| Bytes::from_static(ASKING_FRAME)),
             frame: frame.clone(),
             expect: if asking { 2 } else { 1 },
-            seq: 0,
             sink: Sink::One(tx),
         })
         .await;
@@ -1223,7 +1213,7 @@ async fn pubsub_relay(
     reply_tx: ReplyTx,
     proto: Rc<Cell<u8>>,
     done: Rc<Cell<bool>>,
-    budget: Rc<Cell<usize>>,
+    link: Rc<WriterLink>,
     first_seq: u64,
 ) {
     let mut first_seq = Some(first_seq);
@@ -1257,17 +1247,17 @@ async fn pubsub_relay(
                 if proto.get() >= 3 && frame.first() == Some(&b'*') {
                     frame[0] = b'>';
                 }
-                while budget.get() >= PUBSUB_PUSH_WINDOW {
+                while link.oob_budget.get() >= PUBSUB_PUSH_WINDOW {
                     if reply_tx.is_closed() {
                         return;
                     }
-                    tokio::task::yield_now().await;
+                    link.oob_notify.notified().await;
                 }
                 // the first confirmation rides normal ordering.
                 let tagged = match first_seq.take() {
                     Some(seq) => (seq, frame.freeze()),
                     None => {
-                        budget.set(budget.get() + 1);
+                        link.oob_budget.set(link.oob_budget.get() + 1);
                         (SEQ_OOB, frame.freeze())
                     }
                 };
@@ -1287,26 +1277,23 @@ async fn pubsub_relay(
     writer.abort();
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn write_loop(
     shared: Rc<Shared>,
     mut write_half: OwnedWriteHalf,
     mut rx: mpsc::UnboundedReceiver<(u64, Bytes)>,
     reply_tx: ReplyTx,
     mut close_rx: oneshot::Receiver<u64>,
-    inflight: InflightMap,
-    emitted: Emitted,
-    proto_switches: ProtoSwitches,
-    oob_budget: Rc<Cell<usize>>,
+    link: Rc<WriterLink>,
     client_id: u64,
 ) {
-    struct ExitBump(Rc<Shared>);
+    struct ExitBump(Rc<Shared>, Rc<WriterLink>);
     impl Drop for ExitBump {
         fn drop(&mut self) {
             stats::bump(&self.0.stats.workers[self.0.worker].writers_exited);
+            self.1.oob_notify.notify_waiters();
         }
     }
-    let _exit = ExitBump(shared.clone());
+    let _exit = ExitBump(shared.clone(), link.clone());
     let mut next_emit: u64 = 0;
     // protocol flips apply at the HELLO reply's sequence, not before.
     let mut cur_proto: u8 = 2;
@@ -1340,17 +1327,19 @@ async fn write_loop(
         }
         for (seq, frame) in batch.drain(..) {
             if seq == SEQ_OOB {
-                oob_budget.set(oob_budget.get().saturating_sub(1));
+                let left = link.oob_budget.get().saturating_sub(1);
+                link.oob_budget.set(left);
+                if left == PUBSUB_PUSH_WINDOW - 1 {
+                    link.oob_notify.notify_waiters();
+                }
                 ready.push(convert_nil(frame, cur_proto));
                 continue;
             }
             if seq < next_emit {
                 continue;
             }
-            if frame.first() == Some(&b'-')
-                && let Some((req, base_expect)) = take_retry_frame(&inflight, seq, &frame)
-                && let Some((ask, target)) = parse_redirect(&frame)
-                && (base_expect == 1 || !ask)
+            if let Some((ask, target)) = parse_redirect(&frame)
+                && let Some((req, base_expect)) = take_retry_frame(&link.inflight, seq, ask)
             {
                 stats::bump(&shared.stats.workers[shared.worker].redirects);
                 let _ = shared.refresh.send(());
@@ -1359,8 +1348,7 @@ async fn write_loop(
                     head: ask.then(|| Bytes::from_static(ASKING_FRAME)),
                     frame: req,
                     expect: base_expect + u32::from(ask),
-                    seq,
-                    sink: Sink::Client(reply_tx.clone()),
+                    sink: Sink::Client(reply_tx.clone(), seq),
                 })
                 .await;
                 continue;
@@ -1372,8 +1360,8 @@ async fn write_loop(
                 frame
             };
             if seq == next_emit {
-                inflight.borrow_mut().remove(&seq);
-                proto_switches.apply(next_emit, &mut cur_proto);
+                link.inflight.borrow_mut().remove(&seq);
+                link.proto_switches.apply(next_emit, &mut cur_proto);
                 ready.push(convert_nil(frame, cur_proto));
                 next_emit += 1;
             } else {
@@ -1381,8 +1369,8 @@ async fn write_loop(
             }
         }
         while let Some(frame) = parked.remove(&next_emit) {
-            inflight.borrow_mut().remove(&next_emit);
-            proto_switches.apply(next_emit, &mut cur_proto);
+            link.inflight.borrow_mut().remove(&next_emit);
+            link.proto_switches.apply(next_emit, &mut cur_proto);
             ready.push(convert_nil(frame, cur_proto));
             next_emit += 1;
         }
@@ -1403,17 +1391,16 @@ async fn write_loop(
             stats::add(&shared.stats.workers[shared.worker].bytes_out, total as u64);
             ready.clear();
         }
-        emitted.set(next_emit);
+        link.emitted.set(next_emit);
     }
 }
 
-fn take_retry_frame(inflight: &InflightMap, seq: u64, frame: &Bytes) -> Option<(Bytes, u32)> {
-    if !frame.starts_with(b"-MOVED ") && !frame.starts_with(b"-ASK ") {
-        return None;
-    }
+// marks the entry retried only when the redirect is actually retryable:
+// single-reply requests always, multi-reply blobs only for MOVED.
+fn take_retry_frame(inflight: &InflightMap, seq: u64, ask: bool) -> Option<(Bytes, u32)> {
     let mut inf = inflight.borrow_mut();
     match inf.get_mut(&seq) {
-        Some(entry) if !entry.retried => {
+        Some(entry) if !entry.retried && (entry.expect == 1 || !ask) => {
             entry.retried = true;
             Some((entry.frame.clone(), entry.expect))
         }

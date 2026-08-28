@@ -119,6 +119,7 @@ impl<'a> Iterator for Args<'a> {
 
 /// Serializes argument slices as a RESP array of bulk strings into `out`.
 pub fn write_command(out: &mut Vec<u8>, args: &[&[u8]]) {
+    out.reserve(args.iter().map(|a| a.len() + 13).sum::<usize>() + 13);
     array_header(out, args.len());
     for a in args {
         out.push(b'$');

@@ -27,8 +27,8 @@ pub const ERR_BACKEND_LOST: &[u8] = b"-ERR mithril: backend connection lost\r\n"
 
 /// Where a backend reply is delivered.
 pub enum Sink {
-    /// Ordered client reply stream: (sequence, frame).
-    Client(mpsc::UnboundedSender<(u64, Bytes)>),
+    /// Ordered client reply stream at a fixed sequence.
+    Client(mpsc::UnboundedSender<(u64, Bytes)>, u64),
     /// Single reply for mergers and blocking commands.
     One(oneshot::Sender<Bytes>),
 }
@@ -39,14 +39,12 @@ pub struct Outbound {
     pub frame: Bytes,
     /// Number of backend replies this produces; only the last is delivered.
     pub expect: u32,
-    pub seq: u64,
     pub sink: Sink,
 }
 
 // reply pairing assumes RESP2 backends: no unsolicited pushes.
 struct Pending {
     expect: u32,
-    seq: u64,
     sink: Sink,
     first_err: Option<Bytes>,
 }
@@ -62,12 +60,11 @@ impl Conn {
     /// connection is gone.
     pub async fn send(&self, out: Outbound) {
         if self.dead.get() {
-            deliver(out.sink, out.seq, Bytes::from_static(ERR_BACKEND_LOST));
+            deliver(out.sink, Bytes::from_static(ERR_BACKEND_LOST));
             return;
         }
         if let Err(e) = self.tx.send(out).await {
-            let out = e.0;
-            deliver(out.sink, out.seq, Bytes::from_static(ERR_BACKEND_LOST));
+            deliver(e.0.sink, Bytes::from_static(ERR_BACKEND_LOST));
         }
     }
 
@@ -76,12 +73,12 @@ impl Conn {
     }
 }
 
-/// Per-worker backend pools keyed by node address.
-type PoolKey = (Box<str>, bool);
+type PoolPair = [Option<Rc<Pool>>; 2];
 
+/// Per-worker backend pools keyed by node address, split by readonly role.
 pub struct Backends {
     cfg: Rc<Config>,
-    pools: RefCell<HashMap<PoolKey, Rc<Pool>>>,
+    pools: RefCell<HashMap<Box<str>, PoolPair>>,
 }
 
 impl Backends {
@@ -138,8 +135,9 @@ impl Backends {
     }
 
     fn pool(&self, addr: &str, readonly: bool) -> Rc<Pool> {
-        let key = (addr.into(), readonly);
-        if let Some(p) = self.pools.borrow().get(&key) {
+        if let Some(pair) = self.pools.borrow().get(addr)
+            && let Some(p) = &pair[usize::from(readonly)]
+        {
             return p.clone();
         }
         let pool = Rc::new(Pool {
@@ -147,7 +145,9 @@ impl Backends {
             idle_exclusive: RefCell::new(Vec::new()),
             exclusive_count: Cell::new(0),
         });
-        self.pools.borrow_mut().insert(key, pool.clone());
+        let mut pools = self.pools.borrow_mut();
+        let pair = pools.entry(addr.into()).or_default();
+        pair[usize::from(readonly)] = Some(pool.clone());
         pool
     }
 
@@ -259,7 +259,7 @@ async fn run_conn(addr: &str, mut rx: mpsc::Receiver<Outbound>, readonly: bool, 
                             Some(err) if is_err => err,
                             _ => frame,
                         };
-                        deliver(d.sink, d.seq, reply);
+                        deliver(d.sink, reply);
                     }
                 }
                 resp::Scan::Invalid(e) => {
@@ -285,7 +285,6 @@ async fn run_conn(addr: &str, mut rx: mpsc::Receiver<Outbound>, readonly: bool, 
                 for out in batch.drain(..) {
                     pending.push_back(Pending {
                         expect: out.expect,
-                        seq: out.seq,
                         sink: out.sink,
                         first_err: None,
                     });
@@ -309,14 +308,14 @@ async fn run_conn(addr: &str, mut rx: mpsc::Receiver<Outbound>, readonly: bool, 
     }
 
     for p in pending.drain(..) {
-        deliver(p.sink, p.seq, Bytes::from_static(ERR_BACKEND_LOST));
+        deliver(p.sink, Bytes::from_static(ERR_BACKEND_LOST));
     }
     drain_channel(&mut rx);
 }
 
-fn deliver(sink: Sink, seq: u64, frame: Bytes) {
+fn deliver(sink: Sink, frame: Bytes) {
     match sink {
-        Sink::Client(tx) => {
+        Sink::Client(tx, seq) => {
             let _ = tx.send((seq, frame));
         }
         Sink::One(tx) => {
@@ -328,7 +327,7 @@ fn deliver(sink: Sink, seq: u64, frame: Bytes) {
 fn drain_channel(rx: &mut mpsc::Receiver<Outbound>) {
     rx.close();
     while let Ok(out) = rx.try_recv() {
-        deliver(out.sink, out.seq, Bytes::from_static(ERR_BACKEND_LOST));
+        deliver(out.sink, Bytes::from_static(ERR_BACKEND_LOST));
     }
 }
 
