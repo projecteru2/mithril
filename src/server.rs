@@ -179,7 +179,6 @@ fn acceptor_thread(
         let mut cmd_rate = vec![0u64; conn_txs.len()];
         let mut placed = vec![0u64; conn_txs.len()];
         let mut order: Vec<usize> = Vec::with_capacity(conn_txs.len());
-        let mut snap_at = tokio::time::Instant::now();
         let lb = cfg.placement == Placement::LeastLoaded;
         let mut tick = tokio::time::interval(SNAP_WINDOW);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -189,8 +188,10 @@ fn acceptor_thread(
                 // rates must stay fresh through accept gaps, or a burst on
                 // one worker dilutes across the whole gap and reads as idle
                 _ = tick.tick(), if lb => {
-                    refresh_rates(&stats, &mut cmd_snap, &mut cmd_rate, &mut placed, 1);
-                    snap_at = tokio::time::Instant::now();
+                    if SHUTTING_DOWN.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    refresh_rates(&stats, &mut cmd_snap, &mut cmd_rate, &mut placed);
                     continue;
                 }
                 _ = tokio::time::sleep(ACCEPT_POLL) => {
@@ -229,17 +230,6 @@ fn acceptor_thread(
             // next-best key instead of a cyclic neighbor
             // a full queue must not stall accepts for the rest
             'place: loop {
-                if lb {
-                    let now = tokio::time::Instant::now();
-                    let elapsed = now.duration_since(snap_at);
-                    if elapsed >= SNAP_WINDOW {
-                        // full-queue retries block the tick arm; keep per-window units
-                        let scale =
-                            (elapsed.as_millis() as u64 / SNAP_WINDOW.as_millis() as u64).max(1);
-                        refresh_rates(&stats, &mut cmd_snap, &mut cmd_rate, &mut placed, scale);
-                        snap_at = now;
-                    }
-                }
                 order.clear();
                 order.extend(0..conn_txs.len());
                 if lb {
@@ -268,7 +258,14 @@ fn acceptor_thread(
                 if SHUTTING_DOWN.load(Ordering::Relaxed) {
                     break;
                 }
-                tokio::time::sleep(DRAIN_POLL).await;
+                // full-queue retry: resample on the tick cadence so shifting
+                // load reranks with fresh single-window rates
+                if lb {
+                    tick.tick().await;
+                    refresh_rates(&stats, &mut cmd_snap, &mut cmd_rate, &mut placed);
+                } else {
+                    tokio::time::sleep(DRAIN_POLL).await;
+                }
             }
         }
     });
@@ -320,16 +317,10 @@ fn worker_thread(
     });
 }
 
-fn refresh_rates(
-    stats: &Stats,
-    snap: &mut [u64],
-    rate: &mut [u64],
-    placed: &mut [u64],
-    scale: u64,
-) {
+fn refresh_rates(stats: &Stats, snap: &mut [u64], rate: &mut [u64], placed: &mut [u64]) {
     for i in 0..snap.len() {
         let c = stats.workers[i].commands.load(Ordering::Relaxed);
-        rate[i] = (c - snap[i]) / scale;
+        rate[i] = c - snap[i];
         snap[i] = c;
         placed[i] = 0;
     }
