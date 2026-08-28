@@ -193,18 +193,22 @@ fn acceptor_thread(
             let best = next;
             next = (next + 1) % conn_txs.len();
             let mut pending = Some(std_stream);
-            for k in 0..conn_txs.len() {
-                let Some(s) = pending.take() else { break };
-                let i = (best + k) % conn_txs.len();
-                match conn_txs[i].try_send(s) {
-                    Ok(()) => {}
-                    Err(e) => pending = Some(e.into_inner()),
+            'place: loop {
+                for k in 0..conn_txs.len() {
+                    let Some(s) = pending.take() else {
+                        break 'place;
+                    };
+                    let i = (best + k) % conn_txs.len();
+                    match conn_txs[i].try_send(s) {
+                        Ok(()) => {}
+                        Err(e) => pending = Some(e.into_inner()),
+                    }
                 }
-            }
-            if let Some(s) = pending
-                && conn_txs[best].send(s).await.is_err()
-            {
-                stats.clients.fetch_sub(1, Ordering::Relaxed);
+                if SHUTTING_DOWN.load(Ordering::Relaxed) {
+                    stats.clients.fetch_sub(1, Ordering::Relaxed);
+                    break;
+                }
+                tokio::time::sleep(DRAIN_POLL).await;
             }
         }
     });

@@ -23,6 +23,7 @@ use crate::topology::Topology;
 use crate::{admin, crc16, route};
 
 const MAX_INFLIGHT: usize = 65536;
+const SUBS_LIMIT: usize = 32768;
 const PUBSUB_FORWARD_QUEUE: usize = 64;
 const PUBSUB_PUSH_WINDOW: usize = 4096;
 const GATE_PROBE: std::time::Duration = std::time::Duration::from_millis(100);
@@ -188,7 +189,7 @@ impl Session {
             Kind::Blocking => self.forward_blocking(spec, frame, argc),
             Kind::Eval => self.forward_eval(frame, argc).await,
             Kind::Xread => self.forward_xread(spec, frame, argc).await,
-            Kind::Subscribe => self.enter_pubsub(frame, argc),
+            Kind::Subscribe => self.enter_pubsub(spec, frame, argc),
             Kind::Scan => self.run_scan(&frame, argc),
             Kind::Dbsize => self.run_broadcast(frame, true),
             Kind::Flushall => self.run_broadcast(frame, false),
@@ -895,6 +896,10 @@ impl Session {
                 self.emit_local(Bytes::from_static(b"+RESET\r\n"));
                 return;
             }
+            _ if self.pubsub_overflow(spec, argc) => {
+                self.emit_error("ERR pubsub confirmation backlog exceeds limit");
+                return;
+            }
             "ping" => self.promise_acks(1),
             _ if spec.kind == Kind::Subscribe => self.promise_subscription(&frame, argc),
             _ => {
@@ -916,6 +921,25 @@ impl Session {
         }
     }
 
+    // every promised confirmation occupies the reply window until emitted, and
+    // a bare unsubscribe promises one per live subscription: both need bounds.
+    fn pubsub_overflow(&self, spec: &Spec, argc: usize) -> bool {
+        let live = {
+            let subs = self.subs.borrow();
+            subs.channels.len() + subs.patterns.len()
+        };
+        let expected = if argc > 1 {
+            argc - 1
+        } else if spec.kind == Kind::Subscribe {
+            live.max(1)
+        } else {
+            1
+        };
+        let growing = matches!(spec.name, "subscribe" | "psubscribe");
+        let outstanding = (self.next_seq.get() - self.link.emitted.get()) as usize;
+        (growing && live + expected > SUBS_LIMIT) || outstanding + expected > MAX_INFLIGHT
+    }
+
     fn promise_subscription(&self, frame: &Bytes, argc: usize) {
         let acks = {
             let args = collect_args(frame, argc);
@@ -931,7 +955,11 @@ impl Session {
         }
     }
 
-    fn enter_pubsub(&self, first_frame: Bytes, argc: usize) {
+    fn enter_pubsub(&self, spec: &Spec, first_frame: Bytes, argc: usize) {
+        if self.pubsub_overflow(spec, argc) {
+            self.emit_error("ERR pubsub confirmation backlog exceeds limit");
+            return;
+        }
         let Some(addr) = self.any_master_addr() else {
             self.emit_error_frame(Bytes::from_static(ERR_NO_OWNER));
             return;
@@ -1156,7 +1184,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
                 _ => {}
             }
         }
-        if gated_read {
+        if gated_read || gate_paused {
             continue 'main;
         }
         match read_half.read_buf(&mut buf).await {
