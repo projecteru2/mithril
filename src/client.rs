@@ -130,6 +130,7 @@ struct Session {
     blocking: RefCell<Vec<(u64, tokio::task::JoinHandle<()>)>>,
     closing: Cell<bool>,
     conns: RefCell<ConnCache>,
+    topo_cache: RefCell<std::sync::Arc<Topology>>,
 }
 
 impl Session {
@@ -212,6 +213,14 @@ impl Session {
         }
     }
 
+    // one relaxed epoch load replaces the arc-swap hazard load on the hot path
+    fn topo(&self) -> std::cell::Ref<'_, std::sync::Arc<Topology>> {
+        if crate::server::topo_epoch() != self.topo_cache.borrow().epoch {
+            *self.topo_cache.borrow_mut() = self.shared.topo.load_full();
+        }
+        self.topo_cache.borrow()
+    }
+
     fn key_slot(&self, frame: &Bytes, argc: usize, key_index: usize) -> Option<u16> {
         let mut it = resp::Args::new(frame, argc);
         it.nth(key_index).map(crc16::slot)
@@ -244,7 +253,7 @@ impl Session {
     async fn forward_any_master(&self, frame: Bytes) {
         let seq = self.alloc_seq();
         let conn = {
-            let topo = self.shared.topo.load();
+            let topo = self.topo();
             let picked = self.with_rng(|r| route::any_master(&topo, r));
             let Some(idx) = picked else {
                 self.emit_at(seq, Bytes::from_static(ERR_NO_OWNER));
@@ -256,7 +265,7 @@ impl Session {
     }
 
     fn any_master_addr(&self) -> Option<String> {
-        let topo = self.shared.topo.load();
+        let topo = self.topo();
         let idx = self.with_rng(|r| route::any_master(&topo, r))?;
         Some(topo.nodes[idx as usize].addr.clone())
     }
@@ -270,7 +279,7 @@ impl Session {
 
     // resolves a slot's master connection, emitting ERR_NO_OWNER at seq if unowned
     fn owner_conn(&self, seq: u64, slot: Option<u16>) -> Option<Rc<crate::backend::Conn>> {
-        let topo = self.shared.topo.load();
+        let topo = self.topo();
         let Some(idx) = slot.and_then(|sl| topo.owner(sl)) else {
             self.emit_at(seq, Bytes::from_static(ERR_NO_OWNER));
             return None;
@@ -287,7 +296,7 @@ impl Session {
     ) -> Option<Box<(Rc<crate::backend::Conn>, Outbound)>> {
         let seq = self.alloc_seq();
         let conn = {
-            let topo = self.shared.topo.load();
+            let topo = self.topo();
             let picked = self
                 .with_rng(|r| route::pick(&topo, slot, readonly, self.shared.cfg.slave_mode, r));
             let Some((idx, is_replica)) = picked else {
@@ -1144,6 +1153,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
             epoch: 0,
             by_node: Vec::new(),
         }),
+        topo_cache: RefCell::new(shared.topo.load_full()),
     };
 
     let (close_tx, close_rx) = oneshot::channel::<u64>();

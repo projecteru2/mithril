@@ -108,6 +108,11 @@ fn next_epoch() -> u64 {
     TOPO_EPOCH.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// Latest published topology epoch; sessions compare before reloading their cache.
+pub fn topo_epoch() -> u64 {
+    TOPO_EPOCH.load(Ordering::Relaxed)
+}
+
 fn current_thread_rt(name: &str) -> Option<tokio::runtime::Runtime> {
     match tokio::runtime::Builder::new_current_thread()
         .enable_all()

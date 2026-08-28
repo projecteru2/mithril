@@ -11,6 +11,8 @@ pub const PREFIX_LEN: usize = 8;
 
 const LUT_BITS: u32 = 9;
 const LUT_LEN: usize = 1 << LUT_BITS;
+// valid only while every table name is [a-z]; a test enforces that
+const LOWER_MASK: u64 = 0x2020_2020_2020_2020;
 
 const W: u8 = FLAG_WRITE;
 const R: u8 = FLAG_READONLY;
@@ -252,14 +254,15 @@ pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
     if name.len() > MAX_NAME {
         return None;
     }
-    let mut buf = [0u8; MAX_NAME];
-    let lower = &mut buf[..name.len()];
-    for (d, &s) in lower.iter_mut().zip(name) {
-        *d = s.to_ascii_lowercase();
-    }
-    let mut head = [0u8; PREFIX_LEN];
-    head.copy_from_slice(&buf[..PREFIX_LEN]);
-    let prefix = u64::from_be_bytes(head);
+    // OR 0x20 case-folds [A-Za-z0-9]: a letter's only preimages are its two cases
+    let prefix = match <[u8; PREFIX_LEN]>::try_from(&name[..name.len().min(PREFIX_LEN)]) {
+        Ok(head) => u64::from_be_bytes(head) | LOWER_MASK,
+        Err(_) => {
+            let mut head = [0u8; PREFIX_LEN];
+            head[..name.len()].copy_from_slice(name);
+            u64::from_be_bytes(head) | (LOWER_MASK << (8 * (PREFIX_LEN - name.len())))
+        }
+    };
     let mut h = lut_hash(prefix, name.len() as u8);
     loop {
         let idx = LUT[h];
@@ -267,15 +270,19 @@ pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
             return None;
         }
         let spec = &TABLE[idx as usize];
-        if spec.prefix == prefix
-            && spec.name.len() == name.len()
-            && (name.len() <= PREFIX_LEN
-                || spec.name.as_bytes()[PREFIX_LEN..] == buf[PREFIX_LEN..name.len()])
-        {
+        if spec.prefix == prefix && spec.name.len() == name.len() && tail_eq(spec, name) {
             return Some(spec);
         }
         h = (h + 1) & (LUT_LEN - 1);
     }
+}
+
+fn tail_eq(spec: &Spec, name: &[u8]) -> bool {
+    name.len() <= PREFIX_LEN
+        || spec.name.as_bytes()[PREFIX_LEN..]
+            .iter()
+            .zip(&name[PREFIX_LEN..])
+            .all(|(t, n)| *t == n.to_ascii_lowercase())
 }
 
 static LUT: [u16; LUT_LEN] = build_lut();
@@ -341,6 +348,17 @@ mod tests {
             assert_eq!(
                 lookup(spec.name.as_bytes()).map(|s| s.name),
                 Some(spec.name)
+            );
+        }
+    }
+
+    #[test]
+    fn names_are_lowercase_alpha() {
+        for spec in TABLE {
+            assert!(
+                spec.name.bytes().all(|b| b.is_ascii_lowercase()),
+                "{} breaks the OR-0x20 case fold",
+                spec.name
             );
         }
     }
