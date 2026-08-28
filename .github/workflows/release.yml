@@ -5,6 +5,10 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: existing tag to build and release
+        required: true
 
 permissions:
   contents: write
@@ -29,6 +33,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Extract VERSION
         run: echo "VERSION=$(git describe --tags --always)" >> $GITHUB_ENV
@@ -73,6 +78,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Download artifacts
         uses: actions/download-artifact@v7
