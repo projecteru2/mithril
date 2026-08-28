@@ -1678,7 +1678,7 @@ async fn write_loop(
                 }
             }
             if pass == 0 {
-                if ready.len() < 2 {
+                if ready.len() < 2 || close_now {
                     break;
                 }
                 tokio::task::yield_now().await;

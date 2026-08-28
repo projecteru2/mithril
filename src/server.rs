@@ -52,13 +52,14 @@ pub fn run(cfg: Config) -> Result<(), String> {
         .build()
         .map_err(|e| format!("runtime: {e}"))?;
     let mut topo = boot_rt.block_on(bootstrap(&cfg))?;
-    topo.epoch = next_epoch();
+    topo.epoch = 1;
     log_notice!(
         "topology bootstrapped: {} nodes, {} masters",
         topo.nodes.len(),
         topo.masters.len()
     );
     let topo = Arc::new(ArcSwap::from_pointee(topo));
+    TOPO_EPOCH.store(1, Ordering::Release);
 
     let (refresh_tx, refresh_rx) = mpsc::unbounded_channel();
     let refresher_cfg = cfg.clone();
@@ -104,13 +105,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
     std::process::exit(0);
 }
 
-fn next_epoch() -> u64 {
-    TOPO_EPOCH.fetch_add(1, Ordering::Relaxed) + 1
-}
-
 /// Latest published topology epoch; sessions compare before reloading their cache.
 pub fn topo_epoch() -> u64 {
-    TOPO_EPOCH.load(Ordering::Relaxed)
+    TOPO_EPOCH.load(Ordering::Acquire)
 }
 
 fn current_thread_rt(name: &str) -> Option<tokio::runtime::Runtime> {
@@ -372,8 +369,12 @@ fn refresher_thread(
             };
             match fetch_topology(&cfg, seeds.iter().map(String::as_str)).await {
                 Ok(mut new_topo) => {
-                    new_topo.epoch = next_epoch();
+                    // the pointer lands before the epoch: a reader that sees the
+                    // new epoch always reloads at least this topology
+                    let epoch = topo_epoch() + 1;
+                    new_topo.epoch = epoch;
                     topo.store(Arc::new(new_topo));
+                    TOPO_EPOCH.store(epoch, Ordering::Release);
                 }
                 Err(e) => log_warn!("topology refresh failed: {e}"),
             }

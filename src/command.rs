@@ -251,7 +251,7 @@ pub fn table() -> &'static [Spec] {
 
 /// Case-insensitive lookup; the u64-prefix key makes a probe one integer compare.
 pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
-    if name.len() > MAX_NAME {
+    if name.is_empty() || name.len() > MAX_NAME {
         return None;
     }
     // OR 0x20 case-folds [A-Za-z0-9]: a letter's only preimages are its two cases
