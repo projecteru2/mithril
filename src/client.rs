@@ -22,17 +22,11 @@ use crate::stats::{self, Stats};
 use crate::topology::Topology;
 use crate::{admin, crc16, route};
 
-pub const MAX_INFLIGHT: usize = 65536;
-pub const PUBSUB_FORWARD_QUEUE: usize = 64;
-pub const PUBSUB_PUSH_WINDOW: usize = 4096;
+const MAX_INFLIGHT: usize = 65536;
+const PUBSUB_FORWARD_QUEUE: usize = 64;
+const PUBSUB_PUSH_WINDOW: usize = 4096;
 const GATE_PROBE: std::time::Duration = std::time::Duration::from_millis(100);
-pub const READ_CHUNK: usize = crate::backend::READ_CHUNK;
-/// Sequence for out-of-band frames (pubsub pushes) that bypass ordering.
-pub const SEQ_OOB: u64 = u64::MAX;
-/// Sentinel telling the writer to close the client connection.
-pub const SEQ_CLOSE: u64 = u64::MAX - 1;
-/// High bit marking an ordered pubsub confirmation needing push conversion.
-pub const PUBSUB_ACK_BIT: u64 = 1 << 63;
+const READ_CHUNK: usize = crate::backend::READ_CHUNK;
 
 const ERR_NOAUTH: &[u8] = b"-NOAUTH Authentication required.\r\n";
 const ERR_CROSSSLOT: &[u8] = b"-CROSSSLOT Keys in request don't hash to the same slot\r\n";
@@ -57,7 +51,20 @@ struct InFlight {
 }
 
 type InflightMap = RefCell<HashMap<u64, InFlight>>;
-type ReplyTx = mpsc::UnboundedSender<(u64, Bytes)>;
+
+/// One frame travelling to the client writer.
+pub enum Reply {
+    /// Ordered reply at its sequence.
+    At(u64, Bytes),
+    /// Pubsub confirmation at its sequence, emitted as a push frame.
+    Ack(u64, Bytes),
+    /// Out-of-band push, never emitted before the ack it followed.
+    Push { after: Option<u64>, frame: Bytes },
+    /// Closes the client connection once the pending batch is flushed.
+    Close,
+}
+
+pub type ReplyTx = mpsc::UnboundedSender<Reply>;
 
 /// State shared between a session's reader, writer, and pubsub relay.
 #[derive(Default)]
@@ -74,7 +81,7 @@ struct WriterLink {
 }
 /// Pending protocol flips; `armed` keeps the hot path off the RefCell.
 #[derive(Default)]
-pub struct ProtoSwitchQueue {
+struct ProtoSwitchQueue {
     armed: Cell<usize>,
     queue: RefCell<std::collections::VecDeque<(u64, u8)>>,
 }
@@ -106,7 +113,7 @@ struct Session {
     id: u64,
     reply_tx: ReplyTx,
     link: Rc<WriterLink>,
-    proto: Rc<Cell<u8>>,
+    proto: Cell<u8>,
     authed: Cell<bool>,
     name: RefCell<String>,
     next_seq: Cell<u64>,
@@ -153,11 +160,9 @@ impl Session {
             return;
         }
         if self.pubsub.borrow().is_some() && !self.exit_pubsub_if_done().await {
-            let passthrough = self.proto.get() >= 3
-                && spec.kind != Kind::Subscribe
-                && !matches!(spec.name, "ping" | "quit" | "reset");
+            let passthrough = self.proto.get() >= 3 && !pubsub_allowed(spec);
             if !passthrough {
-                self.dispatch_pubsub(spec, frame, argc).await;
+                self.dispatch_pubsub(spec, frame, argc);
                 return;
             }
         }
@@ -173,10 +178,10 @@ impl Session {
             Kind::Blocking => self.forward_blocking(spec, frame, argc),
             Kind::Eval => self.forward_eval(frame, argc).await,
             Kind::Xread => self.forward_xread(spec, frame, argc).await,
-            Kind::Subscribe => self.enter_pubsub(frame, argc).await,
+            Kind::Subscribe => self.enter_pubsub(frame, argc),
             Kind::Scan => self.run_scan(&frame, argc),
-            Kind::Dbsize => self.run_broadcast_frame(frame, BroadcastMerge::Sum),
-            Kind::Flushall => self.run_broadcast_frame(frame, BroadcastMerge::Ok),
+            Kind::Dbsize => self.run_broadcast(frame, true),
+            Kind::Flushall => self.run_broadcast(frame, false),
         }
     }
 
@@ -267,7 +272,7 @@ impl Session {
             };
             self.cached_conn(&topo, idx, is_replica)
         };
-        self.track_inflight_entry(seq, &frame);
+        self.track_inflight(seq, &frame, 1);
         self.send_single(conn, seq, frame).await;
     }
 
@@ -281,11 +286,7 @@ impl Session {
         .await;
     }
 
-    fn track_inflight_entry(&self, seq: u64, frame: &Bytes) {
-        self.track_inflight_expect(seq, frame, 1);
-    }
-
-    fn track_inflight_expect(&self, seq: u64, frame: &Bytes, expect: u32) {
+    fn track_inflight(&self, seq: u64, frame: &Bytes, expect: u32) {
         self.link.inflight.borrow_mut().insert(
             seq,
             InFlight {
@@ -322,7 +323,7 @@ impl Session {
         let Some(conn) = self.owner_conn(seq, slot) else {
             return;
         };
-        self.track_inflight_entry(seq, &frame);
+        self.track_inflight(seq, &frame, 1);
         self.send_single(conn, seq, frame).await;
     }
 
@@ -371,7 +372,7 @@ impl Session {
         let reply_tx = self.reply_tx.clone();
         let task = tokio::task::spawn_local(async move {
             let reply = blocking_round(&shared, slot, frame, None, false).await;
-            let _ = reply_tx.send((seq, reply));
+            let _ = reply_tx.send(Reply::At(seq, reply));
         });
         let mut blocking = self.blocking.borrow_mut();
         blocking.retain(|(_, t)| !t.is_finished());
@@ -391,9 +392,15 @@ impl Session {
         }
         let split = {
             let args = collect_args(frame, argc);
-            let keys: Vec<&[u8]> = key_indices(spec, argc).map(|i| args[i]).collect();
-            let values: Option<Vec<&[u8]>> =
-                (spec.step == 2).then(|| key_indices(spec, argc).map(|i| args[i + 1]).collect());
+            let mut keys: Vec<&[u8]> = Vec::with_capacity(argc);
+            let mut values: Option<Vec<&[u8]>> =
+                (spec.step == 2).then(|| Vec::with_capacity(argc / 2));
+            for i in key_indices(spec, argc) {
+                keys.push(args[i]);
+                if let Some(vals) = values.as_mut() {
+                    vals.push(args[i + 1]);
+                }
+            }
             let total = keys.len();
             let topo = self.shared.topo.load_full();
             let parts = self.with_rng(|rng| {
@@ -440,10 +447,10 @@ impl Session {
             if !redirected.is_empty() {
                 let _ = shared.refresh.send(());
                 let mut retries = Vec::with_capacity(redirected.len());
-                for (part, ask, target) in &redirected {
+                for (part, ask, target) in &mut redirected {
                     let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
-                    let rx =
-                        scatter_one(&shared, target, id, false, head, part.frame.clone()).await;
+                    let frame = std::mem::take(&mut part.frame);
+                    let rx = scatter_one(&shared, target, id, false, head, frame).await;
                     retries.push(rx);
                 }
                 for ((part, _, _), rx) in redirected.into_iter().zip(retries) {
@@ -456,11 +463,7 @@ impl Session {
                 Merge::Ok => multikey::merge_ok(results.iter().map(|(_, r)| r)),
                 Merge::Sum => multikey::merge_sum(results.iter().map(|(_, r)| r)),
             };
-            let out = match merged {
-                Ok(bytes) => Bytes::from(bytes),
-                Err(err_frame) => err_frame,
-            };
-            let _ = reply_tx.send((seq, out));
+            let _ = reply_tx.send(Reply::At(seq, merged.unwrap_or_else(|e| e)));
         });
     }
 
@@ -484,12 +487,13 @@ impl Session {
             let topo = shared.topo.load_full();
             if master_idx >= topo.masters.len() {
                 let done = multikey::rebuild_scan_reply(0, b"*0\r\n");
-                let _ = reply_tx.send((seq, Bytes::from(done)));
+                let _ = reply_tx.send(Reply::At(seq, Bytes::from(done)));
                 return;
             }
             let addr = &topo.nodes[topo.masters[master_idx] as usize].addr;
-            let cursor_str = node_cursor.to_string();
-            let mut sub_args: Vec<&[u8]> = vec![b"SCAN", cursor_str.as_bytes()];
+            let mut cursor_buf = [0u8; resp::DEC_BUF];
+            let mut sub_args: Vec<&[u8]> =
+                vec![b"SCAN", resp::u64_digits(&mut cursor_buf, node_cursor)];
             let args = collect_args(&frame, argc);
             sub_args.extend_from_slice(&args[2..]);
             let mut cmd = Vec::new();
@@ -512,11 +516,11 @@ impl Session {
                 }
                 None => reply,
             };
-            let _ = reply_tx.send((seq, out));
+            let _ = reply_tx.send(Reply::At(seq, out));
         });
     }
 
-    fn run_broadcast_frame(&self, frame: Bytes, merge: BroadcastMerge) {
+    fn run_broadcast(&self, frame: Bytes, sum: bool) {
         let seq = self.alloc_seq();
         let shared = self.shared.clone();
         let reply_tx = self.reply_tx.clone();
@@ -534,15 +538,12 @@ impl Session {
             for rx in receivers {
                 replies.push(recv_or_lost(rx).await);
             }
-            let merged = match merge {
-                BroadcastMerge::Sum => multikey::merge_sum(replies.iter()),
-                BroadcastMerge::Ok => multikey::merge_ok(replies.iter()),
+            let merged = if sum {
+                multikey::merge_sum(replies.iter())
+            } else {
+                multikey::merge_ok(replies.iter())
             };
-            let out = match merged {
-                Ok(b) => Bytes::from(b),
-                Err(e) => e,
-            };
-            let _ = reply_tx.send((seq, out));
+            let _ = reply_tx.send(Reply::At(seq, merged.unwrap_or_else(|e| e)));
         });
     }
 
@@ -586,8 +587,14 @@ impl Session {
                 drop(guard);
                 self.emit_error_frame(Bytes::from_static(ERR_CROSSSLOT));
             }
+            Some(_) if state.bytes + frame.len() > self.shared.cfg.query_buffer_limit => {
+                state.aborted = true;
+                drop(guard);
+                self.emit_error("ERR transaction exceeds query buffer limit");
+            }
             Some(slot) => {
                 state.slot = Some(slot);
+                state.bytes += frame.len();
                 state.frames.push(frame);
                 drop(guard);
                 self.emit_local(Bytes::from_static(b"+QUEUED\r\n"));
@@ -596,6 +603,10 @@ impl Session {
     }
 
     async fn handle_local(&self, spec: &Spec, frame: Bytes, argc: usize) {
+        if spec.name == "ping" && argc == 1 {
+            self.emit_local(Bytes::from_static(b"+PONG\r\n"));
+            return;
+        }
         let reply: Option<Bytes> = {
             let args = collect_args(&frame, argc);
             match spec.name {
@@ -654,6 +665,7 @@ impl Session {
                         *self.multi.borrow_mut() = Some(MultiState {
                             slot: None,
                             frames: Vec::new(),
+                            bytes: 0,
                             aborted: false,
                         });
                         Some(Bytes::from_static(admin::OK))
@@ -696,7 +708,8 @@ impl Session {
         let Some(conn) = self.owner_conn(seq, state.slot) else {
             return;
         };
-        let mut blob = Vec::new();
+        let body: usize = state.frames.iter().map(Bytes::len).sum();
+        let mut blob = Vec::with_capacity(body + 32);
         blob.extend_from_slice(b"*1\r\n$5\r\nMULTI\r\n");
         for f in &state.frames {
             blob.extend_from_slice(f);
@@ -704,7 +717,7 @@ impl Session {
         blob.extend_from_slice(b"*1\r\n$4\r\nEXEC\r\n");
         let expect = state.frames.len() as u32 + 2;
         let blob = Bytes::from(blob);
-        self.track_inflight_expect(seq, &blob, expect);
+        self.track_inflight(seq, &blob, expect);
         conn.send(Outbound {
             head: None,
             frame: blob,
@@ -827,54 +840,43 @@ impl Session {
         }
     }
 
-    // the reader mirrors the subscription set, so mode exit is its own call;
-    // it only drains already-promised confirmations before dropping the relay.
+    // the reader mirrors the subscription set, so mode exit only drains
+    // already-promised confirmations before dropping the relay.
     async fn exit_pubsub_if_done(&self) -> bool {
-        let relay_dead = self
-            .pubsub
-            .borrow()
-            .as_ref()
-            .is_none_or(|ps| ps.task.is_finished());
-        if relay_dead {
-            self.stop_pubsub();
-            return true;
-        }
-        if !self.subs.borrow().is_empty() {
-            return false;
-        }
-        while !self.link.ack_seqs.borrow().is_empty() {
-            let finished = self
-                .pubsub
-                .borrow()
-                .as_ref()
-                .is_none_or(|ps| ps.task.is_finished());
-            if finished || self.reply_tx.is_closed() {
-                break;
+        if !self.relay_dead() {
+            if !self.subs.borrow().is_empty() {
+                return false;
             }
-            tokio::select! {
-                _ = self.link.acks_drained.notified() => {}
-                _ = self.reply_tx.closed() => break,
+            while !self.link.ack_seqs.borrow().is_empty() {
+                if self.relay_dead() || self.reply_tx.is_closed() {
+                    break;
+                }
+                tokio::select! {
+                    _ = self.link.acks_drained.notified() => {}
+                    _ = self.reply_tx.closed() => break,
+                }
             }
         }
         self.stop_pubsub();
         true
     }
 
+    fn relay_dead(&self) -> bool {
+        self.pubsub
+            .borrow()
+            .as_ref()
+            .is_none_or(|ps| ps.task.is_finished())
+    }
+
     fn stop_pubsub(&self) {
         if let Some(ps) = self.pubsub.borrow_mut().take() {
             ps.task.abort();
         }
-        self.subs.borrow_mut().channels.clear();
-        self.subs.borrow_mut().patterns.clear();
-        let drained: Vec<u64> = self.link.ack_seqs.borrow_mut().drain(..).collect();
-        for seq in drained {
-            let _ = self
-                .reply_tx
-                .send((seq | PUBSUB_ACK_BIT, Bytes::from_static(ERR_BACKEND_LOST)));
-        }
+        *self.subs.borrow_mut() = PubsubSim::default();
+        backfill_acks(&self.link, &self.reply_tx);
     }
 
-    async fn dispatch_pubsub(&self, spec: &Spec, frame: Bytes, argc: usize) {
+    fn dispatch_pubsub(&self, spec: &Spec, frame: Bytes, argc: usize) {
         match spec.name {
             "quit" => {
                 self.closing.set(true);
@@ -887,8 +889,8 @@ impl Session {
                 self.emit_local(Bytes::from_static(b"+RESET\r\n"));
                 return;
             }
-            "ping" => {}
-            _ if spec.kind == Kind::Subscribe => {}
+            "ping" => self.promise_acks(1),
+            _ if spec.kind == Kind::Subscribe => self.promise_subscription(&frame, argc),
             _ => {
                 self.emit_error(
                     "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / RESET \
@@ -896,18 +898,6 @@ impl Session {
                 );
                 return;
             }
-        }
-        let acks = {
-            let args = collect_args(&frame, argc);
-            if spec.kind == Kind::Subscribe {
-                self.subs.borrow_mut().apply(args[0], &args)
-            } else {
-                1
-            }
-        };
-        for _ in 0..acks {
-            let seq = self.alloc_seq();
-            self.link.ack_seqs.borrow_mut().push_back(seq);
         }
         let sent = self
             .pubsub
@@ -921,19 +911,27 @@ impl Session {
         }
     }
 
-    async fn enter_pubsub(&self, first_frame: Bytes, argc: usize) {
+    fn promise_subscription(&self, frame: &Bytes, argc: usize) {
+        let acks = {
+            let args = collect_args(frame, argc);
+            self.subs.borrow_mut().apply(args[0], &args)
+        };
+        self.promise_acks(acks);
+    }
+
+    fn promise_acks(&self, n: usize) {
+        let mut seqs = self.link.ack_seqs.borrow_mut();
+        for _ in 0..n {
+            seqs.push_back(self.alloc_seq());
+        }
+    }
+
+    fn enter_pubsub(&self, first_frame: Bytes, argc: usize) {
         let Some(addr) = self.any_master_addr() else {
             self.emit_error_frame(Bytes::from_static(ERR_NO_OWNER));
             return;
         };
-        let acks = {
-            let args = collect_args(&first_frame, argc);
-            self.subs.borrow_mut().apply(args[0], &args)
-        };
-        for _ in 0..acks {
-            let seq = self.alloc_seq();
-            self.link.ack_seqs.borrow_mut().push_back(seq);
-        }
+        self.promise_subscription(&first_frame, argc);
         let (tx, rx) = mpsc::channel::<Bytes>(PUBSUB_FORWARD_QUEUE);
         let _ = tx.try_send(first_frame);
         let shared = self.shared.clone();
@@ -979,7 +977,7 @@ impl Session {
     }
 
     fn emit_at(&self, seq: u64, frame: Bytes) {
-        let _ = self.reply_tx.send((seq, frame));
+        let _ = self.reply_tx.send(Reply::At(seq, frame));
     }
 }
 
@@ -992,6 +990,7 @@ struct ConnCache {
 struct MultiState {
     slot: Option<u16>,
     frames: Vec<Bytes>,
+    bytes: usize,
     aborted: bool,
 }
 
@@ -1048,11 +1047,6 @@ enum Merge {
     Ok,
 }
 
-enum BroadcastMerge {
-    Sum,
-    Ok,
-}
-
 /// Serves one client connection to completion.
 pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
     if stream.set_nodelay(true).is_err() {
@@ -1060,7 +1054,6 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
     }
     let (mut read_half, write_half) = stream.into_split();
     let (reply_tx, reply_rx) = mpsc::unbounded_channel();
-    let proto = Rc::new(Cell::new(2u8));
     let link: Rc<WriterLink> = Rc::new(WriterLink::default());
 
     let session = Session {
@@ -1068,7 +1061,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         id,
         reply_tx: reply_tx.clone(),
         link: link.clone(),
-        proto: proto.clone(),
+        proto: Cell::new(2),
         authed: Cell::new(shared.cfg.requirepass.is_empty()),
         name: RefCell::new(String::new()),
         next_seq: Cell::new(0),
@@ -1168,7 +1161,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
             continue;
         }
         task.abort();
-        let _ = reply_tx.send((seq, Bytes::from_static(ERR_BACKEND_LOST)));
+        let _ = reply_tx.send(Reply::At(seq, Bytes::from_static(ERR_BACKEND_LOST)));
     }
     let final_seq = session.next_seq.get();
     drop(session);
@@ -1249,7 +1242,7 @@ async fn blocking_round(
     let Some(addr) = addr else {
         return Bytes::from_static(ERR_NO_OWNER);
     };
-    let Some(lease) = shared.backends.take_exclusive(addr, false) else {
+    let Some(lease) = shared.backends.take_exclusive(addr) else {
         return error_frame("ERR too many blocking connections");
     };
     let (tx, rx) = oneshot::channel();
@@ -1264,7 +1257,6 @@ async fn blocking_round(
         .await;
     let reply = recv_or_lost(rx).await;
     lease.complete();
-    drop(lease);
     if !retried
         && reply.first() == Some(&b'-')
         && let Some(redir) = parse_redirect(&reply)
@@ -1316,30 +1308,32 @@ async fn pubsub_relay(
         }
     });
     let mut buf = BytesMut::with_capacity(READ_CHUNK);
+    let mut last_ack: Option<u64> = None;
     'io: loop {
         loop {
             match resp::scan_value(&buf) {
                 resp::Scan::Complete(len) => {
                     let frame = buf.split_to(len).freeze();
-                    let tagged = if !is_publication(&frame) {
-                        match link.ack_seqs.borrow_mut().pop_front() {
-                            Some(seq) => {
-                                link.acks_drained.notify_one();
-                                (seq | PUBSUB_ACK_BIT, frame)
-                            }
-                            None => (SEQ_OOB, frame),
+                    let popped = (!is_publication(&frame))
+                        .then(|| link.ack_seqs.borrow_mut().pop_front())
+                        .flatten();
+                    let reply = match popped {
+                        Some(seq) => {
+                            link.acks_drained.notify_one();
+                            last_ack = Some(seq);
+                            Reply::Ack(seq, frame)
                         }
-                    } else {
-                        while link.oob_budget.get() >= PUBSUB_PUSH_WINDOW {
-                            if reply_tx.is_closed() {
+                        None => {
+                            if !charge_push(&link, &reply_tx).await {
                                 return;
                             }
-                            link.oob_notify.notified().await;
+                            Reply::Push {
+                                after: last_ack,
+                                frame,
+                            }
                         }
-                        link.oob_budget.set(link.oob_budget.get() + 1);
-                        (SEQ_OOB, frame)
                     };
-                    if reply_tx.send(tagged).is_err() {
+                    if reply_tx.send(reply).is_err() {
                         break 'io;
                     }
                 }
@@ -1356,7 +1350,19 @@ async fn pubsub_relay(
     backfill_acks(&link, &reply_tx);
     // a dead pubsub backend would otherwise leave an idle subscriber silently
     // missing publications forever.
-    let _ = reply_tx.send((SEQ_CLOSE, Bytes::new()));
+    let _ = reply_tx.send(Reply::Close);
+}
+
+// every emitted push holds one window slot until the writer emits it.
+async fn charge_push(link: &Rc<WriterLink>, reply_tx: &ReplyTx) -> bool {
+    while link.oob_budget.get() >= PUBSUB_PUSH_WINDOW {
+        if reply_tx.is_closed() {
+            return false;
+        }
+        link.oob_notify.notified().await;
+    }
+    link.oob_budget.set(link.oob_budget.get() + 1);
+    true
 }
 
 // promised confirmation sequences must always resolve, or the writer can
@@ -1364,7 +1370,7 @@ async fn pubsub_relay(
 fn backfill_acks(link: &Rc<WriterLink>, reply_tx: &ReplyTx) {
     let drained: Vec<u64> = link.ack_seqs.borrow_mut().drain(..).collect();
     for seq in drained {
-        let _ = reply_tx.send((seq | PUBSUB_ACK_BIT, Bytes::from_static(ERR_BACKEND_LOST)));
+        let _ = reply_tx.send(Reply::Ack(seq, Bytes::from_static(ERR_BACKEND_LOST)));
     }
     link.acks_drained.notify_one();
 }
@@ -1372,30 +1378,37 @@ fn backfill_acks(link: &Rc<WriterLink>, reply_tx: &ReplyTx) {
 async fn write_loop(
     shared: Rc<Shared>,
     mut write_half: OwnedWriteHalf,
-    mut rx: mpsc::UnboundedReceiver<(u64, Bytes)>,
+    mut rx: mpsc::UnboundedReceiver<Reply>,
     reply_tx: ReplyTx,
     mut close_rx: oneshot::Receiver<u64>,
     link: Rc<WriterLink>,
     client_id: u64,
 ) {
-    struct ExitBump(Rc<Shared>, Rc<WriterLink>);
-    impl Drop for ExitBump {
+    struct ExitBump<'a> {
+        shared: &'a Shared,
+        link: &'a WriterLink,
+    }
+    impl Drop for ExitBump<'_> {
         fn drop(&mut self) {
-            stats::bump(&self.0.stats.workers[self.0.worker].writers_exited);
-            self.1.oob_notify.notify_waiters();
+            stats::bump(&self.shared.stats.workers[self.shared.worker].writers_exited);
+            self.link.oob_notify.notify_waiters();
         }
     }
-    let _exit = ExitBump(shared.clone(), link.clone());
+    let _exit = ExitBump {
+        shared: &shared,
+        link: &link,
+    };
     let mut next_emit: u64 = 0;
     // protocol flips apply at the HELLO reply's sequence, not before.
     let mut cur_proto: u8 = 2;
     // reader's final sequence; draining to it lets a departed client close.
     let mut close_at: Option<u64> = None;
+    let mut close_now = false;
     let mut parked: BTreeMap<u64, Bytes> = BTreeMap::new();
     let mut parked_acks: BTreeMap<u64, Bytes> = BTreeMap::new();
     let mut held_pushes: std::collections::VecDeque<(u64, Bytes)> =
         std::collections::VecDeque::new();
-    let mut batch: Vec<(u64, Bytes)> = Vec::with_capacity(crate::backend::BATCH);
+    let mut batch: Vec<Reply> = Vec::with_capacity(crate::backend::BATCH);
     let mut ready: Vec<Bytes> = Vec::with_capacity(crate::backend::BATCH);
     loop {
         if let Some(n) = close_at
@@ -1422,53 +1435,53 @@ async fn write_loop(
                 }
             }
         }
-        for (seq, frame) in batch.drain(..) {
-            if seq == SEQ_CLOSE {
-                return;
-            }
-            if seq == SEQ_OOB {
-                // a push observed after a confirmation must not overtake it;
-                // held pushes stay charged against the window until emitted.
-                match parked_acks.last_key_value() {
-                    None => {
-                        release_oob_budget(&link);
-                        push_pubsub_frame(&mut ready, frame, cur_proto);
+        for reply in batch.drain(..) {
+            let (seq, mut frame) = match reply {
+                Reply::Close => {
+                    close_now = true;
+                    continue;
+                }
+                // a push never overtakes the confirmation it followed; held
+                // pushes stay charged against the window until emitted.
+                Reply::Push { after, frame } => {
+                    match after {
+                        Some(a) if a >= next_emit => held_pushes.push_back((a, frame)),
+                        _ => emit_push(&link, &mut ready, frame, cur_proto),
                     }
-                    Some((&barrier, _)) => held_pushes.push_back((barrier, frame)),
+                    continue;
                 }
-                continue;
-            }
-            if seq & PUBSUB_ACK_BIT != 0 {
-                let seq = seq & !PUBSUB_ACK_BIT;
-                if seq >= next_emit {
-                    parked_acks.insert(seq, frame);
+                Reply::Ack(seq, frame) => {
+                    if seq >= next_emit {
+                        parked_acks.insert(seq, frame);
+                    }
+                    continue;
                 }
-                continue;
-            }
+                Reply::At(seq, frame) => (seq, frame),
+            };
             if seq < next_emit {
                 continue;
             }
-            if let Some((ask, target)) = parse_redirect(&frame)
-                && let Some((req, base_expect)) = take_retry_frame(&link.inflight, seq, ask)
+            if frame.first() == Some(&b'-')
+                && (frame.starts_with(b"-MOVED ") || frame.starts_with(b"-ASK "))
             {
-                stats::bump(&shared.stats.workers[shared.worker].redirects);
-                let _ = shared.refresh.send(());
-                let conn = shared.backends.shared(&target, client_id, false);
-                conn.send(Outbound {
-                    head: ask.then(|| Bytes::from_static(ASKING_FRAME)),
-                    frame: req,
-                    expect: base_expect + u32::from(ask),
-                    sink: Sink::Client(reply_tx.clone(), seq),
-                })
-                .await;
-                continue;
+                if let Some((ask, target)) = parse_redirect(&frame)
+                    && let Some((req, base_expect)) = take_retry_frame(&link.inflight, seq, ask)
+                {
+                    stats::bump(&shared.stats.workers[shared.worker].redirects);
+                    let _ = shared.refresh.send(());
+                    let conn = shared.backends.shared(&target, client_id, false);
+                    conn.send(Outbound {
+                        head: ask.then(|| Bytes::from_static(ASKING_FRAME)),
+                        frame: req,
+                        expect: base_expect + u32::from(ask),
+                        sink: Sink::Client(reply_tx.clone(), seq),
+                    })
+                    .await;
+                    continue;
+                }
+                // clients believe the proxy owns every slot: never leak redirects.
+                frame = Bytes::from_static(ERR_TRYAGAIN);
             }
-            // clients believe the proxy owns every slot: never leak redirects.
-            let frame = if frame.starts_with(b"-MOVED ") || frame.starts_with(b"-ASK ") {
-                Bytes::from_static(ERR_TRYAGAIN)
-            } else {
-                frame
-            };
             if seq == next_emit {
                 link.inflight.borrow_mut().remove(&seq);
                 link.proto_switches.apply(next_emit, &mut cur_proto);
@@ -1483,8 +1496,7 @@ async fn write_loop(
                 && barrier < next_emit
             {
                 if let Some((_, frame)) = held_pushes.pop_front() {
-                    release_oob_budget(&link);
-                    push_pubsub_frame(&mut ready, frame, cur_proto);
+                    emit_push(&link, &mut ready, frame, cur_proto);
                 }
                 continue;
             }
@@ -1519,6 +1531,9 @@ async fn write_loop(
             ready.clear();
         }
         link.emitted.set(next_emit);
+        if close_now {
+            return;
+        }
     }
 }
 
@@ -1536,30 +1551,39 @@ fn take_retry_frame(inflight: &InflightMap, seq: u64, ask: bool) -> Option<(Byte
 }
 
 /// True for published messages; everything else on a pubsub connection is a
-/// reply to a forwarded command and must consume its promised sequence.
+/// reply to a forwarded command consuming its promised sequence.
 fn is_publication(frame: &[u8]) -> bool {
-    let Some(items) = multikey::split_array(frame) else {
-        return false;
-    };
-    if items.len() < 3 {
+    if frame.first() != Some(&b'*') {
         return false;
     }
-    let Some(kind) = resp::bulk_payload(items[0]) else {
+    let Some((n, _)) = resp::scan_int_line(frame, 1) else {
+        return false;
+    };
+    if n < 3 {
+        return false;
+    }
+    let Some(kind) = resp::Args::new(frame, 1).next() else {
         return false;
     };
     kind.eq_ignore_ascii_case(b"message") || kind.eq_ignore_ascii_case(b"pmessage")
 }
 
-// RESP3 clients receive pubsub frames as push type; the leading '*' becomes
-// '>' via a zero-copy two-segment write.
-fn release_oob_budget(link: &Rc<WriterLink>) {
+fn pubsub_allowed(spec: &Spec) -> bool {
+    spec.kind == Kind::Subscribe || matches!(spec.name, "ping" | "quit" | "reset")
+}
+
+// the single window-release site: a push frees its slot when it becomes ready.
+fn emit_push(link: &WriterLink, ready: &mut Vec<Bytes>, frame: Bytes, proto: u8) {
     let left = link.oob_budget.get().saturating_sub(1);
     link.oob_budget.set(left);
     if left == PUBSUB_PUSH_WINDOW - 1 {
         link.oob_notify.notify_waiters();
     }
+    push_pubsub_frame(ready, frame, proto);
 }
 
+// RESP3 clients receive pubsub frames as push type; the leading '*' becomes
+// '>' via a zero-copy two-segment write.
 fn push_pubsub_frame(ready: &mut Vec<Bytes>, frame: Bytes, proto: u8) {
     if proto >= 3 && frame.first() == Some(&b'*') {
         ready.push(Bytes::from_static(b">"));

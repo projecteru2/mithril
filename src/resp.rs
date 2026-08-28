@@ -62,7 +62,8 @@ pub fn scan_request(buf: &[u8]) -> ReqScan {
     for _ in 0..argc {
         match scan_bulk(buf, pos) {
             Some(Ok((payload, end))) => {
-                if payload.0 == payload.1 && &buf[pos..pos + 3] == b"$-1" {
+                // scan_bulk encodes a null bulk as payload.1 == end.
+                if payload.1 == end {
                     return ReqScan::Invalid("null argument in request");
                 }
                 pos = end;
@@ -372,18 +373,23 @@ fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
     Some(end)
 }
 
-pub(crate) fn push_usize(out: &mut Vec<u8>, mut n: usize) {
+pub(crate) fn push_usize(out: &mut Vec<u8>, n: usize) {
     let mut tmp = [0u8; DEC_BUF];
-    let mut i = tmp.len();
+    out.extend_from_slice(u64_digits(&mut tmp, n as u64));
+}
+
+/// Formats `n` in decimal into the tail of `buf`, returning the digit slice.
+pub(crate) fn u64_digits(buf: &mut [u8; DEC_BUF], mut n: u64) -> &[u8] {
+    let mut i = buf.len();
     loop {
         i -= 1;
-        tmp[i] = b'0' + (n % 10) as u8;
+        buf[i] = b'0' + (n % 10) as u8;
         n /= 10;
         if n == 0 {
             break;
         }
     }
-    out.extend_from_slice(&tmp[i..]);
+    &buf[i..]
 }
 
 #[cfg(test)]

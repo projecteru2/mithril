@@ -13,6 +13,7 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::client::{Reply, ReplyTx};
 use crate::config::Config;
 use crate::log_debug;
 use crate::resp;
@@ -28,7 +29,7 @@ pub const ERR_BACKEND_LOST: &[u8] = b"-ERR mithril: backend connection lost\r\n"
 /// Where a backend reply is delivered.
 pub enum Sink {
     /// Ordered client reply stream at a fixed sequence.
-    Client(mpsc::UnboundedSender<(u64, Bytes)>, u64),
+    Client(ReplyTx, u64),
     /// Single reply for mergers and blocking commands.
     One(oneshot::Sender<Bytes>),
 }
@@ -46,7 +47,6 @@ pub struct Outbound {
 struct Pending {
     expect: u32,
     sink: Sink,
-    first_err: Option<Bytes>,
 }
 
 /// A live backend connection; cheap to clone via Rc.
@@ -104,10 +104,10 @@ impl Backends {
         let idx = (sticky % want as u64) as usize;
         let mut conns = pool.shared.borrow_mut();
         while conns.len() <= idx {
-            conns.push(self.dial(addr, readonly));
+            conns.push(self.dial(addr, readonly, false));
         }
         if conns[idx].is_dead() {
-            conns[idx] = self.dial(addr, readonly);
+            conns[idx] = self.dial(addr, readonly, false);
         }
         conns[idx].clone()
     }
@@ -115,28 +115,24 @@ impl Backends {
     /// Leases an exclusive connection for blocking commands; the lease
     /// returns it (or releases its quota slot) on drop, so a cancelled task
     /// cannot strand quota.
-    pub fn take_exclusive(self: &Rc<Self>, addr: &str, readonly: bool) -> Option<ExclusiveLease> {
-        let pool = self.pool(addr, readonly);
-        loop {
-            let conn = pool.idle_exclusive.borrow_mut().pop();
-            match conn {
-                Some(c) if !c.is_dead() => {
-                    return Some(ExclusiveLease {
-                        conn: c,
-                        pool,
-                        complete: Cell::new(false),
-                    });
-                }
+    pub fn take_exclusive(self: &Rc<Self>, addr: &str) -> Option<ExclusiveLease> {
+        let pool = self.pool(addr, false);
+        let conn = loop {
+            let idle = pool.idle_exclusive.borrow_mut().pop();
+            match idle {
+                Some(c) if !c.is_dead() => break c,
                 Some(_) => pool.exclusive_count.set(pool.exclusive_count.get() - 1),
-                None => break,
+                None => {
+                    if pool.exclusive_count.get() >= MAX_EXCLUSIVE_PER_NODE {
+                        return None;
+                    }
+                    pool.exclusive_count.set(pool.exclusive_count.get() + 1);
+                    break self.dial(addr, false, true);
+                }
             }
-        }
-        if pool.exclusive_count.get() >= MAX_EXCLUSIVE_PER_NODE {
-            return None;
-        }
-        pool.exclusive_count.set(pool.exclusive_count.get() + 1);
+        };
         Some(ExclusiveLease {
-            conn: self.dial(addr, readonly),
+            conn,
             pool,
             complete: Cell::new(false),
         })
@@ -159,7 +155,7 @@ impl Backends {
         pool
     }
 
-    fn dial(&self, addr: &str, readonly: bool) -> Rc<Conn> {
+    fn dial(&self, addr: &str, readonly: bool, abortable: bool) -> Rc<Conn> {
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
         let conn = Rc::new(Conn {
             tx,
@@ -170,7 +166,7 @@ impl Backends {
         let addr = addr.to_string();
         let cfg = self.cfg.clone();
         tokio::task::spawn_local(async move {
-            run_conn(&addr, rx, readonly, &cfg, &task_conn).await;
+            run_conn(&addr, rx, readonly, abortable, &cfg, &task_conn).await;
             task_conn.dead.set(true);
         });
         conn
@@ -196,7 +192,7 @@ impl ExclusiveLease {
         &self.conn
     }
 
-    pub fn complete(&self) {
+    pub fn complete(self) {
         self.complete.set(true);
     }
 }
@@ -221,46 +217,42 @@ async fn run_conn(
     addr: &str,
     mut rx: mpsc::Receiver<Outbound>,
     readonly: bool,
+    abortable: bool,
     cfg: &Config,
     conn: &Conn,
 ) {
-    let stream = tokio::select! {
-        _ = conn.abort.notified() => {
-            drain_channel(&mut rx);
-            return;
-        }
-        r = connect(addr, cfg.tcp_keepalive_secs) => match r {
-            Ok(s) => s,
-            Err(e) => {
-                log_debug!("dial {addr}: {e}");
-                drain_channel(&mut rx);
-                return;
-            }
-        },
-    };
-    let (mut read_half, mut write_half) = stream.into_split();
-    let hs = tokio::select! {
-        _ = conn.abort.notified() => {
-            drain_channel(&mut rx);
-            return;
-        }
-        r = handshake(
-            &mut read_half,
-            &mut write_half,
+    let setup = async {
+        let stream = connect(addr, cfg.tcp_keepalive_secs)
+            .await
+            .map_err(|e| e.to_string())?;
+        let (mut r, mut w) = stream.into_split();
+        handshake(
+            &mut r,
+            &mut w,
             readonly,
             &cfg.backend_user,
             &cfg.backend_pass,
-        ) => r,
+        )
+        .await?;
+        Ok::<_, String>((r, w))
     };
-    if let Err(e) = hs {
-        log_debug!("handshake {addr}: {e}");
-        drain_channel(&mut rx);
-        return;
-    }
+    let halves = tokio::select! {
+        _ = conn.abort.notified(), if abortable => Err("aborted".to_string()),
+        r = setup => r,
+    };
+    let (mut read_half, mut write_half) = match halves {
+        Ok(h) => h,
+        Err(e) => {
+            log_debug!("connect {addr}: {e}");
+            drain_channel(&mut rx);
+            return;
+        }
+    };
 
     // Single task owns both directions: no cross-task pending state, and a
     // dead connection can still drain queued requests with error replies.
     let mut pending: VecDeque<Pending> = VecDeque::new();
+    let mut front_err: Option<Bytes> = None;
     let mut batch: Vec<Outbound> = Vec::with_capacity(BATCH);
     let mut frames: Vec<Bytes> = Vec::with_capacity(BATCH * 2);
     let mut buf = BytesMut::with_capacity(READ_CHUNK);
@@ -271,22 +263,24 @@ async fn run_conn(
                 resp::Scan::Complete(len) => {
                     let frame = buf.split_to(len).freeze();
                     let is_err = frame.first() == Some(&b'-');
-                    let swallow = pending.front().is_some_and(|f| f.expect > 1);
-                    if swallow {
-                        if let Some(front) = pending.front_mut() {
+                    match pending.front_mut() {
+                        Some(front) if front.expect > 1 => {
                             front.expect -= 1;
-                            if front.first_err.is_none() && is_err {
-                                front.first_err = Some(frame);
+                            if front_err.is_none() && is_err {
+                                front_err = Some(frame);
                             }
                         }
-                    } else if let Some(d) = pending.pop_front() {
-                        // an aborted MULTI reports the first queued error, not
-                        // the terminal EXECABORT.
-                        let reply = match d.first_err {
-                            Some(err) if is_err => err,
-                            _ => frame,
-                        };
-                        deliver(d.sink, reply);
+                        _ => {
+                            if let Some(d) = pending.pop_front() {
+                                // an aborted MULTI reports the first queued
+                                // error, not the terminal EXECABORT.
+                                let reply = match front_err.take() {
+                                    Some(err) if is_err => err,
+                                    _ => frame,
+                                };
+                                deliver(d.sink, reply);
+                            }
+                        }
                     }
                 }
                 resp::Scan::Invalid(e) => {
@@ -300,7 +294,7 @@ async fn run_conn(
             break 'io;
         }
         tokio::select! {
-            _ = conn.abort.notified() => {
+            _ = conn.abort.notified(), if abortable => {
                 break 'io;
             }
             n = rx.recv_many(&mut batch, BATCH), if tx_open => {
@@ -316,7 +310,6 @@ async fn run_conn(
                     pending.push_back(Pending {
                         expect: out.expect,
                         sink: out.sink,
-                        first_err: None,
                     });
                     if let Some(h) = out.head {
                         frames.push(h);
@@ -325,7 +318,7 @@ async fn run_conn(
                 }
                 let mut slices: Vec<IoSlice<'_>> = frames.iter().map(|f| IoSlice::new(f)).collect();
                 let wrote = tokio::select! {
-                    _ = conn.abort.notified() => false,
+                    _ = conn.abort.notified(), if abortable => false,
                     r = write_slices(&mut write_half, &mut slices) => r.is_ok(),
                 };
                 if !wrote {
@@ -350,7 +343,7 @@ async fn run_conn(
 fn deliver(sink: Sink, frame: Bytes) {
     match sink {
         Sink::Client(tx, seq) => {
-            let _ = tx.send((seq, frame));
+            let _ = tx.send(Reply::At(seq, frame));
         }
         Sink::One(tx) => {
             let _ = tx.send(frame);

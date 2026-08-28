@@ -31,16 +31,16 @@ where
     let mut by_slot: HashMap<u16, usize> = HashMap::new();
     for (i, key) in keys.iter().enumerate() {
         let slot = crate::crc16::slot(key);
-        let entry = match by_slot.get(&slot) {
-            Some(&g) => &mut parts[g],
+        let g = match by_slot.get(&slot) {
+            Some(&g) => g,
             None => {
                 let node = route(slot).ok_or_else(|| "slot has no owner".to_string())?;
                 by_slot.insert(slot, parts.len());
                 parts.push((node, vec![name], Vec::new()));
-                let last = parts.len() - 1;
-                &mut parts[last]
+                parts.len() - 1
             }
         };
+        let entry = &mut parts[g];
         entry.1.push(key);
         if let Some(vals) = values {
             entry.1.push(vals[i]);
@@ -87,7 +87,7 @@ pub fn split_array(frame: &[u8]) -> Option<Vec<&[u8]>> {
 }
 
 /// Merges MGET part replies back into client key order.
-pub fn merge_mget(total: usize, parts: &[(Vec<usize>, Bytes)]) -> Result<Vec<u8>, Bytes> {
+pub fn merge_mget(total: usize, parts: &[(Vec<usize>, Bytes)]) -> Result<Bytes, Bytes> {
     let mut slots: Vec<&[u8]> = vec![resp::NIL_BULK; total];
     for (positions, reply) in parts {
         if reply.first() == Some(&b'-') {
@@ -106,11 +106,11 @@ pub fn merge_mget(total: usize, parts: &[(Vec<usize>, Bytes)]) -> Result<Vec<u8>
     for s in slots {
         out.extend_from_slice(s);
     }
-    Ok(out)
+    Ok(Bytes::from(out))
 }
 
 /// Sums integer part replies (DEL/UNLINK/EXISTS/TOUCH/PFCOUNT).
-pub fn merge_sum<'r>(parts: impl Iterator<Item = &'r Bytes>) -> Result<Vec<u8>, Bytes> {
+pub fn merge_sum<'r>(parts: impl Iterator<Item = &'r Bytes>) -> Result<Bytes, Bytes> {
     let mut total: i64 = 0;
     for reply in parts {
         match parse_int(reply) {
@@ -120,17 +120,17 @@ pub fn merge_sum<'r>(parts: impl Iterator<Item = &'r Bytes>) -> Result<Vec<u8>, 
     }
     let mut out = Vec::new();
     crate::admin::integer(&mut out, total);
-    Ok(out)
+    Ok(Bytes::from(out))
 }
 
 /// Requires every part to reply +OK (MSET).
-pub fn merge_ok<'r>(parts: impl Iterator<Item = &'r Bytes>) -> Result<Vec<u8>, Bytes> {
+pub fn merge_ok<'r>(parts: impl Iterator<Item = &'r Bytes>) -> Result<Bytes, Bytes> {
     for reply in parts {
         if reply.as_ref() != crate::admin::OK {
             return Err(reply.clone());
         }
     }
-    Ok(crate::admin::OK.to_vec())
+    Ok(Bytes::from_static(crate::admin::OK))
 }
 
 /// Parses an integer reply frame.
@@ -168,9 +168,11 @@ pub fn parse_scan_reply(frame: &[u8]) -> Option<(u64, &[u8])> {
 
 /// Rebuilds a SCAN reply with a synthetic cursor.
 pub fn rebuild_scan_reply(cursor: u64, keys_frame: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut digits = [0u8; resp::DEC_BUF];
+    let cursor = resp::u64_digits(&mut digits, cursor);
+    let mut out = Vec::with_capacity(16 + cursor.len() + keys_frame.len());
     out.extend_from_slice(b"*2\r\n");
-    crate::admin::bulk(&mut out, cursor.to_string().as_bytes());
+    crate::admin::bulk(&mut out, cursor);
     out.extend_from_slice(keys_frame);
     out
 }
@@ -198,7 +200,10 @@ mod tests {
         let p1 = Bytes::from_static(b"*2\r\n$2\r\nv0\r\n$2\r\nv2\r\n");
         let p2 = Bytes::from_static(b"*1\r\n$2\r\nv1\r\n");
         let merged = merge_mget(3, &[(vec![0, 2], p1), (vec![1], p2)]).unwrap();
-        assert_eq!(merged, b"*3\r\n$2\r\nv0\r\n$2\r\nv1\r\n$2\r\nv2\r\n");
+        assert_eq!(
+            merged.as_ref(),
+            b"*3\r\n$2\r\nv0\r\n$2\r\nv1\r\n$2\r\nv2\r\n"
+        );
     }
 
     #[test]
@@ -207,9 +212,15 @@ mod tests {
             (vec![0], Bytes::from_static(b":2\r\n")),
             (vec![1], Bytes::from_static(b":1\r\n")),
         ];
-        assert_eq!(merge_sum(parts.iter().map(|(_, r)| r)).unwrap(), b":3\r\n");
+        assert_eq!(
+            merge_sum(parts.iter().map(|(_, r)| r)).unwrap().as_ref(),
+            b":3\r\n"
+        );
         let oks = [(vec![0], Bytes::from_static(b"+OK\r\n"))];
-        assert_eq!(merge_ok(oks.iter().map(|(_, r)| r)).unwrap(), b"+OK\r\n");
+        assert_eq!(
+            merge_ok(oks.iter().map(|(_, r)| r)).unwrap().as_ref(),
+            b"+OK\r\n"
+        );
         let bad = [(vec![0], Bytes::from_static(b"-ERR nope\r\n"))];
         assert!(merge_sum(bad.iter().map(|(_, r)| r)).is_err());
     }
