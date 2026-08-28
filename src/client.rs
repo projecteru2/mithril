@@ -76,6 +76,8 @@ struct WriterLink {
     // set when no reply can ever be written again; reader must stop dispatching
     closed: Cell<bool>,
     closed_notify: tokio::sync::Notify,
+    // a live relay can close the session while the reader is parked reading
+    has_relay: Cell<bool>,
     proto_switches: ProtoSwitchQueue,
     oob_budget: Cell<usize>,
     oob_notify: tokio::sync::Notify,
@@ -874,6 +876,7 @@ impl Session {
     }
 
     fn stop_pubsub(&self) {
+        self.link.has_relay.set(false);
         if let Some(ps) = self.pubsub.borrow_mut().take() {
             ps.task.abort();
         }
@@ -970,6 +973,7 @@ impl Session {
             return;
         };
         self.promise_subscription(&first_frame, argc);
+        self.link.has_relay.set(true);
         let (tx, rx) = mpsc::channel::<Bytes>(PUBSUB_FORWARD_QUEUE);
         let _ = tx.try_send(first_frame);
         let shared = self.shared.clone();
@@ -1200,9 +1204,15 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
             session.emit_error("ERR query buffer exceeds limit");
             break;
         }
-        let read = tokio::select! {
-            _ = link.closed_notify.notified() => break,
-            r = read_half.read_buf(&mut buf) => r,
+        // only a relay can close the session while the read is parked; a dead
+        // writer without one implies a dead socket the read observes itself
+        let read = if link.has_relay.get() {
+            tokio::select! {
+                _ = link.closed_notify.notified() => break,
+                r = read_half.read_buf(&mut buf) => r,
+            }
+        } else {
+            read_half.read_buf(&mut buf).await
         };
         match read {
             Ok(0) | Err(_) => break,
