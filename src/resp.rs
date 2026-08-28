@@ -203,67 +203,72 @@ pub fn split_inline(line: &[u8]) -> Option<Vec<Vec<u8>>> {
             break;
         }
         let mut arg = Vec::new();
-        match line[i] {
-            b'"' => {
-                i += 1;
-                loop {
-                    let &b = line.get(i)?;
-                    match b {
-                        b'"' => {
+        loop {
+            match line.get(i) {
+                None | Some(b' ') | Some(b'\t') => break,
+                Some(b'"') => {
+                    i += 1;
+                    loop {
+                        let &b = line.get(i)?;
+                        match b {
+                            b'"' => {
+                                i += 1;
+                                if !matches!(line.get(i), None | Some(b' ') | Some(b'\t')) {
+                                    return None;
+                                }
+                                break;
+                            }
+                            b'\\'
+                                if line.get(i + 1) == Some(&b'x')
+                                    && line.get(i + 2).copied().and_then(hex_val).is_some()
+                                    && line.get(i + 3).copied().and_then(hex_val).is_some() =>
+                            {
+                                let hi = hex_val(line[i + 2])?;
+                                let lo = hex_val(line[i + 3])?;
+                                arg.push(hi << 4 | lo);
+                                i += 4;
+                            }
+                            b'\\' => {
+                                i += 1;
+                                let &e = line.get(i)?;
+                                arg.push(match e {
+                                    b'n' => b'\n',
+                                    b'r' => b'\r',
+                                    b't' => b'\t',
+                                    b'b' => 0x08,
+                                    b'a' => 0x07,
+                                    other => other,
+                                });
+                                i += 1;
+                            }
+                            _ => {
+                                arg.push(b);
+                                i += 1;
+                            }
+                        }
+                    }
+                }
+                Some(b'\'') => {
+                    i += 1;
+                    loop {
+                        let &b = line.get(i)?;
+                        if b == b'\\' && line.get(i + 1) == Some(&b'\'') {
+                            arg.push(b'\'');
+                            i += 2;
+                        } else if b == b'\'' {
                             i += 1;
+                            if !matches!(line.get(i), None | Some(b' ') | Some(b'\t')) {
+                                return None;
+                            }
                             break;
-                        }
-                        b'\\' if line.get(i + 1) == Some(&b'x') => {
-                            let hi = hex_val(*line.get(i + 2)?)?;
-                            let lo = hex_val(*line.get(i + 3)?)?;
-                            arg.push(hi << 4 | lo);
-                            i += 4;
-                        }
-                        b'\\' => {
-                            i += 1;
-                            let &e = line.get(i)?;
-                            arg.push(match e {
-                                b'n' => b'\n',
-                                b'r' => b'\r',
-                                b't' => b'\t',
-                                b'b' => 0x08,
-                                b'a' => 0x07,
-                                other => other,
-                            });
-                            i += 1;
-                        }
-                        _ => {
+                        } else {
                             arg.push(b);
                             i += 1;
                         }
                     }
                 }
-                if !matches!(line.get(i), None | Some(b' ') | Some(b'\t')) {
-                    return None;
-                }
-            }
-            b'\'' => {
-                i += 1;
-                loop {
-                    let &b = line.get(i)?;
-                    if b == b'\\' && line.get(i + 1) == Some(&b'\'') {
-                        arg.push(b'\'');
-                        i += 2;
-                    } else if b == b'\'' {
-                        i += 1;
-                        break;
-                    } else {
-                        arg.push(b);
-                        i += 1;
-                    }
-                }
-                if !matches!(line.get(i), None | Some(b' ') | Some(b'\t')) {
-                    return None;
-                }
-            }
-            _ => {
-                while i < line.len() && line[i] != b' ' && line[i] != b'\t' {
-                    arg.push(line[i]);
+                Some(&b) => {
+                    arg.push(b);
                     i += 1;
                 }
             }
@@ -472,6 +477,14 @@ mod tests {
             b"it's".to_vec()
         );
         assert!(split_inline(b"GET \"a\"tail\r\n").is_none());
+        assert_eq!(
+            split_inline(b"ECHO foo\" bar\"\r\n").unwrap()[1],
+            b"foo bar".to_vec()
+        );
+        assert_eq!(
+            split_inline(b"ECHO \"\\xZZ\"\r\n").unwrap()[1],
+            b"xZZ".to_vec()
+        );
         assert_eq!(scan_request(b"PIN"), ReqScan::Incomplete);
     }
 

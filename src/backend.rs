@@ -77,7 +77,7 @@ impl Conn {
     /// the backend cancels any command still blocked on it.
     pub fn abort(&self) {
         self.dead.set(true);
-        self.abort.notify_waiters();
+        self.abort.notify_one();
     }
 }
 

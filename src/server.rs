@@ -252,13 +252,7 @@ fn refresher_thread(
                 let current = topo.load();
                 current.nodes.iter().map(|n| n.addr.clone()).collect()
             };
-            let fetched = tokio::time::timeout(
-                FETCH_TIMEOUT,
-                fetch_topology(&cfg, seeds.iter().map(String::as_str)),
-            )
-            .await
-            .unwrap_or_else(|_| Err("topology fetch timed out".to_string()));
-            match fetched {
+            match fetch_topology(&cfg, seeds.iter().map(String::as_str)).await {
                 Ok(mut new_topo) => {
                     new_topo.epoch = next_epoch();
                     topo.store(Arc::new(new_topo));
@@ -271,13 +265,7 @@ fn refresher_thread(
 
 async fn bootstrap(cfg: &Config) -> Result<Topology, String> {
     for round in 0..BOOTSTRAP_ROUNDS {
-        let fetched = tokio::time::timeout(
-            FETCH_TIMEOUT,
-            fetch_topology(cfg, cfg.bootstrap.iter().map(String::as_str)),
-        )
-        .await
-        .unwrap_or_else(|_| Err("topology fetch timed out".to_string()));
-        match fetched {
+        match fetch_topology(cfg, cfg.bootstrap.iter().map(String::as_str)).await {
             Ok(t) => return Ok(t),
             Err(e) => {
                 log_warn!("bootstrap round {round}: {e}");
@@ -294,7 +282,10 @@ async fn fetch_topology<'a, I: Iterator<Item = &'a str>>(
 ) -> Result<Topology, String> {
     let mut last_err = "no seed addresses".to_string();
     for seed in seeds {
-        match fetch_from(cfg, seed).await {
+        let fetched = tokio::time::timeout(FETCH_TIMEOUT, fetch_from(cfg, seed))
+            .await
+            .unwrap_or_else(|_| Err("timed out".to_string()));
+        match fetched {
             Ok(t) => return Ok(t),
             Err(e) => last_err = format!("{seed}: {e}"),
         }
