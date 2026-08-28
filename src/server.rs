@@ -178,6 +178,7 @@ fn acceptor_thread(
         let mut cmd_snap = vec![0u64; conn_txs.len()];
         let mut cmd_rate = vec![0u64; conn_txs.len()];
         let mut placed = vec![0u64; conn_txs.len()];
+        let mut order: Vec<usize> = Vec::with_capacity(conn_txs.len());
         let mut snap_at = tokio::time::Instant::now();
         loop {
             let accepted = tokio::select! {
@@ -209,45 +210,43 @@ fn acceptor_thread(
             if admitted.stream.is_none() {
                 continue;
             }
-            let start = match cfg.placement {
-                Placement::RoundRobin => next,
-                // lexicographic (in-window placement imbalance, activity
-                // bucket, rotation): a connect burst is forced to spread
-                // evenly, sparse arrivals steer to the least-active worker,
-                // and a near-idle proxy never tiers on stray-command noise
-                Placement::LeastLoaded => {
-                    let now = tokio::time::Instant::now();
-                    if now.duration_since(snap_at) >= SNAP_WINDOW {
-                        snap_at = now;
-                        for i in 0..conn_txs.len() {
-                            let c = stats.workers[i].commands.load(Ordering::Relaxed);
-                            cmd_rate[i] = c - cmd_snap[i];
-                            cmd_snap[i] = c;
-                            placed[i] = 0;
-                        }
+            // placement-key order per worker: round-robin keeps rotation;
+            // least-loaded keys lexicographically on (in-window placement
+            // imbalance, activity bucket, rotation), so a connect burst is
+            // forced to spread evenly, sparse arrivals steer to the
+            // least-active worker, a near-idle proxy never tiers on
+            // stray-command noise, and a full queue falls back to the
+            // next-best key instead of a cyclic neighbor
+            if cfg.placement == Placement::LeastLoaded {
+                let now = tokio::time::Instant::now();
+                if now.duration_since(snap_at) >= SNAP_WINDOW {
+                    snap_at = now;
+                    for i in 0..conn_txs.len() {
+                        let c = stats.workers[i].commands.load(Ordering::Relaxed);
+                        cmd_rate[i] = c - cmd_snap[i];
+                        cmd_snap[i] = c;
+                        placed[i] = 0;
                     }
+                }
+            }
+            // a full queue must not stall accepts for the rest
+            'place: loop {
+                order.clear();
+                order.extend(0..conn_txs.len());
+                if cfg.placement == Placement::LeastLoaded {
                     let total: u64 = cmd_rate.iter().sum();
                     let share = (total / conn_txs.len() as u64).max(1);
                     let quiet = total < QUIET_FLOOR;
                     let floor = placed.iter().min().copied().unwrap_or(0);
-                    let mut best = next;
-                    let mut best_key = (u64::MAX, u64::MAX);
-                    for k in 0..conn_txs.len() {
-                        let i = (next + k) % conn_txs.len();
+                    order.sort_by_key(|&i| {
                         let bucket = if quiet { 0 } else { cmd_rate[i] / share };
-                        let key = (placed[i] - floor, bucket);
-                        if key < best_key {
-                            best_key = key;
-                            best = i;
-                        }
-                    }
-                    best
+                        let rot = (i + conn_txs.len() - next) % conn_txs.len();
+                        (placed[i] - floor, bucket, rot)
+                    });
+                } else {
+                    order.rotate_left(next);
                 }
-            };
-            // a full queue must not stall accepts for the rest
-            'place: loop {
-                for k in 0..conn_txs.len() {
-                    let i = (start + k) % conn_txs.len();
+                for &i in &order {
                     match conn_txs[i].try_send(admitted) {
                         Ok(()) => {
                             placed[i] += 1;

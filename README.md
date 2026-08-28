@@ -14,8 +14,8 @@ thread-per-core runtime and zero-copy frame forwarding.
 
 - **Thread-per-core** — each worker runs a single-threaded tokio runtime with
   its own backend pools; nothing crosses workers on the request path, and a
-  central acceptor places connections round-robin so no worker becomes the
-  latency floor
+  central acceptor places each connection on the least-loaded worker
+  (configurable) so no worker becomes the latency floor
 - **Zero-copy pipeline** — requests and replies travel as `bytes::Bytes`
   slices of the socket buffers; the RESP layer finds frame boundaries without
   materializing values, and replies re-order per client by sequence number so

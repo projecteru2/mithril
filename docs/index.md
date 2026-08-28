@@ -12,7 +12,7 @@ redis clients (RESP2 / RESP3, cluster-aware or not)
         ▼
   ┌──────────────────────────────────────────────┐
   │ mithril                                      │
-  │   acceptor ──► worker threads (one per core) │  round-robin placement
+  │   acceptor ──► worker threads (one per core) │  least-loaded placement
   │                 │                            │
   │                 ├─ session: parse ► dispatch │  zero-copy frames
   │                 │    │ ordered reply stream  │  sequence numbers
