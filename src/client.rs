@@ -230,18 +230,6 @@ impl Session {
         conn
     }
 
-    fn pick_addr(&self, slot: u16, readonly: bool) -> Option<(String, bool)> {
-        let topo = self.shared.topo.load();
-        self.with_rng(|r| route::pick(&topo, slot, readonly, self.shared.cfg.slave_mode, r))
-            .map(|(i, is_replica)| (topo.nodes[i as usize].addr.clone(), is_replica))
-    }
-
-    fn master_addr(&self, slot: u16) -> Option<String> {
-        let topo = self.shared.topo.load();
-        topo.owner(slot)
-            .map(|i| topo.nodes[i as usize].addr.clone())
-    }
-
     async fn forward_any_master(&self, frame: Bytes) {
         let seq = self.alloc_seq();
         let conn = {
@@ -318,12 +306,15 @@ impl Session {
             return;
         }
         let seq = self.alloc_seq();
-        let Some(addr) = slot.and_then(|s| self.master_addr(s)) else {
-            self.emit_at(seq, error_frame(ERR_NO_OWNER));
-            return;
+        let conn = {
+            let topo = self.shared.topo.load();
+            let Some(idx) = slot.and_then(|sl| topo.owner(sl)) else {
+                self.emit_at(seq, error_frame(ERR_NO_OWNER));
+                return;
+            };
+            self.cached_conn(&topo, idx, false)
         };
         self.track_inflight_entry(seq, &frame);
-        let conn = self.shared.backends.shared(&addr, self.id, false);
         self.send_single(conn, seq, frame).await;
     }
 
@@ -356,12 +347,24 @@ impl Session {
             return;
         }
         let seq = self.alloc_seq();
-        let Some((addr, is_replica)) = self.pick_addr(slot, spec.is_readonly()) else {
-            self.emit_at(seq, error_frame(ERR_NO_OWNER));
-            return;
+        let conn = {
+            let topo = self.shared.topo.load();
+            let picked = self.with_rng(|r| {
+                route::pick(
+                    &topo,
+                    slot,
+                    spec.is_readonly(),
+                    self.shared.cfg.slave_mode,
+                    r,
+                )
+            });
+            let Some((idx, is_replica)) = picked else {
+                self.emit_at(seq, error_frame(ERR_NO_OWNER));
+                return;
+            };
+            self.cached_conn(&topo, idx, is_replica)
         };
         self.track_inflight_entry(seq, &frame);
-        let conn = self.shared.backends.shared(&addr, self.id, is_replica);
         self.send_single(conn, seq, frame).await;
     }
 
@@ -403,16 +406,15 @@ impl Session {
             let values: Option<Vec<&[u8]>> =
                 (spec.step == 2).then(|| key_indices(spec, argc).map(|i| args[i + 1]).collect());
             let total = keys.len();
-            let topo = self.shared.topo.load();
+            let topo = self.shared.topo.load_full();
             let parts = self.with_rng(|rng| {
                 multikey::split(spec.name.as_bytes(), &keys, values.as_deref(), |slot| {
-                    route::pick(&topo, slot, readonly, mode, rng)
-                        .map(|(i, _)| topo.nodes[i as usize].addr.clone())
+                    route::pick(&topo, slot, readonly, mode, rng).map(|(i, _)| i)
                 })
             });
-            parts.map(|p| (p, total))
+            parts.map(|p| (p, total, topo))
         };
-        let (parts, total) = match split {
+        let (parts, total, topo) = match split {
             Ok(v) => v,
             Err(e) => {
                 self.emit_at(seq, error_frame(&format!("CLUSTERDOWN {e}")));
@@ -428,7 +430,10 @@ impl Session {
             let mut receivers = Vec::with_capacity(parts.len());
             for part in &parts {
                 let (tx, rx) = oneshot::channel();
-                let conn = shared.backends.shared(&part.addr, id, flag_readonly);
+                let conn =
+                    shared
+                        .backends
+                        .shared(&topo.nodes[part.node as usize].addr, id, flag_readonly);
                 conn.send(Outbound {
                     head: None,
                     frame: part.frame.clone(),
@@ -485,42 +490,38 @@ impl Session {
     }
 
     fn run_scan(&self, frame: &Bytes, argc: usize) {
-        let (cursor, tail) = {
+        let cursor = {
             let args = collect_args(frame, argc);
-            let cursor = std::str::from_utf8(args[1])
+            std::str::from_utf8(args[1])
                 .ok()
-                .and_then(|s| s.parse::<u64>().ok());
-            let tail: Vec<Vec<u8>> = args[2..].iter().map(|a| a.to_vec()).collect();
-            (cursor, tail)
+                .and_then(|s| s.parse::<u64>().ok())
         };
         let Some(cursor) = cursor else {
             self.emit_error("ERR invalid cursor");
             return;
         };
+        let frame = frame.clone();
         let (master_idx, node_cursor) = multikey::unpack_cursor(cursor);
         let seq = self.alloc_seq();
         let shared = self.shared.clone();
         let reply_tx = self.reply_tx.clone();
         let id = self.id;
         tokio::task::spawn_local(async move {
-            let addr = {
-                let topo = shared.topo.load();
-                if master_idx >= topo.masters.len() {
-                    let done = multikey::rebuild_scan_reply(0, b"*0\r\n");
-                    let _ = reply_tx.send((seq, Bytes::from(done)));
-                    return;
-                }
-                topo.nodes[topo.masters[master_idx] as usize].addr.clone()
-            };
+            let topo = shared.topo.load_full();
+            if master_idx >= topo.masters.len() {
+                let done = multikey::rebuild_scan_reply(0, b"*0\r\n");
+                let _ = reply_tx.send((seq, Bytes::from(done)));
+                return;
+            }
+            let addr = &topo.nodes[topo.masters[master_idx] as usize].addr;
             let cursor_str = node_cursor.to_string();
             let mut sub_args: Vec<&[u8]> = vec![b"SCAN", cursor_str.as_bytes()];
-            for t in &tail {
-                sub_args.push(t);
-            }
+            let args = collect_args(&frame, argc);
+            sub_args.extend_from_slice(&args[2..]);
             let mut cmd = Vec::new();
             resp::write_command(&mut cmd, &sub_args);
             let (tx, rx) = oneshot::channel();
-            let conn = shared.backends.shared(&addr, id, false);
+            let conn = shared.backends.shared(addr, id, false);
             conn.send(Outbound {
                 head: None,
                 frame: Bytes::from(cmd),
@@ -556,17 +557,13 @@ impl Session {
         let reply_tx = self.reply_tx.clone();
         let id = self.id;
         tokio::task::spawn_local(async move {
-            let addrs: Vec<String> = {
-                let topo = shared.topo.load();
-                topo.masters
-                    .iter()
-                    .map(|&i| topo.nodes[i as usize].addr.clone())
-                    .collect()
-            };
-            let mut receivers = Vec::with_capacity(addrs.len());
-            for addr in &addrs {
+            let topo = shared.topo.load_full();
+            let mut receivers = Vec::with_capacity(topo.masters.len());
+            for &midx in &topo.masters {
                 let (tx, rx) = oneshot::channel();
-                let conn = shared.backends.shared(addr, id, false);
+                let conn = shared
+                    .backends
+                    .shared(&topo.nodes[midx as usize].addr, id, false);
                 conn.send(Outbound {
                     head: None,
                     frame: frame.clone(),
@@ -735,10 +732,13 @@ impl Session {
             return;
         }
         let seq = self.alloc_seq();
-        let addr = state.slot.and_then(|s| self.master_addr(s));
-        let Some(addr) = addr else {
-            self.emit_at(seq, error_frame(ERR_NO_OWNER));
-            return;
+        let conn = {
+            let topo = self.shared.topo.load();
+            let Some(idx) = state.slot.and_then(|sl| topo.owner(sl)) else {
+                self.emit_at(seq, error_frame(ERR_NO_OWNER));
+                return;
+            };
+            self.cached_conn(&topo, idx, false)
         };
         let mut blob = Vec::new();
         blob.extend_from_slice(b"*1\r\n$5\r\nMULTI\r\n");
@@ -749,7 +749,6 @@ impl Session {
         let expect = state.frames.len() as u32 + 2;
         let blob = Bytes::from(blob);
         self.track_inflight_expect(seq, &blob, expect);
-        let conn = self.shared.backends.shared(&addr, self.id, false);
         conn.send(Outbound {
             head: None,
             frame: blob,
@@ -1184,21 +1183,19 @@ async fn blocking_round(
     redirect: Option<(bool, String)>,
     retried: bool,
 ) -> Bytes {
-    let (addr, asking) = match redirect {
-        Some((ask, target)) => (Some(target), ask),
-        None => {
-            let topo = shared.topo.load();
-            (
-                topo.owner(slot)
-                    .map(|i| topo.nodes[i as usize].addr.clone()),
-                false,
-            )
-        }
+    let topo = shared.topo.load_full();
+    let (addr, asking) = match &redirect {
+        Some((ask, target)) => (Some(target.as_str()), *ask),
+        None => (
+            topo.owner(slot)
+                .map(|i| topo.nodes[i as usize].addr.as_str()),
+            false,
+        ),
     };
     let Some(addr) = addr else {
         return error_frame(ERR_NO_OWNER);
     };
-    let Some(lease) = shared.backends.take_exclusive(&addr, false) else {
+    let Some(lease) = shared.backends.take_exclusive(addr, false) else {
         return error_frame("ERR too many blocking connections");
     };
     let (tx, rx) = oneshot::channel();

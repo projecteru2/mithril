@@ -11,7 +11,7 @@ pub const SCAN_CURSOR_BITS: u32 = 51;
 /// Sub-request for one slot: rebuilt command plus original key positions.
 pub struct Part {
     pub slot: u16,
-    pub addr: String,
+    pub node: u16,
     pub frame: Bytes,
     pub positions: Vec<usize>,
 }
@@ -24,9 +24,9 @@ pub fn split<'k, F>(
     mut route: F,
 ) -> Result<Vec<Part>, String>
 where
-    F: FnMut(u16) -> Option<String>,
+    F: FnMut(u16) -> Option<u16>,
 {
-    type Group<'a> = (u16, String, Vec<&'a [u8]>, Vec<usize>);
+    type Group<'a> = (u16, u16, Vec<&'a [u8]>, Vec<usize>);
     let mut parts: Vec<Group<'k>> = Vec::new();
     let mut by_slot: std::collections::HashMap<u16, usize> = HashMap::new();
     for (i, key) in keys.iter().enumerate() {
@@ -34,9 +34,9 @@ where
         let entry = match by_slot.get(&slot) {
             Some(&g) => &mut parts[g],
             None => {
-                let addr = route(slot).ok_or_else(|| "slot has no owner".to_string())?;
+                let node = route(slot).ok_or_else(|| "slot has no owner".to_string())?;
                 by_slot.insert(slot, parts.len());
-                parts.push((slot, addr, Vec::new(), Vec::new()));
+                parts.push((slot, node, Vec::new(), Vec::new()));
                 let last = parts.len() - 1;
                 &mut parts[last]
             }
@@ -49,7 +49,7 @@ where
     }
     Ok(parts
         .into_iter()
-        .map(|(slot, addr, args, positions)| {
+        .map(|(slot, node, args, positions)| {
             let mut all: Vec<&[u8]> = Vec::with_capacity(args.len() + 1);
             all.push(name);
             all.extend_from_slice(&args);
@@ -57,7 +57,7 @@ where
             resp::write_command(&mut frame, &all);
             Part {
                 slot,
-                addr,
+                node,
                 frame: Bytes::from(frame),
                 positions,
             }
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn splits_by_slot_even_on_one_node() {
         let keys: Vec<&[u8]> = vec![b"{t}a", b"b", b"{t}c"];
-        let parts = split(b"MGET", &keys, None, |_slot| Some("n1".to_string())).unwrap();
+        let parts = split(b"MGET", &keys, None, |_slot| Some(7)).unwrap();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].positions, vec![0, 2]);
         assert_eq!(
@@ -195,7 +195,7 @@ mod tests {
             b"*3\r\n$4\r\nMGET\r\n$4\r\n{t}a\r\n$4\r\n{t}c\r\n"
         );
         assert_eq!(parts[1].positions, vec![1]);
-        assert_eq!(parts[1].addr, "n1");
+        assert_eq!(parts[1].node, 7);
     }
 
     #[test]
