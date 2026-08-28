@@ -251,18 +251,44 @@ pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
     for (d, &s) in lower.iter_mut().zip(name) {
         *d = s.to_ascii_lowercase();
     }
-    let key = (prefix64(lower), name.len() as u8);
-    let idx = TABLE
-        .binary_search_by(|spec| {
-            (spec.prefix, spec.name.len() as u8)
-                .cmp(&key)
-                .then_with(|| {
-                    spec.name.as_bytes()[PREFIX_LEN.min(spec.name.len())..]
-                        .cmp(&lower[PREFIX_LEN.min(lower.len())..])
-                })
-        })
-        .ok()?;
-    Some(&TABLE[idx])
+    let prefix = prefix64(lower);
+    let mut h = lut_hash(prefix, name.len() as u8);
+    loop {
+        let idx = LUT[h];
+        if idx == u16::MAX {
+            return None;
+        }
+        let spec = &TABLE[idx as usize];
+        if spec.prefix == prefix
+            && spec.name.len() == name.len()
+            && spec.name.as_bytes()[PREFIX_LEN.min(spec.name.len())..]
+                == lower[PREFIX_LEN.min(lower.len())..]
+        {
+            return Some(spec);
+        }
+        h = (h + 1) & (LUT.len() - 1);
+    }
+}
+
+static LUT: [u16; 512] = build_lut();
+
+const fn lut_hash(prefix: u64, len: u8) -> usize {
+    let h = (prefix ^ len as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    (h >> 55) as usize
+}
+
+const fn build_lut() -> [u16; 512] {
+    let mut lut = [u16::MAX; 512];
+    let mut i = 0;
+    while i < TABLE.len() {
+        let mut h = lut_hash(TABLE[i].prefix, TABLE[i].name.len() as u8);
+        while lut[h] != u16::MAX {
+            h = (h + 1) & (lut.len() - 1);
+        }
+        lut[h] = i as u16;
+        i += 1;
+    }
+    lut
 }
 
 const fn prefix64(name: &[u8]) -> u64 {
@@ -296,11 +322,21 @@ const fn c(
     }
 }
 
-// Sorted by name; lookup binary-searches and a test enforces the order.
+// Sorted by name; a test enforces order and lookup-key uniqueness.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_entry_resolves_through_the_lut() {
+        for spec in TABLE {
+            assert_eq!(
+                lookup(spec.name.as_bytes()).map(|s| s.name),
+                Some(spec.name)
+            );
+        }
+    }
 
     #[test]
     fn table_is_sorted_by_lookup_key() {
