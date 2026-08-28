@@ -193,16 +193,20 @@ fn acceptor_thread(
             let best = next;
             next = (next + 1) % conn_txs.len();
             let mut pending = Some(std_stream);
-            'place: loop {
+            loop {
                 for k in 0..conn_txs.len() {
                     let Some(s) = pending.take() else {
-                        break 'place;
+                        break;
                     };
                     let i = (best + k) % conn_txs.len();
                     match conn_txs[i].try_send(s) {
                         Ok(()) => {}
                         Err(e) => pending = Some(e.into_inner()),
                     }
+                }
+                // a handed-off socket is owned by its worker: never decrement for it
+                if pending.is_none() {
+                    break;
                 }
                 if SHUTTING_DOWN.load(Ordering::Relaxed) {
                     stats.clients.fetch_sub(1, Ordering::Relaxed);
