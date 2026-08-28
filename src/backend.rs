@@ -53,6 +53,7 @@ struct Pending {
 pub struct Conn {
     tx: mpsc::Sender<Outbound>,
     dead: Cell<bool>,
+    abort: tokio::sync::Notify,
 }
 
 impl Conn {
@@ -70,6 +71,13 @@ impl Conn {
 
     pub fn is_dead(&self) -> bool {
         self.dead.get()
+    }
+
+    /// Force-closes the connection; its task drains and the socket drops, so
+    /// the backend cancels any command still blocked on it.
+    pub fn abort(&self) {
+        self.dead.set(true);
+        self.abort.notify_waiters();
     }
 }
 
@@ -156,12 +164,13 @@ impl Backends {
         let conn = Rc::new(Conn {
             tx,
             dead: Cell::new(false),
+            abort: tokio::sync::Notify::new(),
         });
         let task_conn = conn.clone();
         let addr = addr.to_string();
         let cfg = self.cfg.clone();
         tokio::task::spawn_local(async move {
-            run_conn(&addr, rx, readonly, &cfg).await;
+            run_conn(&addr, rx, readonly, &cfg, &task_conn).await;
             task_conn.dead.set(true);
         });
         conn
@@ -200,6 +209,7 @@ impl Drop for ExclusiveLease {
                 .borrow_mut()
                 .push(self.conn.clone());
         } else {
+            self.conn.abort();
             self.pool
                 .exclusive_count
                 .set(self.pool.exclusive_count.get().saturating_sub(1));
@@ -207,7 +217,13 @@ impl Drop for ExclusiveLease {
     }
 }
 
-async fn run_conn(addr: &str, mut rx: mpsc::Receiver<Outbound>, readonly: bool, cfg: &Config) {
+async fn run_conn(
+    addr: &str,
+    mut rx: mpsc::Receiver<Outbound>,
+    readonly: bool,
+    cfg: &Config,
+    conn: &Conn,
+) {
     let stream = match connect(addr, cfg.tcp_keepalive_secs).await {
         Ok(s) => s,
         Err(e) => {
@@ -273,6 +289,9 @@ async fn run_conn(addr: &str, mut rx: mpsc::Receiver<Outbound>, readonly: bool, 
             break 'io;
         }
         tokio::select! {
+            _ = conn.abort.notified() => {
+                break 'io;
+            }
             n = rx.recv_many(&mut batch, BATCH), if tx_open => {
                 if n == 0 {
                     tx_open = false;
