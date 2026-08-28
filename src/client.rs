@@ -2,7 +2,7 @@
 //! blocking commands, pubsub relay, and MOVED/ASK retries.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::IoSlice;
 use std::rc::Rc;
 
@@ -45,12 +45,14 @@ pub struct Shared {
 }
 
 struct InFlight {
+    seq: u64,
     frame: Bytes,
     expect: u32,
     retried: bool,
 }
 
-type InflightMap = RefCell<HashMap<u64, InFlight>>;
+// sequences are allocated monotonically, so the ring stays sorted.
+type InflightRing = RefCell<std::collections::VecDeque<InFlight>>;
 
 /// One frame travelling to the client writer.
 pub enum Reply {
@@ -69,7 +71,7 @@ pub type ReplyTx = mpsc::UnboundedSender<Reply>;
 /// State shared between a session's reader, writer, and pubsub relay.
 #[derive(Default)]
 struct WriterLink {
-    inflight: InflightMap,
+    inflight: InflightRing,
     emitted: Cell<u64>,
     proto_switches: ProtoSwitchQueue,
     oob_budget: Cell<usize>,
@@ -111,7 +113,7 @@ impl ProtoSwitchQueue {
 struct Session {
     shared: Rc<Shared>,
     id: u64,
-    reply_tx: ReplyTx,
+    reply_tx: Rc<ReplyTx>,
     link: Rc<WriterLink>,
     proto: Cell<u8>,
     authed: Cell<bool>,
@@ -280,20 +282,18 @@ impl Session {
             head: None,
             frame,
             expect: 1,
-            sink: Sink::Client(self.reply_tx.clone(), seq),
+            sink: Sink::Client(Rc::clone(&self.reply_tx), seq),
         })
         .await;
     }
 
     fn track_inflight(&self, seq: u64, frame: &Bytes, expect: u32) {
-        self.link.inflight.borrow_mut().insert(
+        self.link.inflight.borrow_mut().push_back(InFlight {
             seq,
-            InFlight {
-                frame: frame.clone(),
-                expect,
-                retried: false,
-            },
-        );
+            frame: frame.clone(),
+            expect,
+            retried: false,
+        });
     }
 
     async fn forward_eval(&self, frame: Bytes, argc: usize) {
@@ -368,7 +368,7 @@ impl Session {
     fn spawn_blocking(&self, slot: u16, frame: Bytes) {
         let seq = self.alloc_seq();
         let shared = self.shared.clone();
-        let reply_tx = self.reply_tx.clone();
+        let reply_tx = Rc::clone(&self.reply_tx);
         let task = tokio::task::spawn_local(async move {
             let reply = blocking_round(&shared, slot, frame, None, false).await;
             let _ = reply_tx.send(Reply::At(seq, reply));
@@ -417,7 +417,7 @@ impl Session {
             }
         };
         let shared = self.shared.clone();
-        let reply_tx = self.reply_tx.clone();
+        let reply_tx = Rc::clone(&self.reply_tx);
         let id = self.id;
         let merge = match spec.kind {
             Kind::Mget => Merge::Mget,
@@ -479,7 +479,7 @@ impl Session {
         let (master_idx, node_cursor) = multikey::unpack_cursor(cursor);
         let seq = self.alloc_seq();
         let shared = self.shared.clone();
-        let reply_tx = self.reply_tx.clone();
+        let reply_tx = Rc::clone(&self.reply_tx);
         let id = self.id;
         // detached deliberately: completion is bounded by backend replies.
         tokio::task::spawn_local(async move {
@@ -522,7 +522,7 @@ impl Session {
     fn run_broadcast(&self, frame: Bytes, sum: bool) {
         let seq = self.alloc_seq();
         let shared = self.shared.clone();
-        let reply_tx = self.reply_tx.clone();
+        let reply_tx = Rc::clone(&self.reply_tx);
         let id = self.id;
         // detached deliberately: completion is bounded by backend replies.
         tokio::task::spawn_local(async move {
@@ -721,7 +721,7 @@ impl Session {
             head: None,
             frame: blob,
             expect,
-            sink: Sink::Client(self.reply_tx.clone(), seq),
+            sink: Sink::Client(Rc::clone(&self.reply_tx), seq),
         })
         .await;
     }
@@ -932,7 +932,7 @@ impl Session {
         let (tx, rx) = mpsc::channel::<Bytes>(PUBSUB_FORWARD_QUEUE);
         let _ = tx.try_send(first_frame);
         let shared = self.shared.clone();
-        let reply_tx = self.reply_tx.clone();
+        let reply_tx = Rc::clone(&self.reply_tx);
         let link = self.link.clone();
         let task = tokio::task::spawn_local(async move {
             pubsub_relay(shared, addr, rx, reply_tx, link).await;
@@ -1050,12 +1050,13 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
     }
     let (mut read_half, write_half) = stream.into_split();
     let (reply_tx, reply_rx) = mpsc::unbounded_channel();
+    let reply_tx = Rc::new(reply_tx);
     let link: Rc<WriterLink> = Rc::new(WriterLink::default());
 
     let session = Session {
         shared: shared.clone(),
         id,
-        reply_tx: reply_tx.clone(),
+        reply_tx: Rc::clone(&reply_tx),
         link: link.clone(),
         proto: Cell::new(2),
         authed: Cell::new(shared.cfg.requirepass.is_empty()),
@@ -1078,7 +1079,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         shared.clone(),
         write_half,
         reply_rx,
-        reply_tx.clone(),
+        Rc::clone(&reply_tx),
         close_rx,
         link.clone(),
         id,
@@ -1283,7 +1284,7 @@ async fn pubsub_relay(
     shared: Rc<Shared>,
     addr: String,
     mut rx: mpsc::Receiver<Bytes>,
-    reply_tx: ReplyTx,
+    reply_tx: Rc<ReplyTx>,
     link: Rc<WriterLink>,
 ) {
     let stream = match crate::backend::dial_raw(&addr, &shared.cfg).await {
@@ -1349,7 +1350,7 @@ async fn pubsub_relay(
 }
 
 // a push holds one window slot from here until the writer emits it
-async fn charge_push(link: &Rc<WriterLink>, reply_tx: &ReplyTx) -> bool {
+async fn charge_push(link: &Rc<WriterLink>, reply_tx: &Rc<ReplyTx>) -> bool {
     while link.oob_budget.get() >= PUBSUB_PUSH_WINDOW {
         if reply_tx.is_closed() {
             return false;
@@ -1361,7 +1362,7 @@ async fn charge_push(link: &Rc<WriterLink>, reply_tx: &ReplyTx) -> bool {
 }
 
 // promised confirmation sequences must resolve or the writer never drains past them
-fn backfill_acks(link: &Rc<WriterLink>, reply_tx: &ReplyTx) {
+fn backfill_acks(link: &Rc<WriterLink>, reply_tx: &Rc<ReplyTx>) {
     let drained: Vec<u64> = link.ack_seqs.borrow_mut().drain(..).collect();
     for seq in drained {
         let _ = reply_tx.send(Reply::Ack(seq, Bytes::from_static(ERR_BACKEND_LOST)));
@@ -1373,7 +1374,7 @@ async fn write_loop(
     shared: Rc<Shared>,
     mut write_half: OwnedWriteHalf,
     mut rx: mpsc::UnboundedReceiver<Reply>,
-    reply_tx: ReplyTx,
+    reply_tx: Rc<ReplyTx>,
     mut close_rx: oneshot::Receiver<u64>,
     link: Rc<WriterLink>,
     client_id: u64,
@@ -1467,7 +1468,7 @@ async fn write_loop(
                         head: ask.then(|| Bytes::from_static(ASKING_FRAME)),
                         frame: req,
                         expect: base_expect + u32::from(ask),
-                        sink: Sink::Client(reply_tx.clone(), seq),
+                        sink: Sink::Client(Rc::clone(&reply_tx), seq),
                     })
                     .await;
                     continue;
@@ -1476,7 +1477,6 @@ async fn write_loop(
                 frame = Bytes::from_static(ERR_TRYAGAIN);
             }
             if seq == next_emit {
-                link.inflight.borrow_mut().remove(&seq);
                 link.proto_switches.apply(next_emit, &mut cur_proto);
                 ready.push(convert_nil(frame, cur_proto));
                 next_emit += 1;
@@ -1494,7 +1494,6 @@ async fn write_loop(
                 continue;
             }
             if let Some(frame) = parked.remove(&next_emit) {
-                link.inflight.borrow_mut().remove(&next_emit);
                 link.proto_switches.apply(next_emit, &mut cur_proto);
                 ready.push(convert_nil(frame, cur_proto));
                 next_emit += 1;
@@ -1504,6 +1503,12 @@ async fn write_loop(
                 next_emit += 1;
             } else {
                 break;
+            }
+        }
+        {
+            let mut inf = link.inflight.borrow_mut();
+            while inf.front().is_some_and(|e| e.seq < next_emit) {
+                inf.pop_front();
             }
         }
         if !ready.is_empty() {
@@ -1531,9 +1536,10 @@ async fn write_loop(
 }
 
 // retryable redirects: single-reply requests always, multi-reply blobs only for MOVED
-fn take_retry_frame(inflight: &InflightMap, seq: u64, ask: bool) -> Option<(Bytes, u32)> {
+fn take_retry_frame(inflight: &InflightRing, seq: u64, ask: bool) -> Option<(Bytes, u32)> {
     let mut inf = inflight.borrow_mut();
-    match inf.get_mut(&seq) {
+    let idx = inf.binary_search_by_key(&seq, |e| e.seq).ok()?;
+    match inf.get_mut(idx) {
         Some(entry) if !entry.retried && (entry.expect == 1 || !ask) => {
             entry.retried = true;
             Some((entry.frame.clone(), entry.expect))

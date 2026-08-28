@@ -29,7 +29,7 @@ pub const ERR_BACKEND_LOST: &[u8] = b"-ERR mithril: backend connection lost\r\n"
 /// Where a backend reply is delivered.
 pub enum Sink {
     /// Ordered client reply stream at a fixed sequence.
-    Client(ReplyTx, u64),
+    Client(Rc<ReplyTx>, u64),
     /// Single reply for mergers and blocking commands.
     One(oneshot::Sender<Bytes>),
 }
