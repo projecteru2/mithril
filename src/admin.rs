@@ -93,9 +93,7 @@ pub fn command_reply(args: &[&[u8]], table: &[Spec], proto: u8) -> Vec<u8> {
     let sub = args.get(1).map(|s| s.to_ascii_lowercase());
     match sub.as_deref() {
         None => {
-            out.push(b'*');
-            out.extend_from_slice(table.len().to_string().as_bytes());
-            out.extend_from_slice(b"\r\n");
+            resp::array_header(&mut out, table.len());
             for spec in table {
                 command_entry(&mut out, spec);
             }
@@ -105,9 +103,7 @@ pub fn command_reply(args: &[&[u8]], table: &[Spec], proto: u8) -> Vec<u8> {
             out.extend_from_slice(if proto >= 3 { b"%0\r\n" } else { b"*0\r\n" });
         }
         Some(b"info") => {
-            out.push(b'*');
-            out.extend_from_slice((args.len() - 2).to_string().as_bytes());
-            out.extend_from_slice(b"\r\n");
+            resp::array_header(&mut out, args.len() - 2);
             for name in &args[2..] {
                 match crate::command::lookup(name) {
                     Some(spec) => command_entry(&mut out, spec),
@@ -132,9 +128,7 @@ fn command_entry(out: &mut Vec<u8>, spec: &Spec) {
     if spec.is_readonly() {
         flags.push(b"readonly");
     }
-    out.push(b'*');
-    out.extend_from_slice(flags.len().to_string().as_bytes());
-    out.extend_from_slice(b"\r\n");
+    resp::array_header(out, flags.len());
     for f in flags {
         out.push(b'+');
         out.extend_from_slice(f);
@@ -151,7 +145,6 @@ pub fn cluster(args: &[&[u8]], cfg: &Config, proto: u8) -> Vec<u8> {
         .get(1)
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
-    let (host, port) = split_announce(&cfg.announce_addr);
     match sub.as_slice() {
         b"info" => {
             let text = "cluster_enabled:1\r\ncluster_state:ok\r\ncluster_slots_assigned:16384\r\n\
@@ -165,6 +158,7 @@ pub fn cluster(args: &[&[u8]], cfg: &Config, proto: u8) -> Vec<u8> {
             None => resp::write_error(&mut out, "ERR wrong number of arguments"),
         },
         b"nodes" => {
+            let (host, port) = split_announce(&cfg.announce_addr);
             let line = format!(
                 "{} {host}:{port}@{} myself,master - 0 0 1 connected 0-16383\n",
                 node_id(&cfg.announce_addr),
@@ -173,6 +167,7 @@ pub fn cluster(args: &[&[u8]], cfg: &Config, proto: u8) -> Vec<u8> {
             bulk(&mut out, line.as_bytes());
         }
         b"slots" => {
+            let (host, port) = split_announce(&cfg.announce_addr);
             out.extend_from_slice(b"*1\r\n*3\r\n");
             integer(&mut out, 0);
             integer(&mut out, SLOTS as i64 - 1);
@@ -287,9 +282,7 @@ pub fn config_cmd(args: &[&[u8]], cfg: &Config) -> Vec<u8> {
                 .iter()
                 .filter(|(k, _)| pattern == "*" || *k == pattern.as_ref())
                 .collect();
-            out.push(b'*');
-            out.extend_from_slice((matched.len() * 2).to_string().as_bytes());
-            out.extend_from_slice(b"\r\n");
+            resp::array_header(&mut out, matched.len() * 2);
             for (k, v) in matched {
                 bulk(&mut out, k.as_bytes());
                 bulk(&mut out, v.as_bytes());

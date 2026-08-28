@@ -2,6 +2,8 @@
 
 use mithril::config::Config;
 
+const USAGE: &str = "usage: mithril <conf-file> [--<key> <value>]...";
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut cfg: Option<Config> = None;
@@ -13,7 +15,7 @@ fn main() {
                 return;
             }
             "--help" => {
-                println!("usage: mithril <conf-file> [--<key> <value>]...");
+                println!("{USAGE}");
                 return;
             }
             flag if flag.starts_with("--") => {
@@ -35,7 +37,7 @@ fn main() {
     let mut cfg = match cfg {
         Some(c) => c,
         None => {
-            eprintln!("usage: mithril <conf-file> [--<key> <value>]...");
+            eprintln!("{USAGE}");
             std::process::exit(1);
         }
     };

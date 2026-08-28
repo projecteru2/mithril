@@ -7,7 +7,6 @@ pub const NO_NODE: u16 = u16::MAX;
 /// One cluster node as seen in CLUSTER NODES output.
 #[derive(Debug, Clone)]
 pub struct Node {
-    pub id: String,
     pub addr: String,
     pub fail: bool,
     pub replicas: Vec<u16>,
@@ -56,17 +55,13 @@ impl Topology {
                 replica_refs.push((idx, master_ref));
             }
             nodes.push(Node {
-                id: id.to_string(),
                 addr: addr.to_string(),
                 fail,
                 replicas: Vec::new(),
             });
         }
 
-        let mut masters: Vec<u16> = Vec::new();
-        for (_, idx) in &master_ids {
-            masters.push(*idx);
-        }
+        let masters: Vec<u16> = master_ids.iter().map(|&(_, idx)| idx).collect();
         if masters.is_empty() {
             return Err("no masters in topology".to_string());
         }
@@ -74,8 +69,7 @@ impl Topology {
             let Some((_, midx)) = master_ids.iter().find(|(id, _)| *id == master_ref) else {
                 return Err(format!("replica {} references unknown master", idx));
             };
-            let replica_ok = !nodes[idx as usize].fail;
-            if replica_ok {
+            if !nodes[idx as usize].fail {
                 nodes[*midx as usize].replicas.push(idx);
             }
         }

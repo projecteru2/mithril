@@ -119,9 +119,7 @@ impl<'a> Iterator for Args<'a> {
 
 /// Serializes argument slices as a RESP array of bulk strings into `out`.
 pub fn write_command(out: &mut Vec<u8>, args: &[&[u8]]) {
-    out.extend_from_slice(b"*");
-    push_usize(out, args.len());
-    out.extend_from_slice(b"\r\n");
+    array_header(out, args.len());
     for a in args {
         out.push(b'$');
         push_usize(out, a.len());
@@ -129,6 +127,13 @@ pub fn write_command(out: &mut Vec<u8>, args: &[&[u8]]) {
         out.extend_from_slice(a);
         out.extend_from_slice(b"\r\n");
     }
+}
+
+/// Appends a RESP array header.
+pub(crate) fn array_header(out: &mut Vec<u8>, n: usize) {
+    out.push(b'*');
+    push_usize(out, n);
+    out.extend_from_slice(b"\r\n");
 }
 
 /// Appends a simple error reply.

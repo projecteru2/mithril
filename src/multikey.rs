@@ -25,7 +25,7 @@ pub fn split<'k, F>(
 where
     F: FnMut(u16) -> Option<u16>,
 {
-    type Group<'a> = (u16, u16, Vec<&'a [u8]>, Vec<usize>);
+    type Group<'a> = (u16, Vec<&'a [u8]>, Vec<usize>);
     let mut parts: Vec<Group<'k>> = Vec::new();
     let mut by_slot: HashMap<u16, usize> = HashMap::new();
     for (i, key) in keys.iter().enumerate() {
@@ -35,20 +35,20 @@ where
             None => {
                 let node = route(slot).ok_or_else(|| "slot has no owner".to_string())?;
                 by_slot.insert(slot, parts.len());
-                parts.push((slot, node, Vec::new(), Vec::new()));
+                parts.push((node, Vec::new(), Vec::new()));
                 let last = parts.len() - 1;
                 &mut parts[last]
             }
         };
-        entry.2.push(key);
+        entry.1.push(key);
         if let Some(vals) = values {
-            entry.2.push(vals[i]);
+            entry.1.push(vals[i]);
         }
-        entry.3.push(i);
+        entry.2.push(i);
     }
     Ok(parts
         .into_iter()
-        .map(|(_, node, args, positions)| {
+        .map(|(node, args, positions)| {
             let mut all: Vec<&[u8]> = Vec::with_capacity(args.len() + 1);
             all.push(name);
             all.extend_from_slice(&args);
@@ -103,9 +103,7 @@ pub fn merge_mget(total: usize, parts: &[(Vec<usize>, Bytes)]) -> Result<Vec<u8>
         }
     }
     let mut out = Vec::new();
-    out.push(b'*');
-    out.extend_from_slice(total.to_string().as_bytes());
-    out.extend_from_slice(b"\r\n");
+    resp::array_header(&mut out, total);
     for s in slots {
         out.extend_from_slice(s);
     }
