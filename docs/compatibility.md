@@ -9,6 +9,7 @@ teardown/recreate between versions:
 | redis:7.4 | 7.4.11 | pass |
 | redis:8.2 | 8.2.9 | pass |
 | valkey/valkey:9.1 | 9.1.1 | pass |
+| redis-stable (source) | 8.10.1 | pass |
 
 Clients verified: redis-py (cluster and standalone mode), redis-cli,
 memtier_benchmark, redis-benchmark.

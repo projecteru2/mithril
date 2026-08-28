@@ -16,6 +16,21 @@ const BYTE_UNITS: &[(&str, usize)] = &[
 
 /// Replica read routing mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    RoundRobin,
+    LeastLoaded,
+}
+
+impl fmt::Display for Placement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Placement::RoundRobin => "round-robin",
+            Placement::LeastLoaded => "least-loaded",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlaveMode {
     Off,
     /// Reads balance across master and replicas.
@@ -48,6 +63,7 @@ pub struct Config {
     pub backend_user: String,
     pub backend_pass: String,
     pub slave_mode: SlaveMode,
+    pub placement: Placement,
     pub tcp_keepalive_secs: u64,
     pub query_buffer_limit: usize,
     pub topology_refresh_secs: u64,
@@ -68,6 +84,7 @@ impl Default for Config {
             backend_user: String::new(),
             backend_pass: String::new(),
             slave_mode: SlaveMode::Off,
+            placement: Placement::LeastLoaded,
             tcp_keepalive_secs: 300,
             query_buffer_limit: 1024 * 1024 * 1024,
             topology_refresh_secs: 15,
@@ -109,6 +126,7 @@ impl Config {
             "backend-auth-user" => self.backend_user = value.to_string(),
             "backend-auth-pass" => self.backend_pass = value.to_string(),
             "slave-mode" => self.slave_mode = parse_slave_mode(value)?,
+            "placement" => self.placement = parse_placement(value)?,
             "tcp-keepalive" => self.tcp_keepalive_secs = parse(key, value)?,
             "query-buffer-limit" => self.query_buffer_limit = parse_bytes(key, value)?,
             "topology-refresh-secs" => {
@@ -147,6 +165,14 @@ fn parse_bounded(key: &str, value: &str, min: usize, max: usize) -> Result<usize
         return Err(format!("'{key}' must be in [{min}, {max}]"));
     }
     Ok(n)
+}
+
+fn parse_placement(value: &str) -> Result<Placement, String> {
+    match value {
+        "round-robin" => Ok(Placement::RoundRobin),
+        "least-loaded" => Ok(Placement::LeastLoaded),
+        _ => Err(format!("bad placement '{value}'")),
+    }
 }
 
 fn parse_slave_mode(value: &str) -> Result<SlaveMode, String> {

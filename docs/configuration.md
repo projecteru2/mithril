@@ -18,6 +18,7 @@ See [`mithril.conf.sample`](https://github.com/projecteru2/mithril/blob/master/m
 | `backend-auth-user` | string | empty | username sent to backends (`AUTH user pass`) |
 | `backend-auth-pass` | string | empty | password sent to backends |
 | `slave-mode` | enum | `off` | replica read splitting: `off`, `master_readwrite`, `master_writeonly` |
+| `placement` | enum | `least-loaded` | new-connection placement: `least-loaded` (avoid busy workers; decays to rotation under even load) or `round-robin` |
 | `tcp-keepalive` | seconds | `300` | keepalive on backend connections |
 | `query-buffer-limit` | bytes | `1gb` | per-client input cap; accepts `kb`/`mb`/`gb` suffixes; also bounds queued MULTI bytes |
 | `topology-refresh-secs` | 1..3600 | `15` | periodic CLUSTER NODES refresh; redirects trigger one immediately (debounced 100ms) |

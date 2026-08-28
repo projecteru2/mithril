@@ -24,6 +24,9 @@ backend-conns 1
 # replica read splitting: off | master_readwrite | master_writeonly
 slave-mode off
 
+# new-connection placement across workers: least-loaded | round-robin
+placement least-loaded
+
 maxclients 10000
 tcp-keepalive 300
 query-buffer-limit 1gb

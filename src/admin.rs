@@ -320,6 +320,7 @@ fn config_pairs(cfg: &Config) -> Vec<(&'static str, String)> {
             .to_string(),
         ),
         ("slave-mode", cfg.slave_mode.to_string()),
+        ("placement", cfg.placement.to_string()),
         ("tcp-keepalive", cfg.tcp_keepalive_secs.to_string()),
         ("query-buffer-limit", cfg.query_buffer_limit.to_string()),
         (

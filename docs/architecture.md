@@ -12,7 +12,11 @@ One acceptor thread owns the listen socket and hands accepted connections to
 workers round-robin over bounded channels. Kernel `SO_REUSEPORT` hashing was
 measured to skew connections binomially (26% worker imbalance at 100
 connections); at saturation the heaviest worker sets the throughput floor,
-and round-robin placement recovered +3.2% at pipeline depth 16. Each
+and central placement recovered +3.2% at pipeline depth 16. Placement is
+`least-loaded` by default: new connections land on the worker with the least
+recent command activity (10ms windows, in-window placements charged), which
+under even load ties every bucket and decays to exact rotation, and under
+skew steers reconnecting pool members away from hot workers. Each
 accepted socket carries an admission ticket: a drop guard holding one
 `maxclients` slot, released exactly once on every path — rejection, handoff
 failure, session end, or panic.
