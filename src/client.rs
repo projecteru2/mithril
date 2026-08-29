@@ -1605,8 +1605,9 @@ async fn write_loop(
     impl Drop for ExitBump<'_> {
         fn drop(&mut self) {
             self.reply.closed.set(true);
-            // queued frames must not outlive the writer via lingering backend sinks
-            self.reply.q.borrow_mut().clear();
+            // queued frames and their backing buffer must not outlive the writer
+            // via lingering backend sinks
+            drop(std::mem::take(&mut *self.reply.q.borrow_mut()));
             mark_closed(self.link);
             stats::bump(&self.shared.stats.workers[self.shared.worker].writers_exited);
             self.link.oob_notify.notify_waiters();
