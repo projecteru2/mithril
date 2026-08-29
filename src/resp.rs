@@ -267,7 +267,7 @@ pub fn split_inline(line: &[u8]) -> Option<Vec<Vec<u8>>> {
     Some(args)
 }
 
-// i64::MIN marks a malformed integer line; every caller rejects negatives.
+// i64::MIN marks a malformed integer line, distinct from a valid -1
 pub(crate) fn scan_int_line(buf: &[u8], pos: usize) -> Option<(i64, usize)> {
     let end = find_crlf(buf, pos)?;
     let line = &buf[pos..end - 2];

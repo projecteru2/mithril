@@ -1037,9 +1037,15 @@ impl Session {
                 self.emit_local(Bytes::from_static(resp::OK));
             }
             Some(b"getname") => {
-                let mut out = Vec::new();
-                resp::bulk(&mut out, self.name.borrow().as_bytes());
-                self.emit_local(out);
+                let name = self.name.borrow();
+                if name.is_empty() {
+                    self.emit_local(Bytes::from_static(resp::NIL_BULK));
+                } else {
+                    let mut out = Vec::new();
+                    resp::bulk(&mut out, name.as_bytes());
+                    drop(name);
+                    self.emit_local(out);
+                }
             }
             _ => self.emit_error("ERR unsupported CLIENT subcommand"),
         }
@@ -1184,6 +1190,7 @@ impl Session {
 
     fn do_reset(&self) {
         *self.multi.borrow_mut() = None;
+        self.name.borrow_mut().clear();
         self.proto.set(2);
         self.link.proto_switches.push(self.next_seq.get(), 2);
         self.authed.set(self.shared.cfg.requirepass.is_empty());
@@ -1200,7 +1207,7 @@ impl Session {
     }
 
     fn window_full(&self) -> bool {
-        self.outstanding() > MAX_INFLIGHT as u64
+        self.outstanding() >= MAX_INFLIGHT as u64
     }
 
     fn alloc_seq(&self) -> u64 {
@@ -1657,6 +1664,8 @@ async fn pubsub_relay(
         Err(e) => {
             log_debug!("pubsub dial {addr}: {e}");
             backfill_acks(&link, &reply_q);
+            mark_closed(&link);
+            let _ = reply_q.send(Reply::Close);
             return;
         }
     };
@@ -1855,8 +1864,8 @@ async fn write_loop(
                 }
             }
         }
-        // pass 1 processes the woken batch; one yield then coalesces every
-        // ready backend's deliveries into the same flush
+        // pass 1 processes the woken batch; one yield lets already-delivered
+        // replies join the same flush
         for pass in 0..2 {
             for reply in batch.drain(..) {
                 let (seq, mut frame) = match reply {
