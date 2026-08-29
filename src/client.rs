@@ -78,7 +78,9 @@ impl std::hash::Hasher for TokenHasher {
     }
 
     fn write_u64(&mut self, n: u64) {
-        self.0 = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        // worker-strided tokens share low bits; fold the mixed high bits back
+        let h = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = h ^ (h >> 32);
     }
 }
 
@@ -87,18 +89,25 @@ pub async fn intake_loop(
     mut rx: mpsc::UnboundedReceiver<crate::shard::ReplyBatch>,
     registry: Registry,
 ) {
-    let mut batches = Vec::with_capacity(crate::backend::BATCH);
+    const INTAKE_BATCHES: usize = 32;
+    let mut batches = Vec::with_capacity(INTAKE_BATCHES);
     loop {
-        if rx.recv_many(&mut batches, crate::backend::BATCH).await == 0 {
+        if rx.recv_many(&mut batches, INTAKE_BATCHES).await == 0 {
             return;
         }
-        let registry = registry.borrow();
-        for batch in batches.drain(..) {
-            for r in batch {
-                if let Some(q) = registry.get(&r.token) {
-                    let _ = q.send(Reply::At(r.seq, r.frame));
+        {
+            let registry = registry.borrow();
+            for batch in batches.drain(..) {
+                for r in batch {
+                    if let Some(q) = registry.get(&r.token) {
+                        let _ = q.send(Reply::At(r.seq, r.frame));
+                    }
                 }
             }
+        }
+        // a deep backlog must not starve this worker's sessions
+        if !rx.is_empty() {
+            tokio::task::yield_now().await;
         }
     }
 }
