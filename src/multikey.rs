@@ -1,5 +1,7 @@
 //! Multi-key fan-out: split keys per owner node, merge partial replies.
 
+use std::collections::HashMap;
+
 use bytes::Bytes;
 
 use crate::resp;
@@ -14,6 +16,25 @@ pub struct Part {
     pub positions: Vec<usize>,
 }
 
+/// Multiply-fold hasher for u16 slot keys.
+#[derive(Default)]
+struct SlotHasher(u64);
+
+impl std::hash::Hasher for SlotHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, _bytes: &[u8]) {
+        unreachable!("slot keys hash as u16");
+    }
+
+    fn write_u16(&mut self, n: u16) {
+        let h = u64::from(n).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = h ^ (h >> 32);
+    }
+}
+
 /// Groups keys per slot (nodes reject cross-slot multi-key commands).
 pub fn split<'k, F>(
     name: &'k [u8],
@@ -24,29 +45,32 @@ pub fn split<'k, F>(
 where
     F: FnMut(u16) -> Option<(u16, bool)>,
 {
-    // a handful of slots per command: a linear probe beats hashing
-    type Group<'a> = (u16, (u16, bool), Vec<&'a [u8]>, Vec<usize>);
+    type Group<'a> = ((u16, bool), Vec<&'a [u8]>, Vec<usize>);
     let mut parts: Vec<Group<'k>> = Vec::new();
+    // adversarial key sets span thousands of slots: stay O(1) per key
+    let mut by_slot: HashMap<u16, usize, std::hash::BuildHasherDefault<SlotHasher>> =
+        HashMap::default();
     for (i, key) in keys.iter().enumerate() {
         let slot = crate::crc16::slot(key);
-        let g = match parts.iter().position(|g| g.0 == slot) {
-            Some(g) => g,
+        let g = match by_slot.get(&slot) {
+            Some(&g) => g,
             None => {
                 let node = route(slot).ok_or_else(|| "slot has no owner".to_string())?;
-                parts.push((slot, node, vec![name], Vec::new()));
+                by_slot.insert(slot, parts.len());
+                parts.push((node, vec![name], Vec::new()));
                 parts.len() - 1
             }
         };
         let entry = &mut parts[g];
-        entry.2.push(key);
+        entry.1.push(key);
         if let Some(vals) = values {
-            entry.2.push(vals[i]);
+            entry.1.push(vals[i]);
         }
-        entry.3.push(i);
+        entry.2.push(i);
     }
     Ok(parts
         .into_iter()
-        .map(|(_, (node, readonly), args, positions)| {
+        .map(|((node, readonly), args, positions)| {
             let mut frame = Vec::new();
             resp::write_command(&mut frame, &args);
             Part {
