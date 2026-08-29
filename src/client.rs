@@ -1605,6 +1605,8 @@ async fn write_loop(
     impl Drop for ExitBump<'_> {
         fn drop(&mut self) {
             self.reply.closed.set(true);
+            // queued frames must not outlive the writer via lingering backend sinks
+            self.reply.q.borrow_mut().clear();
             mark_closed(self.link);
             stats::bump(&self.shared.stats.workers[self.shared.worker].writers_exited);
             self.link.oob_notify.notify_waiters();
