@@ -84,18 +84,19 @@ struct SharedState {
 
 impl SharedQueue {
     /// Delivers a reply straight from an owner worker.
-    pub fn send(&self, reply: Reply) {
+    pub fn send(&self, reply: Reply) -> Result<(), Reply> {
         let Ok(mut state) = self.state.lock() else {
-            return;
+            return Err(reply);
         };
         if state.closed {
-            return;
+            return Err(reply);
         }
         state.q.push_back(reply);
         // the writer only parks on an empty queue: notify on that transition
         if state.q.len() == 1 {
             self.bell.notify_one();
         }
+        Ok(())
     }
 }
 
@@ -134,25 +135,12 @@ impl ReplyQueue {
                 }
                 let mut q = q.borrow_mut();
                 q.push_back(reply);
-                // the writer only parks on an empty queue: notify on that transition
                 if q.len() == 1 {
                     bell.notify_one();
                 }
                 Ok(())
             }
-            QueueInner::Shared(sq) => {
-                let Ok(mut state) = sq.state.lock() else {
-                    return Err(reply);
-                };
-                if state.closed {
-                    return Err(reply);
-                }
-                state.q.push_back(reply);
-                if state.q.len() == 1 {
-                    sq.bell.notify_one();
-                }
-                Ok(())
-            }
+            QueueInner::Shared(sq) => sq.send(reply),
         }
     }
 
@@ -383,6 +371,15 @@ impl Session {
 
     // one Vec index per request once warm; re-resolves on epoch or death
     fn cached_pipe(&self, topo: &Topology, idx: u16, is_replica: bool) -> Pipe {
+        {
+            let cache = self.conns.borrow();
+            if cache.epoch == topo.epoch
+                && let Some(Some(pipe)) = cache.by_node.get(idx as usize)
+                && !pipe.is_dead()
+            {
+                return pipe.clone();
+            }
+        }
         let mut cache = self.conns.borrow_mut();
         if cache.epoch != topo.epoch {
             cache.epoch = topo.epoch;
@@ -406,7 +403,6 @@ impl Session {
         pipe
     }
 
-    // queues an ordered client reply on either pipe kind
     fn queue_at(&self, pipe: &Pipe, seq: u64, frame: Bytes, expect: u32) -> Option<Box<ColdSend>> {
         match pipe {
             Pipe::Local(conn) => {
@@ -483,7 +479,6 @@ impl Session {
         Some(self.cached_pipe(&topo, idx, false))
     }
 
-    // sync fast path: the returned box is the rare full-queue leftover to await
     fn route_single(&self, slot: u16, readonly: bool, frame: Bytes) -> Option<Box<ColdSend>> {
         let seq = self.alloc_seq();
         let pipe = {
@@ -622,15 +617,21 @@ impl Session {
                 }
             }
             let total = keys.len();
-            let topo = self.shared.topo.load_full();
+            let topo = self.topo();
             let parts = self.with_rng(|rng| {
                 multikey::split(spec.name.as_bytes(), &keys, values.as_deref(), |slot| {
                     route::pick(&topo, slot, readonly, mode, rng)
                 })
             });
-            parts.map(|p| (p, total, topo))
+            parts.map(|p| {
+                let pipes: Vec<Pipe> = p
+                    .iter()
+                    .map(|part| self.cached_pipe(&topo, part.node, part.readonly))
+                    .collect();
+                (p, pipes, total)
+            })
         };
-        let (parts, total, topo) = match split {
+        let (parts, pipes, total) = match split {
             Ok(v) => v,
             Err(e) => {
                 self.emit_at(seq, error_frame(&format!("CLUSTERDOWN {e}")));
@@ -648,11 +649,9 @@ impl Session {
         // detached deliberately: completion is bounded by backend replies.
         tokio::task::spawn_local(async move {
             let mut receivers = Vec::with_capacity(parts.len());
-            for part in &parts {
-                let addr = &topo.nodes[part.node as usize].addr;
+            for (part, pipe) in parts.iter().zip(pipes) {
                 // the clone retains the frame for a possible redirect resend
-                let rx =
-                    scatter_one(&shared, addr, id, part.readonly, None, part.frame.clone()).await;
+                let rx = scatter_pipe(pipe, part.frame.clone()).await;
                 receivers.push(rx);
             }
             let mut results: Vec<(Vec<usize>, Bytes)> = Vec::with_capacity(parts.len());
@@ -824,7 +823,7 @@ impl Session {
 
     fn handle_local(&self, spec: &Spec, frame: Bytes, argc: usize) {
         if spec.name == "ping" && argc == 1 {
-            self.emit_local(Bytes::from_static(b"+PONG\r\n"));
+            self.emit_local(Bytes::from_static(resp::PONG));
             return;
         }
         let reply: Option<Bytes> = {
@@ -845,11 +844,7 @@ impl Session {
                     &self.shared.cfg,
                     self.proto.get(),
                 ))),
-                "command" => Some(Bytes::from(admin::command_reply(
-                    &args,
-                    command::table(),
-                    self.proto.get(),
-                ))),
+                "command" => Some(Bytes::from(admin::command_reply(&args, self.proto.get()))),
                 "auth" => {
                     self.handle_auth(&args);
                     None
@@ -861,7 +856,7 @@ impl Session {
                 "acl" => match args.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
                     Some(b"whoami") => {
                         let mut out = Vec::new();
-                        admin::bulk(&mut out, b"default");
+                        resp::bulk(&mut out, b"default");
                         Some(Bytes::from(out))
                     }
                     _ => Some(error_frame("ERR unsupported ACL subcommand")),
@@ -872,7 +867,7 @@ impl Session {
                 }
                 "quit" => {
                     self.closing.set(true);
-                    Some(Bytes::from_static(admin::OK))
+                    Some(Bytes::from_static(resp::OK))
                 }
                 "reset" => {
                     self.do_reset();
@@ -888,12 +883,12 @@ impl Session {
                             bytes: 0,
                             aborted: false,
                         });
-                        Some(Bytes::from_static(admin::OK))
+                        Some(Bytes::from_static(resp::OK))
                     }
                 }
                 "discard" => {
                     if self.multi.borrow_mut().take().is_some() {
-                        Some(Bytes::from_static(admin::OK))
+                        Some(Bytes::from_static(resp::OK))
                     } else {
                         Some(error_frame("ERR DISCARD without MULTI"))
                     }
@@ -950,7 +945,7 @@ impl Session {
         };
         if given == Some(pass) {
             self.authed.set(true);
-            self.emit_local(Bytes::from_static(admin::OK));
+            self.emit_local(Bytes::from_static(resp::OK));
         } else {
             self.emit_error("WRONGPASS invalid username-password pair or user is disabled.");
         }
@@ -1013,19 +1008,19 @@ impl Session {
         } else {
             out.extend_from_slice(b"*14\r\n");
         }
-        admin::bulk(&mut out, b"server");
-        admin::bulk(&mut out, b"redis");
-        admin::bulk(&mut out, b"version");
-        admin::bulk(&mut out, admin::SERVER_VERSION.as_bytes());
-        admin::bulk(&mut out, b"proto");
-        admin::integer(&mut out, i64::from(proto));
-        admin::bulk(&mut out, b"id");
-        admin::integer(&mut out, self.id as i64);
-        admin::bulk(&mut out, b"mode");
-        admin::bulk(&mut out, b"cluster");
-        admin::bulk(&mut out, b"role");
-        admin::bulk(&mut out, b"master");
-        admin::bulk(&mut out, b"modules");
+        resp::bulk(&mut out, b"server");
+        resp::bulk(&mut out, b"redis");
+        resp::bulk(&mut out, b"version");
+        resp::bulk(&mut out, admin::SERVER_VERSION.as_bytes());
+        resp::bulk(&mut out, b"proto");
+        resp::integer(&mut out, i64::from(proto));
+        resp::bulk(&mut out, b"id");
+        resp::integer(&mut out, self.id as i64);
+        resp::bulk(&mut out, b"mode");
+        resp::bulk(&mut out, b"cluster");
+        resp::bulk(&mut out, b"role");
+        resp::bulk(&mut out, b"master");
+        resp::bulk(&mut out, b"modules");
         out.extend_from_slice(b"*0\r\n");
         self.emit_local(out);
     }
@@ -1034,16 +1029,16 @@ impl Session {
         match args.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
             Some(b"id") => {
                 let mut out = Vec::new();
-                admin::integer(&mut out, self.id as i64);
+                resp::integer(&mut out, self.id as i64);
                 self.emit_local(out);
             }
             Some(b"setname") if args.len() == 3 => {
                 *self.name.borrow_mut() = String::from_utf8_lossy(args[2]).into_owned();
-                self.emit_local(Bytes::from_static(admin::OK));
+                self.emit_local(Bytes::from_static(resp::OK));
             }
             Some(b"getname") => {
                 let mut out = Vec::new();
-                admin::bulk(&mut out, self.name.borrow().as_bytes());
+                resp::bulk(&mut out, self.name.borrow().as_bytes());
                 self.emit_local(out);
             }
             _ => self.emit_error("ERR unsupported CLIENT subcommand"),
@@ -1090,7 +1085,7 @@ impl Session {
         match spec.name {
             "quit" => {
                 self.closing.set(true);
-                self.emit_local(Bytes::from_static(admin::OK));
+                self.emit_local(Bytes::from_static(resp::OK));
                 return;
             }
             "reset" => {
@@ -1128,7 +1123,7 @@ impl Session {
     fn pubsub_overflow(&self, spec: &Spec, frame: &Bytes, argc: usize) -> bool {
         let subs = self.subs.borrow();
         let expected = subs.ack_count(spec.name.as_bytes(), argc);
-        let outstanding = self.next_seq.get().saturating_sub(self.link.emitted.get()) as usize;
+        let outstanding = self.outstanding() as usize;
         if outstanding + expected > MAX_INFLIGHT {
             return true;
         }
@@ -1200,8 +1195,12 @@ impl Session {
         }
     }
 
+    fn outstanding(&self) -> u64 {
+        self.next_seq.get().saturating_sub(self.link.emitted.get())
+    }
+
     fn window_full(&self) -> bool {
-        self.next_seq.get().saturating_sub(self.link.emitted.get()) > MAX_INFLIGHT as u64
+        self.outstanding() > MAX_INFLIGHT as u64
     }
 
     fn alloc_seq(&self) -> u64 {
@@ -1500,6 +1499,33 @@ fn key_indices(spec: &Spec, argc: usize) -> impl Iterator<Item = usize> {
     (first..end).step_by((spec.step as usize).max(1))
 }
 
+// hot fan-out path: the pipe was resolved through the session cache
+async fn scatter_pipe(pipe: Pipe, frame: Bytes) -> oneshot::Receiver<Bytes> {
+    let (tx, rx) = oneshot::channel();
+    match pipe {
+        Pipe::Local(conn) => {
+            conn.send(Outbound {
+                head: None,
+                frame,
+                expect: 1,
+                sink: Sink::One(tx),
+            })
+            .await;
+        }
+        Pipe::Shard(sender) => {
+            let out = crate::shard::RemoteOutbound {
+                head: None,
+                frame,
+                expect: 1,
+                reply: crate::shard::RemoteSink::One(tx),
+            };
+            // a closed pipe drops the oneshot; the receiver reads that as LOST
+            let _ = sender.send(out).await;
+        }
+    }
+    rx
+}
+
 async fn scatter_one(
     shared: &Rc<Shared>,
     addr: &str,
@@ -1518,7 +1544,6 @@ async fn scatter_one(
                 expect,
                 reply: crate::shard::RemoteSink::One(tx),
             };
-            // a closed pipe drops the oneshot; the receiver reads that as LOST
             let _ = f.pipe(addr, readonly).send(out).await;
         }
         None => {
@@ -1716,8 +1741,7 @@ async fn charge_push(link: &Rc<WriterLink>) -> bool {
 
 // promised confirmation sequences must resolve or the writer never drains past them
 fn backfill_acks(link: &Rc<WriterLink>, reply_q: &Rc<ReplyQueue>) {
-    let drained: Vec<u64> = link.ack_seqs.borrow_mut().drain(..).collect();
-    for seq in drained {
+    while let Some(seq) = link.ack_seqs.borrow_mut().pop_front() {
         let _ = reply_q.send(Reply::Ack(seq, Bytes::from_static(ERR_BACKEND_LOST)));
     }
     link.acks_drained.notify_one();

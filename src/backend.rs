@@ -130,7 +130,9 @@ impl Backends {
             let idle = pool.idle_exclusive.borrow_mut().pop();
             match idle {
                 Some(c) if !c.is_dead() => break c,
-                Some(_) => pool.exclusive_count.set(pool.exclusive_count.get() - 1),
+                Some(_) => pool
+                    .exclusive_count
+                    .set(pool.exclusive_count.get().saturating_sub(1)),
                 None => {
                     if pool.exclusive_count.get() >= MAX_EXCLUSIVE_PER_NODE {
                         return None;
@@ -253,9 +255,46 @@ pub async fn write_slices<W: tokio::io::AsyncWrite + Unpin>(
 }
 
 // reply pairing assumes RESP2 backends: no unsolicited pushes
-struct Pending {
-    expect: u32,
-    sink: Sink,
+pub(crate) struct Pending<S> {
+    pub(crate) expect: u32,
+    pub(crate) sink: S,
+}
+
+// pairs buffered replies against the pipeline; Err is a protocol error
+pub(crate) fn pair_replies<S>(
+    buf: &mut BytesMut,
+    pending: &mut VecDeque<Pending<S>>,
+    front_err: &mut Option<Bytes>,
+    deliver: impl Fn(S, Bytes),
+) -> Result<(), &'static str> {
+    loop {
+        match resp::scan_value(buf) {
+            resp::Scan::Complete(len) => {
+                let frame = buf.split_to(len).freeze();
+                let is_err = frame.first() == Some(&b'-');
+                match pending.front_mut() {
+                    Some(front) if front.expect > 1 => {
+                        front.expect -= 1;
+                        if front_err.is_none() && is_err {
+                            *front_err = Some(frame);
+                        }
+                    }
+                    _ => {
+                        if let Some(d) = pending.pop_front() {
+                            // an aborted MULTI reports its first queued error
+                            let reply = match front_err.take() {
+                                Some(err) if is_err => err,
+                                _ => frame,
+                            };
+                            deliver(d.sink, reply);
+                        }
+                    }
+                }
+            }
+            resp::Scan::Invalid(e) => return Err(e),
+            resp::Scan::Incomplete => return Ok(()),
+        }
+    }
 }
 
 async fn run_conn(
@@ -295,43 +334,16 @@ async fn run_conn(
     };
 
     // one task owns both directions; a dead connection still drains its queue
-    let mut pending: VecDeque<Pending> = VecDeque::new();
+    let mut pending: VecDeque<Pending<Sink>> = VecDeque::new();
     let mut front_err: Option<Bytes> = None;
     let mut batch: Vec<Outbound> = Vec::with_capacity(BATCH);
     let mut frames: Vec<Bytes> = Vec::with_capacity(BATCH * 2);
     let mut buf = BytesMut::with_capacity(READ_INIT);
     let mut tx_open = true;
     'io: loop {
-        loop {
-            match resp::scan_value(&buf) {
-                resp::Scan::Complete(len) => {
-                    let frame = buf.split_to(len).freeze();
-                    let is_err = frame.first() == Some(&b'-');
-                    match pending.front_mut() {
-                        Some(front) if front.expect > 1 => {
-                            front.expect -= 1;
-                            if front_err.is_none() && is_err {
-                                front_err = Some(frame);
-                            }
-                        }
-                        _ => {
-                            if let Some(d) = pending.pop_front() {
-                                // an aborted MULTI reports its first queued error
-                                let reply = match front_err.take() {
-                                    Some(err) if is_err => err,
-                                    _ => frame,
-                                };
-                                deliver(d.sink, reply);
-                            }
-                        }
-                    }
-                }
-                resp::Scan::Invalid(e) => {
-                    log_debug!("backend {addr} protocol error: {e}");
-                    break 'io;
-                }
-                resp::Scan::Incomplete => break,
-            }
+        if let Err(e) = pair_replies(&mut buf, &mut pending, &mut front_err, deliver) {
+            log_debug!("backend {addr} protocol error: {e}");
+            break 'io;
         }
         if !tx_open && pending.is_empty() {
             break 'io;

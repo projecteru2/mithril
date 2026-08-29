@@ -60,22 +60,33 @@ impl<'a> Args<'a> {
 impl<'a> Iterator for Args<'a> {
     type Item = &'a [u8];
 
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+
     fn next(&mut self) -> Option<&'a [u8]> {
         if self.remaining == 0 {
             return None;
         }
         self.remaining -= 1;
         match scan_bulk(self.buf, self.pos)? {
-            Ok((payload, end)) => {
-                self.pos = end;
-                Some(&self.buf[payload.0..payload.1])
+            Ok(b) => {
+                self.pos = b.next;
+                Some(&self.buf[b.payload_start..b.payload_end])
             }
             Err(_) => None,
         }
     }
 }
 
-type BulkScan = Option<Result<((usize, usize), usize), &'static str>>;
+// a null bulk carries no payload: all three offsets coincide
+struct Bulk {
+    payload_start: usize,
+    payload_end: usize,
+    next: usize,
+}
+
+type BulkScan = Option<Result<Bulk, &'static str>>;
 
 /// Scans one complete RESP value of any protocol version at `buf[0..]`.
 pub fn scan_value(buf: &[u8]) -> Scan {
@@ -106,12 +117,11 @@ pub fn scan_request(buf: &[u8]) -> ReqScan {
             return ReqScan::Invalid("verbatim string in request");
         }
         match scan_bulk(buf, pos) {
-            Some(Ok((payload, end))) => {
-                // scan_bulk encodes a null bulk as payload.1 == end.
-                if payload.1 == end {
+            Some(Ok(b)) => {
+                if b.payload_end == b.next {
                     return ReqScan::Invalid("null argument in request");
                 }
-                pos = end;
+                pos = b.next;
             }
             Some(Err(e)) => return ReqScan::Invalid(e),
             None => return ReqScan::Incomplete,
@@ -137,6 +147,25 @@ pub fn write_command(out: &mut Vec<u8>, args: &[&[u8]]) {
 }
 
 /// Appends a RESP array header.
+pub const OK: &[u8] = b"+OK\r\n";
+pub const PONG: &[u8] = b"+PONG\r\n";
+
+/// Appends one bulk string frame.
+pub fn bulk(out: &mut Vec<u8>, payload: &[u8]) {
+    out.push(b'$');
+    push_usize(out, payload.len());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(payload);
+    out.extend_from_slice(b"\r\n");
+}
+
+/// Appends one integer frame.
+pub fn integer(out: &mut Vec<u8>, n: i64) {
+    out.push(b':');
+    push_i64(out, n);
+    out.extend_from_slice(b"\r\n");
+}
+
 pub(crate) fn array_header(out: &mut Vec<u8>, n: usize) {
     out.push(b'*');
     push_usize(out, n);
@@ -241,7 +270,7 @@ pub fn split_inline(line: &[u8]) -> Option<Vec<Vec<u8>>> {
 // i64::MIN marks a malformed integer line; every caller rejects negatives.
 pub(crate) fn scan_int_line(buf: &[u8], pos: usize) -> Option<(i64, usize)> {
     let end = find_crlf(buf, pos)?;
-    let line = &buf[pos..pos + (end - pos) - 2];
+    let line = &buf[pos..end - 2];
     let (neg, digits) = match line.first() {
         Some(b'-') => (true, &line[1..]),
         _ => (false, line),
@@ -308,7 +337,7 @@ fn scan_at(buf: &[u8], pos: usize, depth: usize) -> Option<Scan> {
             Some(Scan::Complete(end - pos))
         }
         b'$' | b'=' => match scan_bulk(buf, pos)? {
-            Ok((_, end)) => Some(Scan::Complete(end - pos)),
+            Ok(b) => Some(Scan::Complete(b.next - pos)),
             Err(e) => Some(Scan::Invalid(e)),
         },
         b'*' | b'~' | b'>' | b'%' => {
@@ -351,7 +380,11 @@ fn scan_bulk(buf: &[u8], pos: usize) -> BulkScan {
     }
     let (n, body) = scan_int_line(buf, pos + 1)?;
     if n == -1 {
-        return Some(Ok(((body, body), body)));
+        return Some(Ok(Bulk {
+            payload_start: body,
+            payload_end: body,
+            next: body,
+        }));
     }
     if n < 0 || n as usize > MAX_BULK_LEN {
         return Some(Err("bad bulk length"));
@@ -363,7 +396,11 @@ fn scan_bulk(buf: &[u8], pos: usize) -> BulkScan {
     if &buf[end - 2..end] != b"\r\n" {
         return Some(Err("bulk missing terminator"));
     }
-    Some(Ok(((body, end - 2), end)))
+    Some(Ok(Bulk {
+        payload_start: body,
+        payload_end: end - 2,
+        next: end,
+    }))
 }
 
 fn hex_val(b: u8) -> Option<u8> {

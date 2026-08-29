@@ -120,7 +120,7 @@ impl Config {
             "port" => self.port = parse(key, value)?,
             "announce-addr" => self.announce_addr = value.to_string(),
             "worker-threads" => self.workers = parse(key, value)?,
-            "maxclients" => self.maxclients = parse(key, value)?,
+            "maxclients" => self.maxclients = parse_bounded(key, value, 1, 1_000_000)?,
             "bootstrap" => {
                 self.bootstrap = value.split(',').map(|s| s.trim().to_string()).collect();
             }
@@ -158,6 +158,9 @@ impl Config {
         }
         if self.announce_addr.is_empty() {
             self.announce_addr = format!("{}:{}", self.bind, self.port);
+        }
+        if self.announce_addr.starts_with("0.0.0.0") {
+            crate::log_warn!("announce-addr resolves to 0.0.0.0; set it for cluster clients");
         }
         if self.backend_sharding && self.backend_conns > 1 {
             crate::log_warn!("backend-conns is ignored under backend-sharding");

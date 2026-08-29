@@ -1,6 +1,6 @@
 //! Static command table: name, arity, flags, key positions, and routing kind.
 
-pub const MAX_NAME: usize = 24;
+const MAX_NAME: usize = 24;
 
 pub const FLAG_WRITE: u8 = 1;
 pub const FLAG_READONLY: u8 = 1 << 1;
@@ -19,7 +19,9 @@ const R: u8 = FLAG_READONLY;
 const N: u8 = FLAG_NO_AUTH;
 const T: u8 = FLAG_TXN_CTRL;
 
-// sorted by name; a test enforces order and lookup-key uniqueness
+// sorted for browsing; a test enforces lookup-key order and uniqueness
+static LUT: [u16; LUT_LEN] = build_lut();
+
 static TABLE: &[Spec] = &[
     c("acl", -2, 0, 0, 0, 0, Kind::Local),
     c("append", 3, W, 1, 1, 1, Kind::Single),
@@ -284,8 +286,6 @@ fn tail_eq(spec: &Spec, name: &[u8]) -> bool {
             .zip(&name[PREFIX_LEN..])
             .all(|(t, n)| *t == n.to_ascii_lowercase())
 }
-
-static LUT: [u16; LUT_LEN] = build_lut();
 
 const fn lut_hash(prefix: u64, len: u8) -> usize {
     let h = (prefix ^ len as u64).wrapping_mul(0x9E3779B97F4A7C15);

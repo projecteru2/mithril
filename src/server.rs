@@ -20,12 +20,12 @@ use crate::stats::Stats;
 use crate::topology::Topology;
 use crate::{log_notice, log_warn, resp};
 
-pub const REFRESH_DEBOUNCE: Duration = Duration::from_millis(100);
-pub const BOOTSTRAP_RETRY: Duration = Duration::from_secs(1);
-pub const BOOTSTRAP_ROUNDS: usize = 30;
-pub const LISTEN_BACKLOG: i32 = 1024;
-pub const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
-pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const REFRESH_DEBOUNCE: Duration = Duration::from_millis(100);
+const BOOTSTRAP_RETRY: Duration = Duration::from_secs(1);
+const BOOTSTRAP_ROUNDS: usize = 30;
+const LISTEN_BACKLOG: i32 = 1024;
+const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_POLL: Duration = Duration::from_millis(200);
 const ACCEPT_QUEUE: usize = 1024;
 // worker-activity snapshot cadence for least-loaded placement
@@ -38,7 +38,7 @@ type ShardWiring = (Arc<shard::Fabric>, mpsc::UnboundedReceiver<shard::NewConn>)
 
 static TOPO_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Set on SIGINT/SIGTERM; accept loops stop taking new connections.
-pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Runs the proxy until SIGINT/SIGTERM; Err on fatal startup failure.
 pub fn run(cfg: Config) -> Result<(), String> {
@@ -209,8 +209,6 @@ fn acceptor_thread(
         let mut placed = vec![0u64; conn_txs.len()];
         let mut order: Vec<usize> = Vec::with_capacity(conn_txs.len());
         let least_loaded = cfg.placement == Placement::LeastLoaded;
-        // least-loaded samples worker activity per window; round-robin only
-        // needs a shutdown poll
         let period = if least_loaded {
             SNAP_WINDOW
         } else {
@@ -348,7 +346,6 @@ fn worker_thread(
     });
 }
 
-// converts the window's command deltas straight into sort buckets
 fn refresh_buckets(stats: &Stats, snap: &mut [u64], buckets: &mut [u64], placed: &mut [u64]) {
     let mut total = 0u64;
     for i in 0..snap.len() {

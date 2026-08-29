@@ -10,12 +10,10 @@ use crate::resp;
 use crate::stats::Stats;
 
 pub const SERVER_VERSION: &str = "7.4.0";
-pub const CLUSTER_BUS_OFFSET: u32 = 10000;
-pub const OK: &[u8] = b"+OK\r\n";
-pub const PONG: &[u8] = b"+PONG\r\n";
+const CLUSTER_BUS_OFFSET: u32 = 10000;
 
 /// Emulated node id: 40 hex chars derived from the announce address.
-pub fn node_id(announce: &str) -> String {
+fn node_id(announce: &str) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in announce.as_bytes() {
         h ^= u64::from(b);
@@ -32,25 +30,11 @@ pub fn node_id(announce: &str) -> String {
     id
 }
 
-pub fn bulk(out: &mut Vec<u8>, payload: &[u8]) {
-    out.push(b'$');
-    resp::push_usize(out, payload.len());
-    out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(payload);
-    out.extend_from_slice(b"\r\n");
-}
-
-pub fn integer(out: &mut Vec<u8>, n: i64) {
-    out.push(b':');
-    resp::push_i64(out, n);
-    out.extend_from_slice(b"\r\n");
-}
-
 pub fn ping(args: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::new();
     match args.len() {
-        1 => out.extend_from_slice(PONG),
-        2 => bulk(&mut out, args[1]),
+        1 => out.extend_from_slice(resp::PONG),
+        2 => resp::bulk(&mut out, args[1]),
         _ => resp::write_error(&mut out, "ERR wrong number of arguments for 'ping' command"),
     }
     out
@@ -59,7 +43,7 @@ pub fn ping(args: &[&[u8]]) -> Vec<u8> {
 pub fn echo(args: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::new();
     match args.len() {
-        2 => bulk(&mut out, args[1]),
+        2 => resp::bulk(&mut out, args[1]),
         _ => resp::write_error(&mut out, "ERR wrong number of arguments for 'echo' command"),
     }
     out
@@ -68,7 +52,7 @@ pub fn echo(args: &[&[u8]]) -> Vec<u8> {
 pub fn select(args: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::new();
     if args.len() == 2 && args[1] == b"0" {
-        out.extend_from_slice(OK);
+        out.extend_from_slice(resp::OK);
     } else {
         resp::write_error(&mut out, "ERR SELECT is not allowed in cluster mode");
     }
@@ -81,22 +65,22 @@ pub fn time() -> Vec<u8> {
         .unwrap_or_default();
     let mut out = Vec::new();
     out.extend_from_slice(b"*2\r\n");
-    bulk(&mut out, now.as_secs().to_string().as_bytes());
-    bulk(&mut out, now.subsec_micros().to_string().as_bytes());
+    resp::bulk(&mut out, now.as_secs().to_string().as_bytes());
+    resp::bulk(&mut out, now.subsec_micros().to_string().as_bytes());
     out
 }
 
-pub fn command_reply(args: &[&[u8]], table: &[Spec], proto: u8) -> Vec<u8> {
+pub fn command_reply(args: &[&[u8]], proto: u8) -> Vec<u8> {
     let mut out = Vec::new();
     let sub = args.get(1).map(|s| s.to_ascii_lowercase());
     match sub.as_deref() {
         None => {
-            resp::array_header(&mut out, table.len());
-            for spec in table {
+            resp::array_header(&mut out, crate::command::table().len());
+            for spec in crate::command::table() {
                 command_entry(&mut out, spec);
             }
         }
-        Some(b"count") => integer(&mut out, table.len() as i64),
+        Some(b"count") => resp::integer(&mut out, crate::command::table().len() as i64),
         Some(b"docs") => {
             out.extend_from_slice(if proto >= 3 { b"%0\r\n" } else { b"*0\r\n" });
         }
@@ -125,11 +109,11 @@ pub fn cluster(args: &[&[u8]], cfg: &Config, proto: u8) -> Vec<u8> {
             let text = "cluster_enabled:1\r\ncluster_state:ok\r\ncluster_slots_assigned:16384\r\n\
                  cluster_slots_ok:16384\r\ncluster_slots_pfail:0\r\ncluster_slots_fail:0\r\n\
                  cluster_known_nodes:1\r\ncluster_size:1\r\n";
-            bulk(&mut out, text.as_bytes());
+            resp::bulk(&mut out, text.as_bytes());
         }
-        b"myid" => bulk(&mut out, node_id(&cfg.announce_addr).as_bytes()),
+        b"myid" => resp::bulk(&mut out, node_id(&cfg.announce_addr).as_bytes()),
         b"keyslot" => match args.get(2) {
-            Some(key) => integer(&mut out, i64::from(crc16::slot(key))),
+            Some(key) => resp::integer(&mut out, i64::from(crc16::slot(key))),
             None => resp::write_error(&mut out, "ERR wrong number of arguments"),
         },
         b"nodes" => {
@@ -139,17 +123,17 @@ pub fn cluster(args: &[&[u8]], cfg: &Config, proto: u8) -> Vec<u8> {
                 node_id(&cfg.announce_addr),
                 port as u32 + CLUSTER_BUS_OFFSET,
             );
-            bulk(&mut out, line.as_bytes());
+            resp::bulk(&mut out, line.as_bytes());
         }
         b"slots" => {
             let (host, port) = split_announce(&cfg.announce_addr);
             out.extend_from_slice(b"*1\r\n*3\r\n");
-            integer(&mut out, 0);
-            integer(&mut out, SLOTS as i64 - 1);
+            resp::integer(&mut out, 0);
+            resp::integer(&mut out, SLOTS as i64 - 1);
             out.extend_from_slice(b"*3\r\n");
-            bulk(&mut out, host.as_bytes());
-            integer(&mut out, i64::from(port));
-            bulk(&mut out, node_id(&cfg.announce_addr).as_bytes());
+            resp::bulk(&mut out, host.as_bytes());
+            resp::integer(&mut out, i64::from(port));
+            resp::bulk(&mut out, node_id(&cfg.announce_addr).as_bytes());
         }
         b"shards" => {
             let open = if proto >= 3 {
@@ -159,11 +143,11 @@ pub fn cluster(args: &[&[u8]], cfg: &Config, proto: u8) -> Vec<u8> {
             };
             out.extend_from_slice(b"*1\r\n");
             out.extend_from_slice(open);
-            bulk(&mut out, b"slots");
+            resp::bulk(&mut out, b"slots");
             out.extend_from_slice(b"*2\r\n");
-            integer(&mut out, 0);
-            integer(&mut out, SLOTS as i64 - 1);
-            bulk(&mut out, b"nodes");
+            resp::integer(&mut out, 0);
+            resp::integer(&mut out, SLOTS as i64 - 1);
+            resp::bulk(&mut out, b"nodes");
             out.extend_from_slice(b"*1\r\n");
             shard_node(&mut out, cfg, proto);
         }
@@ -214,7 +198,7 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
             .join(","),
     );
     let mut out = Vec::new();
-    bulk(&mut out, text.as_bytes());
+    resp::bulk(&mut out, text.as_bytes());
     out
 }
 
@@ -227,22 +211,22 @@ pub fn config_cmd(args: &[&[u8]], cfg: &Config) -> Vec<u8> {
     match sub.as_slice() {
         b"get" if args.len() == 3 => {
             let pairs = config_pairs(cfg);
-            let pattern = String::from_utf8_lossy(args[2]);
+            let pattern = String::from_utf8_lossy(args[2]).to_ascii_lowercase();
             let matched: Vec<_> = pairs
                 .iter()
-                .filter(|(k, _)| pattern == "*" || *k == pattern.as_ref())
+                .filter(|(k, _)| pattern == "*" || *k == pattern)
                 .collect();
             resp::array_header(&mut out, matched.len() * 2);
             for (k, v) in matched {
-                bulk(&mut out, k.as_bytes());
-                bulk(&mut out, v.as_bytes());
+                resp::bulk(&mut out, k.as_bytes());
+                resp::bulk(&mut out, v.as_bytes());
             }
         }
-        b"set" if args.len() == 4 => match (args[2], args[3]) {
+        b"set" if args.len() == 4 => match (args[2].to_ascii_lowercase().as_slice(), args[3]) {
             (b"loglevel", v) => match crate::log::parse_level(&String::from_utf8_lossy(v)) {
                 Ok(level) => {
                     crate::log::set_level(level);
-                    out.extend_from_slice(OK);
+                    out.extend_from_slice(resp::OK);
                 }
                 Err(e) => resp::write_error(&mut out, &format!("ERR {e}")),
             },
@@ -255,8 +239,8 @@ pub fn config_cmd(args: &[&[u8]], cfg: &Config) -> Vec<u8> {
 
 fn command_entry(out: &mut Vec<u8>, spec: &Spec) {
     out.extend_from_slice(b"*6\r\n");
-    bulk(out, spec.name.as_bytes());
-    integer(out, i64::from(spec.arity));
+    resp::bulk(out, spec.name.as_bytes());
+    resp::integer(out, i64::from(spec.arity));
     let mut flags: Vec<&[u8]> = Vec::new();
     if spec.is_write() {
         flags.push(b"write");
@@ -271,40 +255,37 @@ fn command_entry(out: &mut Vec<u8>, spec: &Spec) {
         out.extend_from_slice(f);
         out.extend_from_slice(b"\r\n");
     }
-    integer(out, i64::from(spec.first_key));
-    integer(out, i64::from(spec.last_key));
-    integer(out, i64::from(spec.step));
+    resp::integer(out, i64::from(spec.first_key));
+    resp::integer(out, i64::from(spec.last_key));
+    resp::integer(out, i64::from(spec.step));
 }
 
 fn shard_node(out: &mut Vec<u8>, cfg: &Config, proto: u8) {
     let (host, port) = split_announce(&cfg.announce_addr);
     out.extend_from_slice(if proto >= 3 { b"%6\r\n" } else { b"*12\r\n" });
-    bulk(out, b"id");
-    bulk(out, node_id(&cfg.announce_addr).as_bytes());
-    bulk(out, b"endpoint");
-    bulk(out, host.as_bytes());
-    bulk(out, b"port");
-    integer(out, i64::from(port));
-    bulk(out, b"role");
-    bulk(out, b"master");
-    bulk(out, b"replication-offset");
-    integer(out, 0);
-    bulk(out, b"health");
-    bulk(out, b"online");
+    resp::bulk(out, b"id");
+    resp::bulk(out, node_id(&cfg.announce_addr).as_bytes());
+    resp::bulk(out, b"endpoint");
+    resp::bulk(out, host.as_bytes());
+    resp::bulk(out, b"port");
+    resp::integer(out, i64::from(port));
+    resp::bulk(out, b"role");
+    resp::bulk(out, b"master");
+    resp::bulk(out, b"replication-offset");
+    resp::integer(out, 0);
+    resp::bulk(out, b"health");
+    resp::bulk(out, b"online");
 }
 
-fn split_announce(announce: &str) -> (String, u16) {
+fn split_announce(announce: &str) -> (&str, u16) {
     match announce.rsplit_once(':') {
-        Some((h, p)) => (
-            h.to_string(),
-            p.parse().unwrap_or(crate::config::DEFAULT_PORT),
-        ),
-        None => (announce.to_string(), crate::config::DEFAULT_PORT),
+        Some((h, p)) => (h, p.parse().unwrap_or(crate::config::DEFAULT_PORT)),
+        None => (announce, crate::config::DEFAULT_PORT),
     }
 }
 
-fn yesno(v: bool) -> String {
-    if v { "yes" } else { "no" }.to_string()
+fn yesno(v: bool) -> &'static str {
+    if v { "yes" } else { "no" }
 }
 
 fn config_pairs(cfg: &Config) -> Vec<(&'static str, String)> {
@@ -316,7 +297,7 @@ fn config_pairs(cfg: &Config) -> Vec<(&'static str, String)> {
         ("maxclients", cfg.maxclients.to_string()),
         ("bootstrap", cfg.bootstrap.join(",")),
         ("backend-conns", cfg.backend_conns.to_string()),
-        ("backend-sharding", yesno(cfg.backend_sharding)),
+        ("backend-sharding", yesno(cfg.backend_sharding).to_string()),
         (
             "requirepass",
             if cfg.requirepass.is_empty() {

@@ -1,7 +1,7 @@
 //! Cross-worker backend sharding: one pipelined connection per node, owned by
 //! the worker its address hashes to; other workers hand requests across.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -11,7 +11,6 @@ use tokio::sync::{mpsc, oneshot};
 use crate::backend::{BATCH, ERR_BACKEND_LOST, OUTBOUND_QUEUE, ensure_read_room, write_slices};
 use crate::config::Config;
 use crate::log_debug;
-use crate::resp;
 
 /// A request crossing to a node-owner worker.
 pub struct RemoteOutbound {
@@ -113,10 +112,6 @@ async fn run_shard_conn(
     mut rx: mpsc::Receiver<RemoteOutbound>,
     cfg: &Config,
 ) {
-    struct Pending {
-        expect: u32,
-        reply: RemoteSink,
-    }
     let setup = async {
         let stream = crate::backend::connect(addr, cfg.tcp_keepalive_secs)
             .await
@@ -140,41 +135,17 @@ async fn run_shard_conn(
             return;
         }
     };
-    let mut pending: std::collections::VecDeque<Pending> = std::collections::VecDeque::new();
+    let mut pending: VecDeque<crate::backend::Pending<RemoteSink>> = VecDeque::new();
     let mut front_err: Option<Bytes> = None;
     let mut batch: Vec<RemoteOutbound> = Vec::with_capacity(BATCH);
     let mut frames: Vec<Bytes> = Vec::with_capacity(BATCH * 2);
     let mut buf = bytes::BytesMut::with_capacity(crate::backend::READ_INIT);
     'io: loop {
-        loop {
-            match resp::scan_value(&buf) {
-                resp::Scan::Complete(len) => {
-                    let frame = buf.split_to(len).freeze();
-                    let is_err = frame.first() == Some(&b'-');
-                    match pending.front_mut() {
-                        Some(front) if front.expect > 1 => {
-                            front.expect -= 1;
-                            if front_err.is_none() && is_err {
-                                front_err = Some(frame);
-                            }
-                        }
-                        _ => {
-                            if let Some(d) = pending.pop_front() {
-                                let reply = match front_err.take() {
-                                    Some(err) if is_err => err,
-                                    _ => frame,
-                                };
-                                deliver(d.reply, reply);
-                            }
-                        }
-                    }
-                }
-                resp::Scan::Invalid(e) => {
-                    log_debug!("shard backend {addr} protocol error: {e}");
-                    break 'io;
-                }
-                resp::Scan::Incomplete => break,
-            }
+        if let Err(e) =
+            crate::backend::pair_replies(&mut buf, &mut pending, &mut front_err, deliver)
+        {
+            log_debug!("shard backend {addr} protocol error: {e}");
+            break 'io;
         }
         ensure_read_room(&mut buf);
         tokio::select! {
@@ -184,9 +155,9 @@ async fn run_shard_conn(
                 }
                 frames.clear();
                 for out in batch.drain(..) {
-                    pending.push_back(Pending {
+                    pending.push_back(crate::backend::Pending {
                         expect: out.expect,
-                        reply: out.reply,
+                        sink: out.reply,
                     });
                     if let Some(h) = out.head {
                         frames.push(h);
@@ -208,16 +179,15 @@ async fn run_shard_conn(
         }
     }
     for p in pending.drain(..) {
-        deliver(p.reply, Bytes::from_static(ERR_BACKEND_LOST));
+        deliver(p.sink, Bytes::from_static(ERR_BACKEND_LOST));
     }
     drain(&mut rx);
 }
 
-// a shared queue takes the reply directly; oneshot sinks resolve in place
 fn deliver(reply: RemoteSink, frame: Bytes) {
     match reply {
         RemoteSink::Session { queue, seq } => {
-            queue.send(crate::client::Reply::At(seq, frame));
+            let _ = queue.send(crate::client::Reply::At(seq, frame));
         }
         RemoteSink::One(tx) => {
             let _ = tx.send(frame);

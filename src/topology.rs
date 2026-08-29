@@ -67,7 +67,7 @@ impl Topology {
         }
         for (idx, master_ref) in replica_refs {
             let Some((_, midx)) = master_ids.iter().find(|(id, _)| *id == master_ref) else {
-                return Err(format!("replica {} references unknown master", idx));
+                return Err(format!("replica {idx} references unknown master"));
             };
             if !nodes[idx as usize].fail {
                 nodes[*midx as usize].replicas.push(idx);

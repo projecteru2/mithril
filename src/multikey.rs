@@ -1,7 +1,5 @@
 //! Multi-key fan-out: split keys per owner node, merge partial replies.
 
-use std::collections::HashMap;
-
 use bytes::Bytes;
 
 use crate::resp;
@@ -26,30 +24,29 @@ pub fn split<'k, F>(
 where
     F: FnMut(u16) -> Option<(u16, bool)>,
 {
-    type Group<'a> = ((u16, bool), Vec<&'a [u8]>, Vec<usize>);
+    // a handful of slots per command: a linear probe beats hashing
+    type Group<'a> = (u16, (u16, bool), Vec<&'a [u8]>, Vec<usize>);
     let mut parts: Vec<Group<'k>> = Vec::new();
-    let mut by_slot: HashMap<u16, usize> = HashMap::new();
     for (i, key) in keys.iter().enumerate() {
         let slot = crate::crc16::slot(key);
-        let g = match by_slot.get(&slot) {
-            Some(&g) => g,
+        let g = match parts.iter().position(|g| g.0 == slot) {
+            Some(g) => g,
             None => {
                 let node = route(slot).ok_or_else(|| "slot has no owner".to_string())?;
-                by_slot.insert(slot, parts.len());
-                parts.push((node, vec![name], Vec::new()));
+                parts.push((slot, node, vec![name], Vec::new()));
                 parts.len() - 1
             }
         };
         let entry = &mut parts[g];
-        entry.1.push(key);
+        entry.2.push(key);
         if let Some(vals) = values {
-            entry.1.push(vals[i]);
+            entry.2.push(vals[i]);
         }
-        entry.2.push(i);
+        entry.3.push(i);
     }
     Ok(parts
         .into_iter()
-        .map(|((node, readonly), args, positions)| {
+        .map(|(_, (node, readonly), args, positions)| {
             let mut frame = Vec::new();
             resp::write_command(&mut frame, &args);
             Part {
@@ -63,7 +60,7 @@ where
 }
 
 /// Splits a multi-bulk reply into its top-level element frames.
-pub fn split_array(frame: &[u8]) -> Option<Vec<&[u8]>> {
+pub(crate) fn split_array(frame: &[u8]) -> Option<Vec<&[u8]>> {
     if frame.first() != Some(&b'*') {
         return None;
     }
@@ -119,22 +116,22 @@ pub fn merge_sum<'r>(parts: impl Iterator<Item = &'r Bytes>) -> Result<Bytes, By
         }
     }
     let mut out = Vec::new();
-    crate::admin::integer(&mut out, total);
+    crate::resp::integer(&mut out, total);
     Ok(Bytes::from(out))
 }
 
 /// Requires every part to reply +OK (MSET).
 pub fn merge_ok<'r>(parts: impl Iterator<Item = &'r Bytes>) -> Result<Bytes, Bytes> {
     for reply in parts {
-        if reply.as_ref() != crate::admin::OK {
+        if reply.as_ref() != crate::resp::OK {
             return Err(reply.clone());
         }
     }
-    Ok(Bytes::from_static(crate::admin::OK))
+    Ok(Bytes::from_static(crate::resp::OK))
 }
 
 /// Parses an integer reply frame.
-pub fn parse_int(frame: &[u8]) -> Option<i64> {
+pub(crate) fn parse_int(frame: &[u8]) -> Option<i64> {
     if frame.first() != Some(&b':') {
         return None;
     }
@@ -172,7 +169,7 @@ pub fn rebuild_scan_reply(cursor: u64, keys_frame: &[u8]) -> Vec<u8> {
     let cursor = resp::u64_digits(&mut digits, cursor);
     let mut out = Vec::with_capacity(16 + cursor.len() + keys_frame.len());
     out.extend_from_slice(b"*2\r\n");
-    crate::admin::bulk(&mut out, cursor);
+    crate::resp::bulk(&mut out, cursor);
     out.extend_from_slice(keys_frame);
     out
 }
