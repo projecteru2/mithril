@@ -14,6 +14,7 @@ See [`mithril.conf.sample`](https://github.com/projecteru2/mithril/blob/master/m
 | `worker-threads` | int | CPU count | worker threads, one runtime each |
 | `maxclients` | int | `10000` | client connection cap, enforced at accept |
 | `backend-conns` | 1..512 | `1` | shared pipelined connections per node per worker |
+| `backend-sharding` | `yes`/`no` | `no` | one process-wide connection per node, owned by the worker its address hashes to; deepens backend pipelines for unpipelined workloads |
 | `requirepass` | string | empty | client password (default user); empty disables AUTH |
 | `backend-auth-user` | string | empty | username sent to backends (`AUTH user pass`) |
 | `backend-auth-pass` | string | empty | password sent to backends |
