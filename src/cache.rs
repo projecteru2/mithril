@@ -130,13 +130,10 @@ impl ReplyCache {
         let Some(poisoned) = self.fills.borrow_mut().remove(key) else {
             return;
         };
-        if poisoned
-            || !self.armed()
-            || frame.first() != Some(&b'$')
-            || frame.len() > ENTRY_MAX_BYTES
-        {
+        if poisoned || frame.first() != Some(&b'$') || frame.len() > ENTRY_MAX_BYTES {
             return;
         }
+        // the copy unpins the request read buffer the key slice points into
         self.insert_hot(
             Box::from(&key[..]),
             Entry {
