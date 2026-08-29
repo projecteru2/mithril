@@ -24,24 +24,14 @@ pub struct RemoteOutbound {
 
 /// Where a sharded reply is delivered.
 pub enum RemoteSink {
-    /// Ordered client reply routed back through the home worker's intake.
-    Session { home: u32, token: u64, seq: u64 },
+    /// Ordered client reply pushed straight into the session's shared queue.
+    Session {
+        queue: std::sync::Arc<crate::client::SharedQueue>,
+        seq: u64,
+    },
     /// Single reply for mergers and broadcasts.
     One(oneshot::Sender<Bytes>),
 }
-
-/// A reply travelling back to its home worker.
-pub struct RemoteReply {
-    pub token: u64,
-    pub seq: u64,
-    pub frame: Bytes,
-}
-
-/// One wake per parse pass: replies cross in per-home batches.
-pub type ReplyBatch = Vec<RemoteReply>;
-
-// bounds intake work per turn together with the receiver's batch cap
-const REPLY_BATCH_CAP: usize = 512;
 
 /// A node connection handed to its owner worker to run.
 pub struct NewConn {
@@ -52,18 +42,13 @@ pub struct NewConn {
 
 /// Process-wide shard fabric shared by every worker.
 pub struct Fabric {
-    intakes: Vec<mpsc::UnboundedSender<ReplyBatch>>,
     controls: Vec<mpsc::UnboundedSender<NewConn>>,
     conns: Mutex<[HashMap<Box<str>, mpsc::Sender<RemoteOutbound>>; 2]>,
 }
 
 impl Fabric {
-    pub fn new(
-        intakes: Vec<mpsc::UnboundedSender<ReplyBatch>>,
-        controls: Vec<mpsc::UnboundedSender<NewConn>>,
-    ) -> Arc<Fabric> {
+    pub fn new(controls: Vec<mpsc::UnboundedSender<NewConn>>) -> Arc<Fabric> {
         Arc::new(Fabric {
-            intakes,
             controls,
             conns: Mutex::new([HashMap::new(), HashMap::new()]),
         })
@@ -115,7 +100,7 @@ pub async fn control_loop(
         let fabric = fabric.clone();
         let cfg = cfg.clone();
         tokio::task::spawn_local(async move {
-            run_shard_conn(&nc.addr, nc.readonly, nc.rx, &cfg, &fabric).await;
+            run_shard_conn(&nc.addr, nc.readonly, nc.rx, &cfg).await;
             fabric.forget(&nc.addr, nc.readonly);
         });
     }
@@ -127,7 +112,6 @@ async fn run_shard_conn(
     readonly: bool,
     mut rx: mpsc::Receiver<RemoteOutbound>,
     cfg: &Config,
-    fabric: &Fabric,
 ) {
     struct Pending {
         expect: u32,
@@ -152,11 +136,10 @@ async fn run_shard_conn(
         Ok(h) => h,
         Err(e) => {
             log_debug!("shard connect {addr}: {e}");
-            drain(&mut rx, fabric);
+            drain(&mut rx);
             return;
         }
     };
-    let mut outboxes: Vec<ReplyBatch> = (0..fabric.intakes.len()).map(|_| Vec::new()).collect();
     let mut pending: std::collections::VecDeque<Pending> = std::collections::VecDeque::new();
     let mut front_err: Option<Bytes> = None;
     let mut batch: Vec<RemoteOutbound> = Vec::with_capacity(BATCH);
@@ -181,10 +164,7 @@ async fn run_shard_conn(
                                     Some(err) if is_err => err,
                                     _ => frame,
                                 };
-                                if let Some(full) = stage(&mut outboxes, d.reply, reply) {
-                                    let _ = fabric.intakes[full]
-                                        .send(std::mem::take(&mut outboxes[full]));
-                                }
+                                deliver(d.reply, reply);
                             }
                         }
                     }
@@ -196,7 +176,6 @@ async fn run_shard_conn(
                 resp::Scan::Incomplete => break,
             }
         }
-        flush_outboxes(&mut outboxes, fabric);
         ensure_read_room(&mut buf);
         tokio::select! {
             n = rx.recv_many(&mut batch, BATCH) => {
@@ -229,51 +208,28 @@ async fn run_shard_conn(
         }
     }
     for p in pending.drain(..) {
-        if let Some(full) = stage(&mut outboxes, p.reply, Bytes::from_static(ERR_BACKEND_LOST)) {
-            let _ = fabric.intakes[full].send(std::mem::take(&mut outboxes[full]));
-        }
+        deliver(p.reply, Bytes::from_static(ERR_BACKEND_LOST));
     }
-    flush_outboxes(&mut outboxes, fabric);
-    drain(&mut rx, fabric);
+    drain(&mut rx);
 }
 
-// oneshot sinks resolve at once; session replies wait for the pass flush,
-// or sooner when a home's batch hits its cap
-fn stage(outboxes: &mut [ReplyBatch], reply: RemoteSink, frame: Bytes) -> Option<usize> {
+// a shared queue takes the reply directly; oneshot sinks resolve in place
+fn deliver(reply: RemoteSink, frame: Bytes) {
     match reply {
-        RemoteSink::Session { home, token, seq } => {
-            let home = home as usize;
-            outboxes[home].push(RemoteReply { token, seq, frame });
-            (outboxes[home].len() >= REPLY_BATCH_CAP).then_some(home)
+        RemoteSink::Session { queue, seq } => {
+            queue.send(crate::client::Reply::At(seq, frame));
         }
         RemoteSink::One(tx) => {
             let _ = tx.send(frame);
-            None
         }
     }
 }
 
-fn flush_outboxes(outboxes: &mut [ReplyBatch], fabric: &Fabric) {
-    for (home, batch) in outboxes.iter_mut().enumerate() {
-        if !batch.is_empty() {
-            let _ = fabric.intakes[home].send(std::mem::take(batch));
-        }
-    }
-}
-
-fn drain(rx: &mut mpsc::Receiver<RemoteOutbound>, fabric: &Fabric) {
+fn drain(rx: &mut mpsc::Receiver<RemoteOutbound>) {
     rx.close();
-    let mut outboxes: Vec<ReplyBatch> = (0..fabric.intakes.len()).map(|_| Vec::new()).collect();
     while let Ok(out) = rx.try_recv() {
-        if let Some(full) = stage(
-            &mut outboxes,
-            out.reply,
-            Bytes::from_static(ERR_BACKEND_LOST),
-        ) {
-            let _ = fabric.intakes[full].send(std::mem::take(&mut outboxes[full]));
-        }
+        deliver(out.reply, Bytes::from_static(ERR_BACKEND_LOST));
     }
-    flush_outboxes(&mut outboxes, fabric);
 }
 
 fn fnv(data: &[u8]) -> u64 {

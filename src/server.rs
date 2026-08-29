@@ -12,10 +12,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
-use std::cell::RefCell;
-
 use crate::backend::Backends;
-use crate::client::{self, Shared, serve};
+use crate::client::{Shared, serve};
 use crate::config::{Config, Placement};
 use crate::shard;
 use crate::stats::Stats;
@@ -36,11 +34,7 @@ const SNAP_WINDOW: Duration = Duration::from_millis(10);
 const QUIET_FLOOR: u64 = 128;
 const DRAIN_POLL: Duration = Duration::from_millis(50);
 
-type ShardWiring = (
-    Arc<shard::Fabric>,
-    mpsc::UnboundedReceiver<shard::ReplyBatch>,
-    mpsc::UnboundedReceiver<shard::NewConn>,
-);
+type ShardWiring = (Arc<shard::Fabric>, mpsc::UnboundedReceiver<shard::NewConn>);
 
 static TOPO_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Set on SIGINT/SIGTERM; accept loops stop taking new connections.
@@ -81,19 +75,14 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let listener = bind_listener(&cfg.bind, cfg.port)
         .map_err(|e| format!("bind {}:{}: {e}", cfg.bind, cfg.port))?;
     let mut shard_parts = if cfg.backend_sharding {
-        let mut intake_txs = Vec::with_capacity(cfg.workers);
-        let mut intake_rxs = Vec::with_capacity(cfg.workers);
         let mut ctl_txs = Vec::with_capacity(cfg.workers);
         let mut ctl_rxs = Vec::with_capacity(cfg.workers);
         for _ in 0..cfg.workers {
-            let (it, ir) = mpsc::unbounded_channel();
-            intake_txs.push(it);
-            intake_rxs.push(ir);
             let (ct, cr) = mpsc::unbounded_channel();
             ctl_txs.push(ct);
             ctl_rxs.push(cr);
         }
-        Some((shard::Fabric::new(intake_txs, ctl_txs), intake_rxs, ctl_rxs))
+        Some((shard::Fabric::new(ctl_txs), ctl_rxs))
     } else {
         None
     };
@@ -105,10 +94,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
         let topo = topo.clone();
         let stats = stats.clone();
         let refresh = refresh_tx.clone();
-        // receivers ship in worker order; fabric intakes/controls index by worker
+        // receivers ship in worker order; fabric controls index by worker
         let shard = shard_parts
             .as_mut()
-            .map(|(f, irs, crs)| (f.clone(), irs.remove(0), crs.remove(0)));
+            .map(|(f, crs)| (f.clone(), crs.remove(0)));
         let ctx = WorkerCtx {
             cfg,
             topo,
@@ -323,10 +312,7 @@ fn worker_thread(
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
         let local_cfg = Rc::new((*cfg).clone());
-        let registry: client::Registry =
-            Rc::new(RefCell::new(std::collections::HashMap::default()));
-        let fabric = shard.map(|(fabric, intake_rx, ctl_rx)| {
-            tokio::task::spawn_local(client::intake_loop(intake_rx, registry.clone()));
+        let fabric = shard.map(|(fabric, ctl_rx)| {
             tokio::task::spawn_local(shard::control_loop(ctl_rx, fabric.clone(), cfg.clone()));
             fabric
         });
@@ -339,7 +325,6 @@ fn worker_thread(
             refresh,
             started,
             fabric,
-            registry,
         });
         let mut next_client: u64 = worker as u64;
         while let Some(mut admitted) = conn_rx.recv().await {

@@ -42,7 +42,6 @@ pub struct Shared {
     pub refresh: mpsc::UnboundedSender<()>,
     pub started: u64,
     pub fabric: Option<std::sync::Arc<crate::shard::Fabric>>,
-    pub registry: Registry,
 }
 
 /// One frame travelling to the client writer.
@@ -57,100 +56,111 @@ pub enum Reply {
     Close,
 }
 
-/// Sessions visible to the shard intake, keyed by client id.
-pub type Registry = Rc<
-    RefCell<
-        std::collections::HashMap<u64, Rc<ReplyQueue>, std::hash::BuildHasherDefault<TokenHasher>>,
-    >,
->;
-
-/// Multiply-shift hasher for the strided-u64 session tokens.
-#[derive(Default)]
-pub struct TokenHasher(u64);
-
-impl std::hash::Hasher for TokenHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, _bytes: &[u8]) {
-        unreachable!("token keys hash as u64");
-    }
-
-    fn write_u64(&mut self, n: u64) {
-        // worker-strided tokens share low bits; fold the mixed high bits back
-        let h = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        self.0 = h ^ (h >> 32);
-    }
+/// The session's reply queue: worker-local sessions use plain RefCell ops;
+/// sharded sessions share a mutex so owner workers deliver replies directly.
+pub struct ReplyQueue {
+    inner: QueueInner,
 }
 
-/// Routes sharded reply batches arriving from owner workers to their sessions.
-pub async fn intake_loop(
-    mut rx: mpsc::UnboundedReceiver<crate::shard::ReplyBatch>,
-    registry: Registry,
-) {
-    // batches are capped at shard::REPLY_BATCH_CAP, bounding replies per turn
-    const INTAKE_BATCHES: usize = 8;
-    let mut batches = Vec::with_capacity(INTAKE_BATCHES);
-    loop {
-        if rx.recv_many(&mut batches, INTAKE_BATCHES).await == 0 {
+enum QueueInner {
+    Local {
+        q: RefCell<VecDeque<Reply>>,
+        bell: tokio::sync::Notify,
+        closed: Cell<bool>,
+    },
+    Shared(std::sync::Arc<SharedQueue>),
+}
+
+/// Cross-worker reply queue for sharded sessions.
+pub struct SharedQueue {
+    state: std::sync::Mutex<SharedState>,
+    bell: tokio::sync::Notify,
+}
+
+struct SharedState {
+    closed: bool,
+    q: VecDeque<Reply>,
+}
+
+impl SharedQueue {
+    /// Delivers a reply straight from an owner worker.
+    pub fn send(&self, reply: Reply) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.closed {
             return;
         }
-        {
-            let registry = registry.borrow();
-            for batch in batches.drain(..) {
-                for r in batch {
-                    if let Some(q) = registry.get(&r.token) {
-                        let _ = q.send(Reply::At(r.seq, r.frame));
-                    }
-                }
-            }
-        }
-        // a deep backlog must not starve this worker's sessions
-        if !rx.is_empty() {
-            tokio::task::yield_now().await;
+        state.q.push_back(reply);
+        // the writer only parks on an empty queue: notify on that transition
+        if state.q.len() == 1 {
+            self.bell.notify_one();
         }
     }
-}
-
-/// Worker-local reply queue: plain RefCell ops where an mpsc would pay atomics.
-pub struct ReplyQueue {
-    q: RefCell<VecDeque<Reply>>,
-    bell: tokio::sync::Notify,
-    closed: Cell<bool>,
 }
 
 impl ReplyQueue {
-    fn new() -> Rc<ReplyQueue> {
-        Rc::new(ReplyQueue {
-            q: RefCell::new(VecDeque::new()),
-            bell: tokio::sync::Notify::new(),
-            closed: Cell::new(false),
-        })
+    fn new(shared: bool) -> Rc<ReplyQueue> {
+        let inner = if shared {
+            QueueInner::Shared(std::sync::Arc::new(SharedQueue {
+                state: std::sync::Mutex::new(SharedState {
+                    closed: false,
+                    q: VecDeque::new(),
+                }),
+                bell: tokio::sync::Notify::new(),
+            }))
+        } else {
+            QueueInner::Local {
+                q: RefCell::new(VecDeque::new()),
+                bell: tokio::sync::Notify::new(),
+                closed: Cell::new(false),
+            }
+        };
+        Rc::new(ReplyQueue { inner })
+    }
+
+    fn shard_handle(&self) -> Option<std::sync::Arc<SharedQueue>> {
+        match &self.inner {
+            QueueInner::Local { .. } => None,
+            QueueInner::Shared(sq) => Some(sq.clone()),
+        }
     }
 
     pub fn send(&self, reply: Reply) -> Result<(), Reply> {
-        if self.closed.get() {
-            return Err(reply);
+        match &self.inner {
+            QueueInner::Local { q, bell, closed } => {
+                if closed.get() {
+                    return Err(reply);
+                }
+                let mut q = q.borrow_mut();
+                q.push_back(reply);
+                // the writer only parks on an empty queue: notify on that transition
+                if q.len() == 1 {
+                    bell.notify_one();
+                }
+                Ok(())
+            }
+            QueueInner::Shared(sq) => {
+                let Ok(mut state) = sq.state.lock() else {
+                    return Err(reply);
+                };
+                if state.closed {
+                    return Err(reply);
+                }
+                state.q.push_back(reply);
+                if state.q.len() == 1 {
+                    sq.bell.notify_one();
+                }
+                Ok(())
+            }
         }
-        let mut q = self.q.borrow_mut();
-        q.push_back(reply);
-        // the writer only parks on an empty queue: notify on that transition
-        if q.len() == 1 {
-            self.bell.notify_one();
-        }
-        Ok(())
     }
 
-    fn pop(&self) -> Option<Reply> {
-        self.q.borrow_mut().pop_front()
-    }
-
-    // cancel-safe: the drain is synchronous and a notified permit persists
-    async fn recv_batch(&self, batch: &mut Vec<Reply>, max: usize) {
-        loop {
-            {
-                let mut q = self.q.borrow_mut();
+    // one lock per refill keeps the coalescing pass off per-item locking
+    fn pop_into(&self, batch: &mut Vec<Reply>, max: usize) {
+        match &self.inner {
+            QueueInner::Local { q, .. } => {
+                let mut q = q.borrow_mut();
                 while batch.len() < max {
                     match q.pop_front() {
                         Some(r) => batch.push(r),
@@ -158,10 +168,48 @@ impl ReplyQueue {
                     }
                 }
             }
+            QueueInner::Shared(sq) => {
+                let Ok(mut state) = sq.state.lock() else {
+                    return;
+                };
+                while batch.len() < max {
+                    match state.q.pop_front() {
+                        Some(r) => batch.push(r),
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+
+    // cancel-safe: the drain is synchronous and a notified permit persists
+    async fn recv_batch(&self, batch: &mut Vec<Reply>, max: usize) {
+        let bell = match &self.inner {
+            QueueInner::Local { bell, .. } => bell,
+            QueueInner::Shared(sq) => &sq.bell,
+        };
+        loop {
+            self.pop_into(batch, max);
             if !batch.is_empty() {
                 return;
             }
-            self.bell.notified().await;
+            bell.notified().await;
+        }
+    }
+
+    // queued frames and their backing buffer must not outlive the writer
+    fn close(&self) {
+        match &self.inner {
+            QueueInner::Local { q, closed, .. } => {
+                closed.set(true);
+                drop(std::mem::take(&mut *q.borrow_mut()));
+            }
+            QueueInner::Shared(sq) => {
+                if let Ok(mut state) = sq.state.lock() {
+                    state.closed = true;
+                    drop(std::mem::take(&mut state.q));
+                }
+            }
         }
     }
 }
@@ -374,15 +422,15 @@ impl Session {
                 }
             }
             Pipe::Shard(tx) => {
+                let Some(queue) = self.reply_q.shard_handle() else {
+                    self.emit_at(seq, Bytes::from_static(ERR_BACKEND_LOST));
+                    return None;
+                };
                 let out = crate::shard::RemoteOutbound {
                     head: None,
                     frame,
                     expect,
-                    reply: crate::shard::RemoteSink::Session {
-                        home: self.shared.worker as u32,
-                        token: self.id,
-                        seq,
-                    },
+                    reply: crate::shard::RemoteSink::Session { queue, seq },
                 };
                 match tx.try_send(out) {
                     Ok(()) => None,
@@ -1301,7 +1349,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         return;
     }
     let (mut read_half, write_half) = stream.into_split();
-    let reply_q = ReplyQueue::new();
+    let reply_q = ReplyQueue::new(shared.fabric.is_some());
     let link: Rc<WriterLink> = Rc::new(WriterLink::default());
 
     let session = Session {
@@ -1326,9 +1374,6 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         topo_cache: RefCell::new(shared.topo.load_full()),
     };
 
-    if shared.fabric.is_some() {
-        shared.registry.borrow_mut().insert(id, reply_q.clone());
-    }
     let (close_tx, close_rx) = oneshot::channel::<u64>();
     let writer = tokio::task::spawn_local(write_loop(
         shared.clone(),
@@ -1739,17 +1784,10 @@ async fn write_loop(
         shared: &'a Shared,
         link: &'a WriterLink,
         reply: &'a ReplyQueue,
-        client_id: u64,
     }
     impl Drop for ExitBump<'_> {
         fn drop(&mut self) {
-            self.reply.closed.set(true);
-            // queued frames and their backing buffer must not outlive the writer
-            // via lingering backend sinks
-            drop(std::mem::take(&mut *self.reply.q.borrow_mut()));
-            if self.shared.fabric.is_some() {
-                self.shared.registry.borrow_mut().remove(&self.client_id);
-            }
+            self.reply.close();
             mark_closed(self.link);
             stats::bump(&self.shared.stats.workers[self.shared.worker].writers_exited);
             self.link.oob_notify.notify_waiters();
@@ -1759,7 +1797,6 @@ async fn write_loop(
         shared: &shared,
         link: &link,
         reply: &reply_q,
-        client_id,
     };
     let mut next_emit: u64 = 0;
     let mut swept_to: u64 = 0;
@@ -1834,15 +1871,16 @@ async fn write_loop(
                         let expect = base_expect + u32::from(ask);
                         match &shared.fabric {
                             Some(f) => {
+                                let Some(queue) = reply_q.shard_handle() else {
+                                    let _ = reply_q
+                                        .send(Reply::At(seq, Bytes::from_static(ERR_BACKEND_LOST)));
+                                    continue;
+                                };
                                 let out = crate::shard::RemoteOutbound {
                                     head,
                                     frame: req,
                                     expect,
-                                    reply: crate::shard::RemoteSink::Session {
-                                        home: shared.worker as u32,
-                                        token: client_id,
-                                        seq,
-                                    },
+                                    reply: crate::shard::RemoteSink::Session { queue, seq },
                                 };
                                 if f.pipe(&target, false).send(out).await.is_err() {
                                     let _ = reply_q
@@ -1899,12 +1937,7 @@ async fn write_loop(
                     break;
                 }
                 tokio::task::yield_now().await;
-                while batch.len() < crate::backend::BATCH {
-                    match reply_q.pop() {
-                        Some(r) => batch.push(r),
-                        None => break,
-                    }
-                }
+                reply_q.pop_into(&mut batch, crate::backend::BATCH);
                 if batch.is_empty() {
                     break;
                 }
