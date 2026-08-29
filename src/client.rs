@@ -56,15 +56,15 @@ pub enum Reply {
 }
 
 /// Worker-local reply queue: plain RefCell ops where an mpsc would pay atomics.
-pub struct ReplyTx {
+pub struct ReplyQueue {
     q: RefCell<VecDeque<Reply>>,
     bell: tokio::sync::Notify,
     closed: Cell<bool>,
 }
 
-impl ReplyTx {
-    fn new() -> Rc<ReplyTx> {
-        Rc::new(ReplyTx {
+impl ReplyQueue {
+    fn new() -> Rc<ReplyQueue> {
+        Rc::new(ReplyQueue {
             q: RefCell::new(VecDeque::new()),
             bell: tokio::sync::Notify::new(),
             closed: Cell::new(false),
@@ -167,7 +167,7 @@ impl ProtoSwitchQueue {
 struct Session {
     shared: Rc<Shared>,
     id: u64,
-    reply_tx: Rc<ReplyTx>,
+    reply_q: Rc<ReplyQueue>,
     link: Rc<WriterLink>,
     proto: Cell<u8>,
     authed: Cell<bool>,
@@ -367,7 +367,7 @@ impl Session {
             head: None,
             frame,
             expect: 1,
-            sink: Sink::Client(self.reply_tx.clone(), seq),
+            sink: Sink::Client(self.reply_q.clone(), seq),
         }
     }
 
@@ -455,10 +455,10 @@ impl Session {
     fn spawn_blocking(&self, slot: u16, frame: Bytes) {
         let seq = self.alloc_seq();
         let shared = self.shared.clone();
-        let reply_tx = self.reply_tx.clone();
+        let reply_q = self.reply_q.clone();
         let task = tokio::task::spawn_local(async move {
             let reply = blocking_round(&shared, slot, frame, None, false).await;
-            let _ = reply_tx.send(Reply::At(seq, reply));
+            let _ = reply_q.send(Reply::At(seq, reply));
         });
         let mut blocking = self.blocking.borrow_mut();
         blocking.retain(|(_, t)| !t.is_finished());
@@ -504,7 +504,7 @@ impl Session {
             }
         };
         let shared = self.shared.clone();
-        let reply_tx = self.reply_tx.clone();
+        let reply_q = self.reply_q.clone();
         let id = self.id;
         let merge = match spec.kind {
             Kind::Mget => Merge::Mget,
@@ -550,7 +550,7 @@ impl Session {
                 Merge::Ok => multikey::merge_ok(results.iter().map(|(_, r)| r)),
                 Merge::Sum => multikey::merge_sum(results.iter().map(|(_, r)| r)),
             };
-            let _ = reply_tx.send(Reply::At(seq, merged.unwrap_or_else(|e| e)));
+            let _ = reply_q.send(Reply::At(seq, merged.unwrap_or_else(|e| e)));
         });
     }
 
@@ -566,14 +566,14 @@ impl Session {
         let (master_idx, node_cursor) = multikey::unpack_cursor(cursor);
         let seq = self.alloc_seq();
         let shared = self.shared.clone();
-        let reply_tx = self.reply_tx.clone();
+        let reply_q = self.reply_q.clone();
         let id = self.id;
         // detached deliberately: completion is bounded by backend replies.
         tokio::task::spawn_local(async move {
             let topo = shared.topo.load_full();
             if master_idx >= topo.masters.len() {
                 let done = multikey::rebuild_scan_reply(0, b"*0\r\n");
-                let _ = reply_tx.send(Reply::At(seq, Bytes::from(done)));
+                let _ = reply_q.send(Reply::At(seq, Bytes::from(done)));
                 return;
             }
             let addr = &topo.nodes[topo.masters[master_idx] as usize].addr;
@@ -602,14 +602,14 @@ impl Session {
                 }
                 None => reply,
             };
-            let _ = reply_tx.send(Reply::At(seq, out));
+            let _ = reply_q.send(Reply::At(seq, out));
         });
     }
 
     fn run_broadcast(&self, frame: Bytes, sum: bool) {
         let seq = self.alloc_seq();
         let shared = self.shared.clone();
-        let reply_tx = self.reply_tx.clone();
+        let reply_q = self.reply_q.clone();
         let id = self.id;
         // detached deliberately: completion is bounded by backend replies.
         tokio::task::spawn_local(async move {
@@ -629,7 +629,7 @@ impl Session {
             } else {
                 multikey::merge_ok(replies.iter())
             };
-            let _ = reply_tx.send(Reply::At(seq, merged.unwrap_or_else(|e| e)));
+            let _ = reply_q.send(Reply::At(seq, merged.unwrap_or_else(|e| e)));
         });
     }
 
@@ -804,7 +804,7 @@ impl Session {
             head: None,
             frame: blob,
             expect,
-            sink: Sink::Client(self.reply_tx.clone(), seq),
+            sink: Sink::Client(self.reply_q.clone(), seq),
         })
         .await;
     }
@@ -955,7 +955,7 @@ impl Session {
             ps.task.abort();
         }
         *self.subs.borrow_mut() = PubsubSim::default();
-        backfill_acks(&self.link, &self.reply_tx);
+        backfill_acks(&self.link, &self.reply_q);
     }
 
     fn dispatch_pubsub(&self, spec: &Spec, frame: Bytes, argc: usize) {
@@ -1051,10 +1051,10 @@ impl Session {
         let (tx, rx) = mpsc::channel::<Bytes>(PUBSUB_FORWARD_QUEUE);
         let _ = tx.try_send(first_frame);
         let shared = self.shared.clone();
-        let reply_tx = self.reply_tx.clone();
+        let reply_q = self.reply_q.clone();
         let link = self.link.clone();
         let task = tokio::task::spawn_local(async move {
-            pubsub_relay(shared, addr, rx, reply_tx, link).await;
+            pubsub_relay(shared, addr, rx, reply_q, link).await;
         });
         *self.pubsub.borrow_mut() = Some(PubsubHandle { tx, task });
     }
@@ -1097,7 +1097,7 @@ impl Session {
     }
 
     fn emit_at(&self, seq: u64, frame: Bytes) {
-        let _ = self.reply_tx.send(Reply::At(seq, frame));
+        let _ = self.reply_q.send(Reply::At(seq, frame));
     }
 }
 
@@ -1180,13 +1180,13 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         return;
     }
     let (mut read_half, write_half) = stream.into_split();
-    let reply_tx = ReplyTx::new();
+    let reply_q = ReplyQueue::new();
     let link: Rc<WriterLink> = Rc::new(WriterLink::default());
 
     let session = Session {
         shared: shared.clone(),
         id,
-        reply_tx: reply_tx.clone(),
+        reply_q: reply_q.clone(),
         link: link.clone(),
         proto: Cell::new(2),
         authed: Cell::new(shared.cfg.requirepass.is_empty()),
@@ -1209,7 +1209,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
     let writer = tokio::task::spawn_local(write_loop(
         shared.clone(),
         write_half,
-        reply_tx.clone(),
+        reply_q.clone(),
         close_rx,
         link.clone(),
         id,
@@ -1301,11 +1301,11 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
             continue;
         }
         task.abort();
-        let _ = reply_tx.send(Reply::At(seq, Bytes::from_static(ERR_BACKEND_LOST)));
+        let _ = reply_q.send(Reply::At(seq, Bytes::from_static(ERR_BACKEND_LOST)));
     }
     let final_seq = session.next_seq.get();
     drop(session);
-    drop(reply_tx);
+    drop(reply_q);
     let _ = close_tx.send(final_seq);
     let _ = writer.await;
     stats::bump(&shared.stats.workers[shared.worker].sessions_closed);
@@ -1441,14 +1441,14 @@ async fn pubsub_relay(
     shared: Rc<Shared>,
     addr: String,
     mut rx: mpsc::Receiver<Bytes>,
-    reply_tx: Rc<ReplyTx>,
+    reply_q: Rc<ReplyQueue>,
     link: Rc<WriterLink>,
 ) {
     let stream = match crate::backend::dial_raw(&addr, &shared.cfg).await {
         Ok(s) => s,
         Err(e) => {
             log_debug!("pubsub dial {addr}: {e}");
-            backfill_acks(&link, &reply_tx);
+            backfill_acks(&link, &reply_q);
             return;
         }
     };
@@ -1494,7 +1494,7 @@ async fn pubsub_relay(
                             }
                         }
                     };
-                    if reply_tx.send(reply).is_err() {
+                    if reply_q.send(reply).is_err() {
                         break 'io;
                     }
                 }
@@ -1508,10 +1508,10 @@ async fn pubsub_relay(
             Ok(_) => {}
         }
     }
-    backfill_acks(&link, &reply_tx);
+    backfill_acks(&link, &reply_q);
     // an idle subscriber sends nothing: the parked reader needs a wakeup
     mark_closed(&link);
-    let _ = reply_tx.send(Reply::Close);
+    let _ = reply_q.send(Reply::Close);
 }
 
 fn mark_closed(link: &WriterLink) {
@@ -1532,10 +1532,10 @@ async fn charge_push(link: &Rc<WriterLink>) -> bool {
 }
 
 // promised confirmation sequences must resolve or the writer never drains past them
-fn backfill_acks(link: &Rc<WriterLink>, reply_tx: &Rc<ReplyTx>) {
+fn backfill_acks(link: &Rc<WriterLink>, reply_q: &Rc<ReplyQueue>) {
     let drained: Vec<u64> = link.ack_seqs.borrow_mut().drain(..).collect();
     for seq in drained {
-        let _ = reply_tx.send(Reply::Ack(seq, Bytes::from_static(ERR_BACKEND_LOST)));
+        let _ = reply_q.send(Reply::Ack(seq, Bytes::from_static(ERR_BACKEND_LOST)));
     }
     link.acks_drained.notify_one();
 }
@@ -1592,7 +1592,7 @@ impl ParkedRing {
 async fn write_loop(
     shared: Rc<Shared>,
     mut write_half: OwnedWriteHalf,
-    reply_tx: Rc<ReplyTx>,
+    reply_q: Rc<ReplyQueue>,
     mut close_rx: oneshot::Receiver<u64>,
     link: Rc<WriterLink>,
     client_id: u64,
@@ -1600,7 +1600,7 @@ async fn write_loop(
     struct ExitBump<'a> {
         shared: &'a Shared,
         link: &'a WriterLink,
-        reply: &'a ReplyTx,
+        reply: &'a ReplyQueue,
     }
     impl Drop for ExitBump<'_> {
         fn drop(&mut self) {
@@ -1613,7 +1613,7 @@ async fn write_loop(
     let _exit = ExitBump {
         shared: &shared,
         link: &link,
-        reply: &reply_tx,
+        reply: &reply_q,
     };
     let mut next_emit: u64 = 0;
     let mut swept_to: u64 = 0;
@@ -1637,7 +1637,7 @@ async fn write_loop(
             return;
         }
         tokio::select! {
-            _ = reply_tx.recv_batch(&mut batch, crate::backend::BATCH) => {}
+            _ = reply_q.recv_batch(&mut batch, crate::backend::BATCH) => {}
             r = &mut close_rx, if close_at.is_none() => {
                 match r {
                     Ok(n) => {
@@ -1689,7 +1689,7 @@ async fn write_loop(
                             head: ask.then(|| Bytes::from_static(ASKING_FRAME)),
                             frame: req,
                             expect: base_expect + u32::from(ask),
-                            sink: Sink::Client(reply_tx.clone(), seq),
+                            sink: Sink::Client(reply_q.clone(), seq),
                         })
                         .await;
                         continue;
@@ -1732,7 +1732,7 @@ async fn write_loop(
                 }
                 tokio::task::yield_now().await;
                 while batch.len() < crate::backend::BATCH {
-                    match reply_tx.pop() {
+                    match reply_q.pop() {
                         Some(r) => batch.push(r),
                         None => break,
                     }

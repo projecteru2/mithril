@@ -12,7 +12,7 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::client::{Reply, ReplyTx};
+use crate::client::{Reply, ReplyQueue};
 use crate::config::Config;
 use crate::log_debug;
 use crate::resp;
@@ -29,7 +29,7 @@ pub const ERR_BACKEND_LOST: &[u8] = b"-ERR mithril: backend connection lost\r\n"
 /// Where a backend reply is delivered.
 pub enum Sink {
     /// Ordered client reply stream at a fixed sequence.
-    Client(Rc<ReplyTx>, u64),
+    Client(Rc<ReplyQueue>, u64),
     /// Single reply for mergers and blocking commands.
     One(oneshot::Sender<Bytes>),
 }
