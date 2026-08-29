@@ -15,7 +15,7 @@ See [`mithril.conf.sample`](https://github.com/projecteru2/mithril/blob/master/m
 | `maxclients` | int | `10000` | client connection cap, enforced at accept |
 | `backend-conns` | 1..512 | `1` | shared pipelined connections per node per worker |
 | `backend-sharding` | `yes`/`no` | `no` | one process-wide connection per node, owned by the worker its address hashes to; deepens backend pipelines for unpipelined workloads |
-| `reply-cache` | `yes`/`no` | `no` | worker-local GET reply cache, invalidated by RESP3 BCAST client tracking; serves hits without a backend round trip |
+| `reply-cache` | `yes`/`no` | `no` | worker-local GET reply cache, invalidated by RESP3 BCAST client tracking; serves hits without a backend round trip. For read-dominant workloads: every cluster write broadcasts an invalidation to every worker, so write-heavy traffic pays the stream cost without earning hits |
 | `reply-cache-max-bytes` | bytes | `64mb` | per-worker cache budget (two generations under one budget) |
 | `reply-cache-max-age-secs` | 1..3600 | `10` | staleness backstop for missed invalidations; entries older than this never serve |
 | `requirepass` | string | empty | client password (default user); empty disables AUTH |

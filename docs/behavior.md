@@ -29,5 +29,7 @@
   (cross-client, sub-millisecond) plus, for keys expiring server-side, the
   active-expire cycle; `reply-cache-max-age-secs` caps both. The cache only
   serves while every master's tracking connection is up — coverage loss
-  flushes it and pauses fills.
+  flushes it and pauses fills. Enable it for read-dominant traffic: the
+  BCAST stream delivers every cluster write to every worker, so at
+  write-heavy ratios the invalidation processing outweighs the hits.
 
