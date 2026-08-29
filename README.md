@@ -13,9 +13,11 @@ thread-per-core runtime and zero-copy frame forwarding.
 ## Highlights
 
 - **Thread-per-core** — each worker runs a single-threaded tokio runtime with
-  its own backend pools; nothing crosses workers on the request path, and a
-  central acceptor places each connection on the least-loaded worker
-  (configurable) so no worker becomes the latency floor
+  its own backend pools; by default nothing crosses workers on the request
+  path, and a central acceptor places each connection on the least-loaded
+  worker (configurable) so no worker becomes the latency floor. The optional
+  `backend-sharding` mode trades that isolation for one process-wide pipe per
+  node, deepening backend batches for unpipelined workloads
 - **Zero-copy pipeline** — requests and replies travel as `bytes::Bytes`
   slices of the socket buffers; the RESP layer finds frame boundaries without
   materializing values, and replies re-order per client by sequence number so

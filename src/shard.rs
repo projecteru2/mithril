@@ -86,9 +86,13 @@ impl Fabric {
         tx
     }
 
+    // generation-safe: a replacement pipe created meanwhile must survive
     fn forget(&self, addr: &str, readonly: bool) {
         if let Ok(mut conns) = self.conns.lock() {
-            conns.remove(&*Self::key(addr, readonly));
+            let key = Self::key(addr, readonly);
+            if conns.get(&*key).is_some_and(|tx| tx.is_closed()) {
+                conns.remove(&*key);
+            }
         }
     }
 
