@@ -55,7 +55,54 @@ pub enum Reply {
     Close,
 }
 
-pub type ReplyTx = mpsc::UnboundedSender<Reply>;
+/// Worker-local reply queue: plain RefCell ops where an mpsc would pay atomics.
+pub struct ReplyTx {
+    q: RefCell<VecDeque<Reply>>,
+    bell: tokio::sync::Notify,
+    closed: Cell<bool>,
+}
+
+impl ReplyTx {
+    fn new() -> Rc<ReplyTx> {
+        Rc::new(ReplyTx {
+            q: RefCell::new(VecDeque::new()),
+            bell: tokio::sync::Notify::new(),
+            closed: Cell::new(false),
+        })
+    }
+
+    pub fn send(&self, reply: Reply) -> Result<(), Reply> {
+        if self.closed.get() {
+            return Err(reply);
+        }
+        self.q.borrow_mut().push_back(reply);
+        self.bell.notify_one();
+        Ok(())
+    }
+
+    fn pop(&self) -> Option<Reply> {
+        self.q.borrow_mut().pop_front()
+    }
+
+    // cancel-safe: the drain is synchronous and a notified permit persists
+    async fn recv_batch(&self, batch: &mut Vec<Reply>, max: usize) {
+        loop {
+            {
+                let mut q = self.q.borrow_mut();
+                while batch.len() < max {
+                    match q.pop_front() {
+                        Some(r) => batch.push(r),
+                        None => break,
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                return;
+            }
+            self.bell.notified().await;
+        }
+    }
+}
 
 struct InFlight {
     seq: u64,
@@ -883,7 +930,7 @@ impl Session {
                 }
                 tokio::select! {
                     _ = self.link.acks_drained.notified() => {}
-                    _ = self.reply_tx.closed() => break,
+                    _ = self.link.closed_notify.notified() => break,
                 }
             }
         }
@@ -1129,8 +1176,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         return;
     }
     let (mut read_half, write_half) = stream.into_split();
-    let (reply_tx, reply_rx) = mpsc::unbounded_channel();
-    let reply_tx = Rc::new(reply_tx);
+    let reply_tx = ReplyTx::new();
     let link: Rc<WriterLink> = Rc::new(WriterLink::default());
 
     let session = Session {
@@ -1159,7 +1205,6 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
     let writer = tokio::task::spawn_local(write_loop(
         shared.clone(),
         write_half,
-        reply_rx,
         reply_tx.clone(),
         close_rx,
         link.clone(),
@@ -1543,7 +1588,6 @@ impl ParkedRing {
 async fn write_loop(
     shared: Rc<Shared>,
     mut write_half: OwnedWriteHalf,
-    mut rx: mpsc::UnboundedReceiver<Reply>,
     reply_tx: Rc<ReplyTx>,
     mut close_rx: oneshot::Receiver<u64>,
     link: Rc<WriterLink>,
@@ -1552,9 +1596,11 @@ async fn write_loop(
     struct ExitBump<'a> {
         shared: &'a Shared,
         link: &'a WriterLink,
+        reply: &'a ReplyTx,
     }
     impl Drop for ExitBump<'_> {
         fn drop(&mut self) {
+            self.reply.closed.set(true);
             mark_closed(self.link);
             stats::bump(&self.shared.stats.workers[self.shared.worker].writers_exited);
             self.link.oob_notify.notify_waiters();
@@ -1563,6 +1609,7 @@ async fn write_loop(
     let _exit = ExitBump {
         shared: &shared,
         link: &link,
+        reply: &reply_tx,
     };
     let mut next_emit: u64 = 0;
     let mut swept_to: u64 = 0;
@@ -1586,11 +1633,7 @@ async fn write_loop(
             return;
         }
         tokio::select! {
-            n = rx.recv_many(&mut batch, crate::backend::BATCH) => {
-                if n == 0 {
-                    return;
-                }
-            }
+            _ = reply_tx.recv_batch(&mut batch, crate::backend::BATCH) => {}
             r = &mut close_rx, if close_at.is_none() => {
                 match r {
                     Ok(n) => {
@@ -1685,9 +1728,9 @@ async fn write_loop(
                 }
                 tokio::task::yield_now().await;
                 while batch.len() < crate::backend::BATCH {
-                    match rx.try_recv() {
-                        Ok(r) => batch.push(r),
-                        Err(_) => break,
+                    match reply_tx.pop() {
+                        Some(r) => batch.push(r),
+                        None => break,
                     }
                 }
                 if batch.is_empty() {
