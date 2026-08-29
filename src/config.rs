@@ -159,6 +159,9 @@ impl Config {
         if self.announce_addr.is_empty() {
             self.announce_addr = format!("{}:{}", self.bind, self.port);
         }
+        if self.backend_sharding && self.backend_conns > 1 {
+            crate::log_warn!("backend-conns is ignored under backend-sharding");
+        }
         Ok(self)
     }
 }

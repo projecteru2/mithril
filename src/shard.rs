@@ -46,9 +46,9 @@ pub struct NewConn {
 
 /// Process-wide shard fabric shared by every worker.
 pub struct Fabric {
-    pub intakes: Vec<mpsc::UnboundedSender<RemoteReply>>,
+    intakes: Vec<mpsc::UnboundedSender<RemoteReply>>,
     controls: Vec<mpsc::UnboundedSender<NewConn>>,
-    conns: Mutex<HashMap<Box<str>, mpsc::Sender<RemoteOutbound>>>,
+    conns: Mutex<[HashMap<Box<str>, mpsc::Sender<RemoteOutbound>>; 2]>,
 }
 
 impl Fabric {
@@ -59,24 +59,24 @@ impl Fabric {
         Arc::new(Fabric {
             intakes,
             controls,
-            conns: Mutex::new(HashMap::new()),
+            conns: Mutex::new([HashMap::new(), HashMap::new()]),
         })
     }
 
     /// Returns the node's shared pipe, dialing it on the owner worker first.
     pub fn pipe(&self, addr: &str, readonly: bool) -> mpsc::Sender<RemoteOutbound> {
-        let key = Self::key(addr, readonly);
-        let Ok(mut conns) = self.conns.lock() else {
-            let (tx, _) = mpsc::channel(1);
-            return tx;
-        };
-        if let Some(tx) = conns.get(&*key)
+        let mut conns = self
+            .conns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let conns = &mut conns[usize::from(readonly)];
+        if let Some(tx) = conns.get(addr)
             && !tx.is_closed()
         {
             return tx.clone();
         }
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
-        conns.insert(key, tx.clone());
+        conns.insert(addr.into(), tx.clone());
         let owner = fnv(addr.as_bytes()) as usize % self.controls.len();
         let _ = self.controls[owner].send(NewConn {
             addr: addr.to_string(),
@@ -88,19 +88,13 @@ impl Fabric {
 
     // generation-safe: a replacement pipe created meanwhile must survive
     fn forget(&self, addr: &str, readonly: bool) {
-        if let Ok(mut conns) = self.conns.lock() {
-            let key = Self::key(addr, readonly);
-            if conns.get(&*key).is_some_and(|tx| tx.is_closed()) {
-                conns.remove(&*key);
-            }
-        }
-    }
-
-    fn key(addr: &str, readonly: bool) -> Box<str> {
-        if readonly {
-            format!("ro:{addr}").into()
-        } else {
-            addr.into()
+        let mut conns = self
+            .conns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let conns = &mut conns[usize::from(readonly)];
+        if conns.get(addr).is_some_and(|tx| tx.is_closed()) {
+            conns.remove(addr);
         }
     }
 }

@@ -70,8 +70,9 @@ pub async fn intake_loop(
         if rx.recv_many(&mut batch, crate::backend::BATCH).await == 0 {
             return;
         }
+        let registry = registry.borrow();
         for r in batch.drain(..) {
-            if let Some(q) = registry.borrow().get(&r.token) {
+            if let Some(q) = registry.get(&r.token) {
                 let _ = q.send(Reply::At(r.seq, r.frame));
             }
         }
@@ -324,18 +325,11 @@ impl Session {
     }
 
     // queues an ordered client reply on either pipe kind
-    fn queue_at(
-        &self,
-        pipe: &Pipe,
-        seq: u64,
-        head: Option<Bytes>,
-        frame: Bytes,
-        expect: u32,
-    ) -> Option<Box<ColdSend>> {
+    fn queue_at(&self, pipe: &Pipe, seq: u64, frame: Bytes, expect: u32) -> Option<Box<ColdSend>> {
         match pipe {
             Pipe::Local(conn) => {
                 let out = Outbound {
-                    head,
+                    head: None,
                     frame,
                     expect,
                     sink: Sink::Client(self.reply_q.clone(), seq),
@@ -347,7 +341,7 @@ impl Session {
             }
             Pipe::Shard(tx) => {
                 let out = crate::shard::RemoteOutbound {
-                    head,
+                    head: None,
                     frame,
                     expect,
                     reply: crate::shard::RemoteSink::Session {
@@ -381,9 +375,7 @@ impl Session {
             };
             self.cached_pipe(&topo, idx, false)
         };
-        if let Some(cold) = self.queue_at(&pipe, seq, None, frame, 1) {
-            cold.flush().await;
-        }
+        self.send_at(&pipe, seq, frame, 1).await;
     }
 
     fn any_master_addr(&self) -> Option<String> {
@@ -423,7 +415,13 @@ impl Session {
             self.cached_pipe(&topo, idx, is_replica)
         };
         self.track_inflight(seq, &frame, 1);
-        self.queue_at(&pipe, seq, None, frame, 1)
+        self.queue_at(&pipe, seq, frame, 1)
+    }
+
+    async fn send_at(&self, pipe: &Pipe, seq: u64, frame: Bytes, expect: u32) {
+        if let Some(cold) = self.queue_at(pipe, seq, frame, expect) {
+            cold.flush().await;
+        }
     }
 
     fn track_inflight(&self, seq: u64, frame: &Bytes, expect: u32) {
@@ -462,9 +460,7 @@ impl Session {
             return;
         };
         self.track_inflight(seq, &frame, 1);
-        if let Some(cold) = self.queue_at(&pipe, seq, None, frame, 1) {
-            cold.flush().await;
-        }
+        self.send_at(&pipe, seq, frame, 1).await;
     }
 
     async fn forward_xread(&self, spec: &Spec, frame: Bytes, argc: usize) {
@@ -856,9 +852,7 @@ impl Session {
         let expect = state.frames.len() as u32 + 2;
         let blob = Bytes::from(blob);
         self.track_inflight(seq, &blob, expect);
-        if let Some(cold) = self.queue_at(&pipe, seq, None, blob, expect) {
-            cold.flush().await;
-        }
+        self.send_at(&pipe, seq, blob, expect).await;
     }
 
     fn handle_auth(&self, args: &[&[u8]]) {
@@ -1186,8 +1180,8 @@ enum ColdSend {
 }
 
 impl ColdSend {
-    async fn flush(self) {
-        match self {
+    async fn flush(self: Box<Self>) {
+        match *self {
             ColdSend::Local(conn, out) => conn.send_wait(out).await,
             ColdSend::Shard(tx, out, q) => {
                 if let Err(e) = Box::pin(tx.send(out)).await
@@ -1719,7 +1713,9 @@ async fn write_loop(
             // queued frames and their backing buffer must not outlive the writer
             // via lingering backend sinks
             drop(std::mem::take(&mut *self.reply.q.borrow_mut()));
-            self.shared.registry.borrow_mut().remove(&self.client_id);
+            if self.shared.fabric.is_some() {
+                self.shared.registry.borrow_mut().remove(&self.client_id);
+            }
             mark_closed(self.link);
             stats::bump(&self.shared.stats.workers[self.shared.worker].writers_exited);
             self.link.oob_notify.notify_waiters();

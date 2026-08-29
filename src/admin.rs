@@ -185,7 +185,8 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
          total_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\n\
          total_errors:{}\r\nredirections:{}\r\n\
          readers_exited:{}\r\nwriters_exited:{}\r\nsessions_closed:{}\r\n\r\n\
-         # Mithril\r\nworker_threads:{}\r\nbackend_conns_per_node:{}\r\nslave_mode:{}\r\n\
+         # Mithril\r\nworker_threads:{}\r\nbackend_conns_per_node:{}\r\n\
+         backend_sharding:{}\r\nslave_mode:{}\r\n\
          worker_commands:{}\r\n",
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
@@ -203,6 +204,7 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
         stats.sum(|w| &w.sessions_closed),
         cfg.workers,
         cfg.backend_conns,
+        yesno(cfg.backend_sharding),
         cfg.slave_mode,
         stats
             .workers
@@ -301,6 +303,10 @@ fn split_announce(announce: &str) -> (String, u16) {
     }
 }
 
+fn yesno(v: bool) -> String {
+    if v { "yes" } else { "no" }.to_string()
+}
+
 fn config_pairs(cfg: &Config) -> Vec<(&'static str, String)> {
     vec![
         ("bind", cfg.bind.clone()),
@@ -310,6 +316,7 @@ fn config_pairs(cfg: &Config) -> Vec<(&'static str, String)> {
         ("maxclients", cfg.maxclients.to_string()),
         ("bootstrap", cfg.bootstrap.join(",")),
         ("backend-conns", cfg.backend_conns.to_string()),
+        ("backend-sharding", yesno(cfg.backend_sharding)),
         (
             "requirepass",
             if cfg.requirepass.is_empty() {

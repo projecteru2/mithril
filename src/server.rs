@@ -105,6 +105,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
         let topo = topo.clone();
         let stats = stats.clone();
         let refresh = refresh_tx.clone();
+        // receivers ship in worker order; fabric intakes/controls index by worker
         let shard = shard_parts
             .as_mut()
             .map(|(f, irs, crs)| (f.clone(), irs.remove(0), crs.remove(0)));

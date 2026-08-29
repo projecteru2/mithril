@@ -15,6 +15,8 @@ bootstrap 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
 
 # sticky shared connections per node per worker
 backend-conns 1
+# one process-wide pipe per node (deeper backend batches for unpipelined load)
+# backend-sharding no
 
 # client auth (empty = no auth) and backend auth
 # requirepass secret
