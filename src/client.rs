@@ -1,7 +1,8 @@
 //! Client sessions: dispatch, ordered replies, MULTI, pubsub, redirects.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::BuildHasherDefault;
 use std::io::IoSlice;
 use std::rc::Rc;
 
@@ -42,6 +43,7 @@ pub struct Shared {
     pub refresh: mpsc::UnboundedSender<()>,
     pub started: u64,
     pub fabric: Option<std::sync::Arc<crate::shard::Fabric>>,
+    pub cache: Option<Rc<crate::cache::ReplyCache>>,
 }
 
 /// One frame travelling to the client writer.
@@ -228,6 +230,7 @@ struct WriterLink {
     // pre-allocated sequences for pending pubsub confirmations, in order
     ack_seqs: RefCell<VecDeque<u64>>,
     acks_drained: tokio::sync::Notify,
+    fills: FillTickets,
 }
 // pending protocol flips; `armed` keeps the hot path off the RefCell
 #[derive(Default)]
@@ -255,6 +258,29 @@ impl ProtoSwitchQueue {
             q.pop_front();
             self.armed.set(self.armed.get() - 1);
         }
+    }
+}
+
+// cache fills awaiting their reply; `armed` keeps the reply path off the map
+#[derive(Default)]
+struct FillTickets {
+    armed: Cell<usize>,
+    map: RefCell<HashMap<u64, Bytes, BuildHasherDefault<crate::cache::KeyHasher>>>,
+}
+
+impl FillTickets {
+    fn arm(&self, seq: u64, key: Bytes) {
+        self.map.borrow_mut().insert(seq, key);
+        self.armed.set(self.armed.get() + 1);
+    }
+
+    fn take(&self, seq: u64) -> Option<Bytes> {
+        if self.armed.get() == 0 {
+            return None;
+        }
+        let key = self.map.borrow_mut().remove(&seq)?;
+        self.armed.set(self.armed.get() - 1);
+        Some(key)
     }
 }
 
@@ -333,10 +359,34 @@ impl Session {
             self.queue_multi(spec, frame, argc);
             return;
         }
+        if let Some(cache) = &self.shared.cache
+            && spec.is_write()
+        {
+            match spec.kind {
+                Kind::Flushall => cache.clear(),
+                _ => invalidate_keys(cache, spec, &frame, argc),
+            }
+        }
         match spec.kind {
-            Kind::Single => match it.nth(spec.first_key as usize - 1).map(crc16::slot) {
-                Some(slot) => {
-                    if let Some(cold) = self.route_single(slot, spec.is_readonly(), frame) {
+            Kind::Single => match it.nth(spec.first_key as usize - 1) {
+                Some(key) => {
+                    let slot = crc16::slot(key);
+                    let seq = self.alloc_seq();
+                    if let Some(cache) = &self.shared.cache
+                        && spec.flags & command::FLAG_CACHE != 0
+                    {
+                        if let Some(hit) = cache.lookup(key) {
+                            stats::bump(&self.shared.stats.workers[self.shared.worker].cache_hits);
+                            self.emit_at(seq, hit);
+                            return;
+                        }
+                        stats::bump(&self.shared.stats.workers[self.shared.worker].cache_misses);
+                        let key = frame.slice_ref(key);
+                        if cache.begin_fill(&key) {
+                            self.link.fills.arm(seq, key);
+                        }
+                    }
+                    if let Some(cold) = self.route_single(seq, slot, spec.is_readonly(), frame) {
                         cold.flush().await;
                     }
                 }
@@ -479,8 +529,13 @@ impl Session {
         Some(self.cached_pipe(&topo, idx, false))
     }
 
-    fn route_single(&self, slot: u16, readonly: bool, frame: Bytes) -> Option<Box<ColdSend>> {
-        let seq = self.alloc_seq();
+    fn route_single(
+        &self,
+        seq: u64,
+        slot: u16,
+        readonly: bool,
+        frame: Bytes,
+    ) -> Option<Box<ColdSend>> {
         let pipe = {
             let topo = self.topo();
             let picked = self
@@ -522,6 +577,14 @@ impl Session {
             } else {
                 None
             };
+            if let Some(cache) = &self.shared.cache
+                && numkeys >= 1
+                && 3 + numkeys as usize <= argc
+            {
+                for key in &args[3..3 + numkeys as usize] {
+                    cache.invalidate(key);
+                }
+            }
             (numkeys, slot)
         };
         if numkeys < 0 || 3 + numkeys as usize > argc {
@@ -568,7 +631,8 @@ impl Session {
             self.spawn_blocking(slot, frame);
             return;
         }
-        if let Some(cold) = self.route_single(slot, spec.is_readonly(), frame) {
+        let seq = self.alloc_seq();
+        if let Some(cold) = self.route_single(seq, slot, spec.is_readonly(), frame) {
             cold.flush().await;
         }
     }
@@ -914,6 +978,20 @@ impl Session {
         if state.frames.is_empty() {
             self.emit_local(Bytes::from_static(b"*0\r\n"));
             return;
+        }
+        if let Some(cache) = &self.shared.cache {
+            for f in &state.frames {
+                let argc = match resp::scan_int_line(f, 1) {
+                    Some((n, _)) if n > 0 => n as usize,
+                    _ => continue,
+                };
+                let spec = resp::Args::new(f, argc).next().and_then(command::lookup);
+                if let Some(spec) = spec
+                    && spec.is_write()
+                {
+                    invalidate_keys(cache, spec, f, argc);
+                }
+            }
         }
         let seq = self.alloc_seq();
         let Some(pipe) = self.owner_pipe(seq, state.slot) else {
@@ -1490,6 +1568,19 @@ fn collect_args(frame: &Bytes, argc: usize) -> Vec<&[u8]> {
     resp::Args::new(frame, argc).collect()
 }
 
+// writes drop their declared keys from the cache for read-your-writes
+fn invalidate_keys(cache: &crate::cache::ReplyCache, spec: &Spec, frame: &Bytes, argc: usize) {
+    let mut args = resp::Args::new(frame, argc);
+    let mut cur = 0;
+    for want in key_indices(spec, argc) {
+        let Some(key) = args.nth(want - cur) else {
+            return;
+        };
+        cache.invalidate(key);
+        cur = want + 1;
+    }
+}
+
 // argument indices holding keys, per the spec's first/last/step triple
 fn key_indices(spec: &Spec, argc: usize) -> impl Iterator<Item = usize> {
     let first = spec.first_key as usize;
@@ -1822,6 +1913,11 @@ async fn write_loop(
         fn drop(&mut self) {
             self.reply.close();
             mark_closed(self.link);
+            if let Some(cache) = &self.shared.cache {
+                for (_, key) in self.link.fills.map.borrow_mut().drain() {
+                    cache.abandon_fill(&key);
+                }
+            }
             stats::bump(&self.shared.stats.workers[self.shared.worker].writers_exited);
             self.link.oob_notify.notify_waiters();
         }
@@ -1891,6 +1987,11 @@ async fn write_loop(
                 };
                 if seq < next_emit {
                     continue;
+                }
+                if let Some(key) = link.fills.take(seq)
+                    && let Some(cache) = &shared.cache
+                {
+                    cache.complete_fill(&key, &frame);
                 }
                 if frame.first() == Some(&b'-')
                     && (frame.starts_with(b"-MOVED ") || frame.starts_with(b"-ASK "))

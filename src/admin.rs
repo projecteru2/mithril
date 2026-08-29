@@ -170,7 +170,9 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
          total_errors:{}\r\nredirections:{}\r\n\
          readers_exited:{}\r\nwriters_exited:{}\r\nsessions_closed:{}\r\n\r\n\
          # Mithril\r\nworker_threads:{}\r\nbackend_conns_per_node:{}\r\n\
-         backend_sharding:{}\r\nslave_mode:{}\r\n\
+         backend_sharding:{}\r\nslave_mode:{}\r\nreply_cache:{}\r\n\
+         cache_hits:{}\r\ncache_misses:{}\r\ncache_invalidations:{}\r\n\
+         cache_armed_workers:{}\r\n\
          worker_commands:{}\r\n",
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
@@ -190,6 +192,11 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
         cfg.backend_conns,
         yesno(cfg.backend_sharding),
         cfg.slave_mode,
+        yesno(cfg.reply_cache),
+        stats.sum(|w| &w.cache_hits),
+        stats.sum(|w| &w.cache_misses),
+        stats.sum(|w| &w.cache_invalidations),
+        stats.sum(|w| &w.cache_armed),
         stats
             .workers
             .iter()

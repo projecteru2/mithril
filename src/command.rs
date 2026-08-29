@@ -7,6 +7,8 @@ pub const FLAG_READONLY: u8 = 1 << 1;
 pub const FLAG_NO_AUTH: u8 = 1 << 2;
 /// Transaction-control commands dispatch normally inside MULTI.
 pub const FLAG_TXN_CTRL: u8 = 1 << 3;
+/// Replies may be served from and filled into the reply cache.
+pub const FLAG_CACHE: u8 = 1 << 4;
 pub const PREFIX_LEN: usize = 8;
 
 const LUT_BITS: u32 = 9;
@@ -16,6 +18,7 @@ const LOWER_MASK: u64 = 0x2020_2020_2020_2020;
 
 const W: u8 = FLAG_WRITE;
 const R: u8 = FLAG_READONLY;
+const C: u8 = FLAG_CACHE;
 const N: u8 = FLAG_NO_AUTH;
 const T: u8 = FLAG_TXN_CTRL;
 
@@ -58,7 +61,7 @@ static TABLE: &[Spec] = &[
     c("geopos", -2, R, 1, 1, 1, Kind::Single),
     c("georadius", -6, W, 1, 1, 1, Kind::Single),
     c("georadiusbymember", -5, W, 1, 1, 1, Kind::Single),
-    c("get", 2, R, 1, 1, 1, Kind::Single),
+    c("get", 2, R | C, 1, 1, 1, Kind::Single),
     c("getbit", 3, R, 1, 1, 1, Kind::Single),
     c("getdel", 2, W, 1, 1, 1, Kind::Single),
     c("getex", -2, W, 1, 1, 1, Kind::Single),

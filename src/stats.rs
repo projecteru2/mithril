@@ -15,6 +15,10 @@ pub struct WorkerStats {
     pub readers_exited: AtomicU64,
     pub writers_exited: AtomicU64,
     pub sessions_closed: AtomicU64,
+    pub cache_hits: AtomicU64,
+    pub cache_misses: AtomicU64,
+    pub cache_invalidations: AtomicU64,
+    pub cache_armed: AtomicU64,
 }
 
 /// Process-wide stats shared across workers.

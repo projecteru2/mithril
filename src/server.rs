@@ -314,6 +314,15 @@ fn worker_thread(
             tokio::task::spawn_local(shard::control_loop(ctl_rx, fabric.clone(), cfg.clone()));
             fabric
         });
+        let cache = cfg.reply_cache.then(|| {
+            let cache = crate::cache::ReplyCache::new(&cfg, stats.clone(), worker);
+            tokio::task::spawn_local(crate::cache::run_trackers(
+                cache.clone(),
+                topo.clone(),
+                local_cfg.clone(),
+            ));
+            cache
+        });
         let shared = Rc::new(Shared {
             cfg: local_cfg.clone(),
             topo,
@@ -323,6 +332,7 @@ fn worker_thread(
             refresh,
             started,
             fabric,
+            cache,
         });
         let mut next_client: u64 = worker as u64;
         while let Some(mut admitted) = conn_rx.recv().await {

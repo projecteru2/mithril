@@ -21,4 +21,13 @@
   keep RESP2 shape (flat arrays, not maps) — every mainstream client parses
   by wire type and accepts this.
 - AUTH is single-password (`requirepass`, default user). No ACL user table.
+- `reply-cache yes` serves GET from a worker-local cache. Coherence: each
+  worker holds one RESP3 `CLIENT TRACKING ON BCAST` connection per master and
+  drops entries the moment any write is broadcast; writes through the proxy
+  also drop their keys synchronously on their worker, so a session always
+  reads its own writes. Residual staleness is the invalidation push latency
+  (cross-client, sub-millisecond) plus, for keys expiring server-side, the
+  active-expire cycle; `reply-cache-max-age-secs` caps both. The cache only
+  serves while every master's tracking connection is up — coverage loss
+  flushes it and pauses fills.
 

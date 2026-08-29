@@ -438,3 +438,61 @@ def test_pipelined_burst_raw_socket(raw_socket, key_prefix):
     for i in range(n):
         assert reader.read_reply() == "OK"
         assert reader.read_reply() == f"v{i}"
+
+
+@pytest.fixture
+def cache_proxy(r):
+    """The proxy under test, once its reply cache is enabled and armed."""
+    info = r.info()
+    if str(info.get("reply_cache", "no")) != "yes":
+        pytest.skip("reply-cache disabled")
+    workers = int(info["worker_threads"])
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if int(r.info().get("cache_armed_workers", 0)) == workers:
+            return r
+        time.sleep(0.2)
+    pytest.fail("reply cache never armed")
+
+
+def test_cache_hits_and_read_your_writes(cache_proxy, key_prefix):
+    r = cache_proxy
+    key = f"{key_prefix}:c1"
+    assert r.set(key, "v1")
+    assert r.get(key) == "v1"
+    before = int(r.info()["cache_hits"])
+    assert r.get(key) == "v1"
+    assert int(r.info()["cache_hits"]) > before
+    assert r.set(key, "v2")
+    assert r.get(key) == "v2"
+
+
+def test_cache_converges_after_external_write(cache_proxy, cluster_direct, key_prefix):
+    r = cache_proxy
+    key = f"{key_prefix}:c2"
+    assert r.set(key, "v1")
+    assert r.get(key) == "v1"
+    assert r.get(key) == "v1"
+    cluster_direct.set(key, "v2")
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        if r.get(key) == "v2":
+            break
+        time.sleep(0.05)
+    assert r.get(key) == "v2"
+
+
+def test_cache_nil_entries_invalidate(cache_proxy, cluster_direct, key_prefix):
+    r = cache_proxy
+    key = f"{key_prefix}:c3"
+    assert r.get(key) is None
+    assert r.get(key) is None
+    assert r.set(key, "v1")
+    assert r.get(key) == "v1"
+    cluster_direct.delete(key)
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        if r.get(key) is None:
+            break
+        time.sleep(0.05)
+    assert r.get(key) is None

@@ -80,10 +80,10 @@ impl<'a> Iterator for Args<'a> {
 }
 
 // a null bulk carries no payload: all three offsets coincide
-struct Bulk {
-    payload_start: usize,
-    payload_end: usize,
-    next: usize,
+pub(crate) struct Bulk {
+    pub(crate) payload_start: usize,
+    pub(crate) payload_end: usize,
+    pub(crate) next: usize,
 }
 
 type BulkScan = Option<Result<Bulk, &'static str>>;
@@ -372,7 +372,7 @@ fn scan_inline(buf: &[u8]) -> ReqScan {
     }
 }
 
-fn scan_bulk(buf: &[u8], pos: usize) -> BulkScan {
+pub(crate) fn scan_bulk(buf: &[u8], pos: usize) -> BulkScan {
     match buf.get(pos) {
         Some(b'$') | Some(b'=') => {}
         Some(_) => return Some(Err("expected bulk string")),

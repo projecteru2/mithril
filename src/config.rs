@@ -61,6 +61,9 @@ pub struct Config {
     pub bootstrap: Vec<String>,
     pub backend_conns: usize,
     pub backend_sharding: bool,
+    pub reply_cache: bool,
+    pub reply_cache_max_bytes: usize,
+    pub reply_cache_max_age_secs: u64,
     pub requirepass: String,
     pub backend_user: String,
     pub backend_pass: String,
@@ -83,6 +86,9 @@ impl Default for Config {
             bootstrap: Vec::new(),
             backend_conns: 1,
             backend_sharding: false,
+            reply_cache: false,
+            reply_cache_max_bytes: 64 << 20,
+            reply_cache_max_age_secs: 10,
             requirepass: String::new(),
             backend_user: String::new(),
             backend_pass: String::new(),
@@ -125,12 +131,13 @@ impl Config {
                 self.bootstrap = value.split(',').map(|s| s.trim().to_string()).collect();
             }
             "backend-conns" => self.backend_conns = parse_bounded(key, value, 1, 512)?,
-            "backend-sharding" => {
-                self.backend_sharding = match value {
-                    "yes" | "on" | "true" => true,
-                    "no" | "off" | "false" => false,
-                    _ => return Err(format!("{key}: expected yes or no, got '{value}'")),
-                }
+            "backend-sharding" => self.backend_sharding = parse_yesno(key, value)?,
+            "reply-cache" => self.reply_cache = parse_yesno(key, value)?,
+            "reply-cache-max-bytes" => {
+                self.reply_cache_max_bytes = parse_bytes(key, value)?.max(1 << 20);
+            }
+            "reply-cache-max-age-secs" => {
+                self.reply_cache_max_age_secs = parse_bounded(key, value, 1, 3600)? as u64;
             }
             "requirepass" => self.requirepass = value.to_string(),
             "backend-auth-user" => self.backend_user = value.to_string(),
@@ -181,6 +188,14 @@ fn parse_bounded(key: &str, value: &str, min: usize, max: usize) -> Result<usize
         return Err(format!("'{key}' must be in [{min}, {max}]"));
     }
     Ok(n)
+}
+
+fn parse_yesno(key: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "yes" | "on" | "true" => Ok(true),
+        "no" | "off" | "false" => Ok(false),
+        _ => Err(format!("{key}: expected yes or no, got '{value}'")),
+    }
 }
 
 fn parse_placement(value: &str) -> Result<Placement, String> {
