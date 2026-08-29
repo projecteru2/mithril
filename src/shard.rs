@@ -37,6 +37,9 @@ pub struct RemoteReply {
     pub frame: Bytes,
 }
 
+/// One wake per parse pass: replies cross in per-home batches.
+pub type ReplyBatch = Vec<RemoteReply>;
+
 /// A node connection handed to its owner worker to run.
 pub struct NewConn {
     pub addr: String,
@@ -46,14 +49,14 @@ pub struct NewConn {
 
 /// Process-wide shard fabric shared by every worker.
 pub struct Fabric {
-    intakes: Vec<mpsc::UnboundedSender<RemoteReply>>,
+    intakes: Vec<mpsc::UnboundedSender<ReplyBatch>>,
     controls: Vec<mpsc::UnboundedSender<NewConn>>,
     conns: Mutex<[HashMap<Box<str>, mpsc::Sender<RemoteOutbound>>; 2]>,
 }
 
 impl Fabric {
     pub fn new(
-        intakes: Vec<mpsc::UnboundedSender<RemoteReply>>,
+        intakes: Vec<mpsc::UnboundedSender<ReplyBatch>>,
         controls: Vec<mpsc::UnboundedSender<NewConn>>,
     ) -> Arc<Fabric> {
         Arc::new(Fabric {
@@ -150,14 +153,7 @@ async fn run_shard_conn(
             return;
         }
     };
-    let deliver = |reply: RemoteSink, frame: Bytes| match reply {
-        RemoteSink::Session { home, token, seq } => {
-            let _ = fabric.intakes[home as usize].send(RemoteReply { token, seq, frame });
-        }
-        RemoteSink::One(tx) => {
-            let _ = tx.send(frame);
-        }
-    };
+    let mut outboxes: Vec<ReplyBatch> = (0..fabric.intakes.len()).map(|_| Vec::new()).collect();
     let mut pending: std::collections::VecDeque<Pending> = std::collections::VecDeque::new();
     let mut front_err: Option<Bytes> = None;
     let mut batch: Vec<RemoteOutbound> = Vec::with_capacity(BATCH);
@@ -182,7 +178,7 @@ async fn run_shard_conn(
                                     Some(err) if is_err => err,
                                     _ => frame,
                                 };
-                                deliver(d.reply, reply);
+                                stage(&mut outboxes, d.reply, reply);
                             }
                         }
                     }
@@ -194,6 +190,7 @@ async fn run_shard_conn(
                 resp::Scan::Incomplete => break,
             }
         }
+        flush_outboxes(&mut outboxes, fabric);
         ensure_read_room(&mut buf);
         tokio::select! {
             n = rx.recv_many(&mut batch, BATCH) => {
@@ -226,27 +223,43 @@ async fn run_shard_conn(
         }
     }
     for p in pending.drain(..) {
-        deliver(p.reply, Bytes::from_static(ERR_BACKEND_LOST));
+        stage(&mut outboxes, p.reply, Bytes::from_static(ERR_BACKEND_LOST));
     }
+    flush_outboxes(&mut outboxes, fabric);
     drain(&mut rx, fabric);
+}
+
+// oneshot sinks resolve at once; session replies wait for the pass flush
+fn stage(outboxes: &mut [ReplyBatch], reply: RemoteSink, frame: Bytes) {
+    match reply {
+        RemoteSink::Session { home, token, seq } => {
+            outboxes[home as usize].push(RemoteReply { token, seq, frame });
+        }
+        RemoteSink::One(tx) => {
+            let _ = tx.send(frame);
+        }
+    }
+}
+
+fn flush_outboxes(outboxes: &mut [ReplyBatch], fabric: &Fabric) {
+    for (home, batch) in outboxes.iter_mut().enumerate() {
+        if !batch.is_empty() {
+            let _ = fabric.intakes[home].send(std::mem::take(batch));
+        }
+    }
 }
 
 fn drain(rx: &mut mpsc::Receiver<RemoteOutbound>, fabric: &Fabric) {
     rx.close();
+    let mut outboxes: Vec<ReplyBatch> = (0..fabric.intakes.len()).map(|_| Vec::new()).collect();
     while let Ok(out) = rx.try_recv() {
-        match out.reply {
-            RemoteSink::Session { home, token, seq } => {
-                let _ = fabric.intakes[home as usize].send(RemoteReply {
-                    token,
-                    seq,
-                    frame: Bytes::from_static(ERR_BACKEND_LOST),
-                });
-            }
-            RemoteSink::One(tx) => {
-                let _ = tx.send(Bytes::from_static(ERR_BACKEND_LOST));
-            }
-        }
+        stage(
+            &mut outboxes,
+            out.reply,
+            Bytes::from_static(ERR_BACKEND_LOST),
+        );
     }
+    flush_outboxes(&mut outboxes, fabric);
 }
 
 fn fnv(data: &[u8]) -> u64 {

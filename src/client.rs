@@ -58,22 +58,46 @@ pub enum Reply {
 }
 
 /// Sessions visible to the shard intake, keyed by client id.
-pub type Registry = Rc<RefCell<std::collections::HashMap<u64, Rc<ReplyQueue>>>>;
+pub type Registry = Rc<
+    RefCell<
+        std::collections::HashMap<u64, Rc<ReplyQueue>, std::hash::BuildHasherDefault<TokenHasher>>,
+    >,
+>;
 
-/// Routes sharded replies arriving from owner workers to their sessions.
+/// Multiply-shift hasher for the strided-u64 session tokens.
+#[derive(Default)]
+pub struct TokenHasher(u64);
+
+impl std::hash::Hasher for TokenHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, _bytes: &[u8]) {
+        unreachable!("token keys hash as u64");
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+/// Routes sharded reply batches arriving from owner workers to their sessions.
 pub async fn intake_loop(
-    mut rx: mpsc::UnboundedReceiver<crate::shard::RemoteReply>,
+    mut rx: mpsc::UnboundedReceiver<crate::shard::ReplyBatch>,
     registry: Registry,
 ) {
-    let mut batch = Vec::with_capacity(crate::backend::BATCH);
+    let mut batches = Vec::with_capacity(crate::backend::BATCH);
     loop {
-        if rx.recv_many(&mut batch, crate::backend::BATCH).await == 0 {
+        if rx.recv_many(&mut batches, crate::backend::BATCH).await == 0 {
             return;
         }
         let registry = registry.borrow();
-        for r in batch.drain(..) {
-            if let Some(q) = registry.get(&r.token) {
-                let _ = q.send(Reply::At(r.seq, r.frame));
+        for batch in batches.drain(..) {
+            for r in batch {
+                if let Some(q) = registry.get(&r.token) {
+                    let _ = q.send(Reply::At(r.seq, r.frame));
+                }
             }
         }
     }

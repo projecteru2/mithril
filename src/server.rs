@@ -38,7 +38,7 @@ const DRAIN_POLL: Duration = Duration::from_millis(50);
 
 type ShardWiring = (
     Arc<shard::Fabric>,
-    mpsc::UnboundedReceiver<shard::RemoteReply>,
+    mpsc::UnboundedReceiver<shard::ReplyBatch>,
     mpsc::UnboundedReceiver<shard::NewConn>,
 );
 
@@ -323,7 +323,8 @@ fn worker_thread(
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
         let local_cfg = Rc::new((*cfg).clone());
-        let registry: client::Registry = Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let registry: client::Registry =
+            Rc::new(RefCell::new(std::collections::HashMap::default()));
         let fabric = shard.map(|(fabric, intake_rx, ctl_rx)| {
             tokio::task::spawn_local(client::intake_loop(intake_rx, registry.clone()));
             tokio::task::spawn_local(shard::control_loop(ctl_rx, fabric.clone(), cfg.clone()));
