@@ -40,6 +40,9 @@ pub struct RemoteReply {
 /// One wake per parse pass: replies cross in per-home batches.
 pub type ReplyBatch = Vec<RemoteReply>;
 
+// bounds intake work per turn together with the receiver's batch cap
+const REPLY_BATCH_CAP: usize = 512;
+
 /// A node connection handed to its owner worker to run.
 pub struct NewConn {
     pub addr: String,
@@ -178,7 +181,10 @@ async fn run_shard_conn(
                                     Some(err) if is_err => err,
                                     _ => frame,
                                 };
-                                stage(&mut outboxes, d.reply, reply);
+                                if let Some(full) = stage(&mut outboxes, d.reply, reply) {
+                                    let _ = fabric.intakes[full]
+                                        .send(std::mem::take(&mut outboxes[full]));
+                                }
                             }
                         }
                     }
@@ -223,20 +229,26 @@ async fn run_shard_conn(
         }
     }
     for p in pending.drain(..) {
-        stage(&mut outboxes, p.reply, Bytes::from_static(ERR_BACKEND_LOST));
+        if let Some(full) = stage(&mut outboxes, p.reply, Bytes::from_static(ERR_BACKEND_LOST)) {
+            let _ = fabric.intakes[full].send(std::mem::take(&mut outboxes[full]));
+        }
     }
     flush_outboxes(&mut outboxes, fabric);
     drain(&mut rx, fabric);
 }
 
-// oneshot sinks resolve at once; session replies wait for the pass flush
-fn stage(outboxes: &mut [ReplyBatch], reply: RemoteSink, frame: Bytes) {
+// oneshot sinks resolve at once; session replies wait for the pass flush,
+// or sooner when a home's batch hits its cap
+fn stage(outboxes: &mut [ReplyBatch], reply: RemoteSink, frame: Bytes) -> Option<usize> {
     match reply {
         RemoteSink::Session { home, token, seq } => {
-            outboxes[home as usize].push(RemoteReply { token, seq, frame });
+            let home = home as usize;
+            outboxes[home].push(RemoteReply { token, seq, frame });
+            (outboxes[home].len() >= REPLY_BATCH_CAP).then_some(home)
         }
         RemoteSink::One(tx) => {
             let _ = tx.send(frame);
+            None
         }
     }
 }
@@ -253,11 +265,13 @@ fn drain(rx: &mut mpsc::Receiver<RemoteOutbound>, fabric: &Fabric) {
     rx.close();
     let mut outboxes: Vec<ReplyBatch> = (0..fabric.intakes.len()).map(|_| Vec::new()).collect();
     while let Ok(out) = rx.try_recv() {
-        stage(
+        if let Some(full) = stage(
             &mut outboxes,
             out.reply,
             Bytes::from_static(ERR_BACKEND_LOST),
-        );
+        ) {
+            let _ = fabric.intakes[full].send(std::mem::take(&mut outboxes[full]));
+        }
     }
     flush_outboxes(&mut outboxes, fabric);
 }

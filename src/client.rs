@@ -89,7 +89,8 @@ pub async fn intake_loop(
     mut rx: mpsc::UnboundedReceiver<crate::shard::ReplyBatch>,
     registry: Registry,
 ) {
-    const INTAKE_BATCHES: usize = 32;
+    // batches are capped at shard::REPLY_BATCH_CAP, bounding replies per turn
+    const INTAKE_BATCHES: usize = 8;
     let mut batches = Vec::with_capacity(INTAKE_BATCHES);
     loop {
         if rx.recv_many(&mut batches, INTAKE_BATCHES).await == 0 {
