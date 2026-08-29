@@ -12,9 +12,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
+use std::cell::RefCell;
+
 use crate::backend::Backends;
-use crate::client::{Shared, serve};
+use crate::client::{self, Shared, serve};
 use crate::config::{Config, Placement};
+use crate::shard;
 use crate::stats::Stats;
 use crate::topology::Topology;
 use crate::{log_notice, log_warn, resp};
@@ -32,6 +35,12 @@ const SNAP_WINDOW: Duration = Duration::from_millis(10);
 // below this many commands per window the proxy is idle: place by rotation
 const QUIET_FLOOR: u64 = 128;
 const DRAIN_POLL: Duration = Duration::from_millis(50);
+
+type ShardWiring = (
+    Arc<shard::Fabric>,
+    mpsc::UnboundedReceiver<shard::RemoteReply>,
+    mpsc::UnboundedReceiver<shard::NewConn>,
+);
 
 static TOPO_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Set on SIGINT/SIGTERM; accept loops stop taking new connections.
@@ -71,6 +80,23 @@ pub fn run(cfg: Config) -> Result<(), String> {
 
     let listener = bind_listener(&cfg.bind, cfg.port)
         .map_err(|e| format!("bind {}:{}: {e}", cfg.bind, cfg.port))?;
+    let mut shard_parts = if cfg.backend_sharding {
+        let mut intake_txs = Vec::with_capacity(cfg.workers);
+        let mut intake_rxs = Vec::with_capacity(cfg.workers);
+        let mut ctl_txs = Vec::with_capacity(cfg.workers);
+        let mut ctl_rxs = Vec::with_capacity(cfg.workers);
+        for _ in 0..cfg.workers {
+            let (it, ir) = mpsc::unbounded_channel();
+            intake_txs.push(it);
+            intake_rxs.push(ir);
+            let (ct, cr) = mpsc::unbounded_channel();
+            ctl_txs.push(ct);
+            ctl_rxs.push(cr);
+        }
+        Some((shard::Fabric::new(intake_txs, ctl_txs), intake_rxs, ctl_rxs))
+    } else {
+        None
+    };
     let mut conn_txs = Vec::with_capacity(cfg.workers);
     for worker in 0..cfg.workers {
         let (conn_tx, conn_rx) = mpsc::channel::<Admitted>(ACCEPT_QUEUE);
@@ -79,9 +105,20 @@ pub fn run(cfg: Config) -> Result<(), String> {
         let topo = topo.clone();
         let stats = stats.clone();
         let refresh = refresh_tx.clone();
+        let shard = shard_parts
+            .as_mut()
+            .map(|(f, irs, crs)| (f.clone(), irs.remove(0), crs.remove(0)));
+        let ctx = WorkerCtx {
+            cfg,
+            topo,
+            stats,
+            refresh,
+            worker,
+            started,
+        };
         std::thread::Builder::new()
             .name(format!("mithril-{worker}"))
-            .spawn(move || worker_thread(cfg, topo, stats, refresh, worker, started, conn_rx))
+            .spawn(move || worker_thread(ctx, conn_rx, shard))
             .map_err(|e| format!("spawn worker: {e}"))?;
     }
     let acceptor_cfg = cfg.clone();
@@ -257,21 +294,40 @@ fn acceptor_thread(
     });
 }
 
-fn worker_thread(
+struct WorkerCtx {
     cfg: Arc<Config>,
     topo: Arc<ArcSwap<Topology>>,
     stats: Arc<Stats>,
     refresh: mpsc::UnboundedSender<()>,
     worker: usize,
     started: u64,
+}
+
+fn worker_thread(
+    ctx: WorkerCtx,
     mut conn_rx: mpsc::Receiver<Admitted>,
+    shard: Option<ShardWiring>,
 ) {
+    let WorkerCtx {
+        cfg,
+        topo,
+        stats,
+        refresh,
+        worker,
+        started,
+    } = ctx;
     let Some(rt) = current_thread_rt("worker") else {
         return;
     };
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
         let local_cfg = Rc::new((*cfg).clone());
+        let registry: client::Registry = Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let fabric = shard.map(|(fabric, intake_rx, ctl_rx)| {
+            tokio::task::spawn_local(client::intake_loop(intake_rx, registry.clone()));
+            tokio::task::spawn_local(shard::control_loop(ctl_rx, fabric.clone(), cfg.clone()));
+            fabric
+        });
         let shared = Rc::new(Shared {
             cfg: local_cfg.clone(),
             topo,
@@ -280,6 +336,8 @@ fn worker_thread(
             worker,
             refresh,
             started,
+            fabric,
+            registry,
         });
         let mut next_client: u64 = worker as u64;
         while let Some(mut admitted) = conn_rx.recv().await {

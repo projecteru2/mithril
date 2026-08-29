@@ -409,7 +409,7 @@ fn drain_channel(rx: &mut mpsc::Receiver<Outbound>) {
     }
 }
 
-async fn connect(addr: &str, keepalive_secs: u64) -> std::io::Result<TcpStream> {
+pub(crate) async fn connect(addr: &str, keepalive_secs: u64) -> std::io::Result<TcpStream> {
     let stream = TcpStream::connect(addr).await?;
     stream.set_nodelay(true)?;
     let sock = socket2::SockRef::from(&stream);
@@ -419,7 +419,7 @@ async fn connect(addr: &str, keepalive_secs: u64) -> std::io::Result<TcpStream> 
     Ok(stream)
 }
 
-async fn handshake(
+pub(crate) async fn handshake(
     reader: &mut OwnedReadHalf,
     writer: &mut OwnedWriteHalf,
     readonly: bool,

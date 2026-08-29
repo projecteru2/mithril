@@ -41,6 +41,8 @@ pub struct Shared {
     pub worker: usize,
     pub refresh: mpsc::UnboundedSender<()>,
     pub started: u64,
+    pub fabric: Option<std::sync::Arc<crate::shard::Fabric>>,
+    pub registry: Registry,
 }
 
 /// One frame travelling to the client writer.
@@ -53,6 +55,27 @@ pub enum Reply {
     Push { after: Option<u64>, frame: Bytes },
     /// Closes the client connection once the pending batch is flushed.
     Close,
+}
+
+/// Sessions visible to the shard intake, keyed by client id.
+pub type Registry = Rc<RefCell<std::collections::HashMap<u64, Rc<ReplyQueue>>>>;
+
+/// Routes sharded replies arriving from owner workers to their sessions.
+pub async fn intake_loop(
+    mut rx: mpsc::UnboundedReceiver<crate::shard::RemoteReply>,
+    registry: Registry,
+) {
+    let mut batch = Vec::with_capacity(crate::backend::BATCH);
+    loop {
+        if rx.recv_many(&mut batch, crate::backend::BATCH).await == 0 {
+            return;
+        }
+        for r in batch.drain(..) {
+            if let Some(q) = registry.borrow().get(&r.token) {
+                let _ = q.send(Reply::At(r.seq, r.frame));
+            }
+        }
+    }
 }
 
 /// Worker-local reply queue: plain RefCell ops where an mpsc would pay atomics.
@@ -243,8 +266,7 @@ impl Session {
             Kind::Single => match it.nth(spec.first_key as usize - 1).map(crc16::slot) {
                 Some(slot) => {
                     if let Some(cold) = self.route_single(slot, spec.is_readonly(), frame) {
-                        let (conn, out) = *cold;
-                        conn.send_wait(out).await;
+                        cold.flush().await;
                     }
                 }
                 None => self.emit_error("ERR missing key"),
@@ -277,7 +299,7 @@ impl Session {
     }
 
     // one Vec index per request once warm; re-resolves on epoch or death
-    fn cached_conn(&self, topo: &Topology, idx: u16, is_replica: bool) -> Rc<crate::backend::Conn> {
+    fn cached_pipe(&self, topo: &Topology, idx: u16, is_replica: bool) -> Pipe {
         let mut cache = self.conns.borrow_mut();
         if cache.epoch != topo.epoch {
             cache.epoch = topo.epoch;
@@ -287,31 +309,81 @@ impl Session {
             cache.by_node.resize(topo.nodes.len(), None);
         }
         let entry = &mut cache.by_node[idx as usize];
-        if let Some(conn) = entry
-            && !conn.is_dead()
+        if let Some(pipe) = entry
+            && !pipe.is_dead()
         {
-            return conn.clone();
+            return pipe.clone();
         }
-        let conn = self
-            .shared
-            .backends
-            .shared(&topo.nodes[idx as usize].addr, self.id, is_replica);
-        *entry = Some(conn.clone());
-        conn
+        let addr = &topo.nodes[idx as usize].addr;
+        let pipe = match &self.shared.fabric {
+            Some(f) => Pipe::Shard(f.pipe(addr, is_replica)),
+            None => Pipe::Local(self.shared.backends.shared(addr, self.id, is_replica)),
+        };
+        *entry = Some(pipe.clone());
+        pipe
+    }
+
+    // queues an ordered client reply on either pipe kind
+    fn queue_at(
+        &self,
+        pipe: &Pipe,
+        seq: u64,
+        head: Option<Bytes>,
+        frame: Bytes,
+        expect: u32,
+    ) -> Option<Box<ColdSend>> {
+        match pipe {
+            Pipe::Local(conn) => {
+                let out = Outbound {
+                    head,
+                    frame,
+                    expect,
+                    sink: Sink::Client(self.reply_q.clone(), seq),
+                };
+                match conn.try_send(out) {
+                    Ok(()) => None,
+                    Err(out) => Some(Box::new(ColdSend::Local(conn.clone(), out))),
+                }
+            }
+            Pipe::Shard(tx) => {
+                let out = crate::shard::RemoteOutbound {
+                    head,
+                    frame,
+                    expect,
+                    reply: crate::shard::RemoteSink::Session {
+                        home: self.shared.worker as u32,
+                        token: self.id,
+                        seq,
+                    },
+                };
+                match tx.try_send(out) {
+                    Ok(()) => None,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(out)) => Some(Box::new(
+                        ColdSend::Shard(tx.clone(), out, self.reply_q.clone()),
+                    )),
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        self.emit_at(seq, Bytes::from_static(ERR_BACKEND_LOST));
+                        None
+                    }
+                }
+            }
+        }
     }
 
     async fn forward_any_master(&self, frame: Bytes) {
         let seq = self.alloc_seq();
-        let conn = {
+        let pipe = {
             let topo = self.topo();
             let picked = self.with_rng(|r| route::any_master(&topo, r));
             let Some(idx) = picked else {
                 self.emit_at(seq, Bytes::from_static(ERR_NO_OWNER));
                 return;
             };
-            self.cached_conn(&topo, idx, false)
+            self.cached_pipe(&topo, idx, false)
         };
-        conn.send(self.client_out(seq, frame)).await;
+        if let Some(cold) = self.queue_at(&pipe, seq, None, frame, 1) {
+            cold.flush().await;
+        }
     }
 
     fn any_master_addr(&self) -> Option<String> {
@@ -327,25 +399,20 @@ impl Session {
         out
     }
 
-    // resolves a slot's master connection, emitting ERR_NO_OWNER at seq if unowned
-    fn owner_conn(&self, seq: u64, slot: Option<u16>) -> Option<Rc<crate::backend::Conn>> {
+    // resolves a slot's master route, emitting ERR_NO_OWNER at seq if unowned
+    fn owner_pipe(&self, seq: u64, slot: Option<u16>) -> Option<Pipe> {
         let topo = self.topo();
         let Some(idx) = slot.and_then(|sl| topo.owner(sl)) else {
             self.emit_at(seq, Bytes::from_static(ERR_NO_OWNER));
             return None;
         };
-        Some(self.cached_conn(&topo, idx, false))
+        Some(self.cached_pipe(&topo, idx, false))
     }
 
-    // sync fast path: the returned pair is the rare full-queue leftover to await
-    fn route_single(
-        &self,
-        slot: u16,
-        readonly: bool,
-        frame: Bytes,
-    ) -> Option<Box<(Rc<crate::backend::Conn>, Outbound)>> {
+    // sync fast path: the returned box is the rare full-queue leftover to await
+    fn route_single(&self, slot: u16, readonly: bool, frame: Bytes) -> Option<Box<ColdSend>> {
         let seq = self.alloc_seq();
-        let conn = {
+        let pipe = {
             let topo = self.topo();
             let picked = self
                 .with_rng(|r| route::pick(&topo, slot, readonly, self.shared.cfg.slave_mode, r));
@@ -353,22 +420,10 @@ impl Session {
                 self.emit_at(seq, Bytes::from_static(ERR_NO_OWNER));
                 return None;
             };
-            self.cached_conn(&topo, idx, is_replica)
+            self.cached_pipe(&topo, idx, is_replica)
         };
         self.track_inflight(seq, &frame, 1);
-        match conn.try_send(self.client_out(seq, frame)) {
-            Ok(()) => None,
-            Err(out) => Some(Box::new((conn, out))),
-        }
-    }
-
-    fn client_out(&self, seq: u64, frame: Bytes) -> Outbound {
-        Outbound {
-            head: None,
-            frame,
-            expect: 1,
-            sink: Sink::Client(self.reply_q.clone(), seq),
-        }
+        self.queue_at(&pipe, seq, None, frame, 1)
     }
 
     fn track_inflight(&self, seq: u64, frame: &Bytes, expect: u32) {
@@ -403,11 +458,13 @@ impl Session {
             return;
         }
         let seq = self.alloc_seq();
-        let Some(conn) = self.owner_conn(seq, slot) else {
+        let Some(pipe) = self.owner_pipe(seq, slot) else {
             return;
         };
         self.track_inflight(seq, &frame, 1);
-        conn.send(self.client_out(seq, frame)).await;
+        if let Some(cold) = self.queue_at(&pipe, seq, None, frame, 1) {
+            cold.flush().await;
+        }
     }
 
     async fn forward_xread(&self, spec: &Spec, frame: Bytes, argc: usize) {
@@ -439,8 +496,7 @@ impl Session {
             return;
         }
         if let Some(cold) = self.route_single(slot, spec.is_readonly(), frame) {
-            let (conn, out) = *cold;
-            conn.send_wait(out).await;
+            cold.flush().await;
         }
     }
 
@@ -787,7 +843,7 @@ impl Session {
             return;
         }
         let seq = self.alloc_seq();
-        let Some(conn) = self.owner_conn(seq, state.slot) else {
+        let Some(pipe) = self.owner_pipe(seq, state.slot) else {
             return;
         };
         let body: usize = state.frames.iter().map(Bytes::len).sum();
@@ -800,13 +856,9 @@ impl Session {
         let expect = state.frames.len() as u32 + 2;
         let blob = Bytes::from(blob);
         self.track_inflight(seq, &blob, expect);
-        conn.send(Outbound {
-            head: None,
-            frame: blob,
-            expect,
-            sink: Sink::Client(self.reply_q.clone(), seq),
-        })
-        .await;
+        if let Some(cold) = self.queue_at(&pipe, seq, None, blob, expect) {
+            cold.flush().await;
+        }
     }
 
     fn handle_auth(&self, args: &[&[u8]]) {
@@ -1104,7 +1156,48 @@ impl Session {
 // per-session resolved connections, valid for one topology epoch
 struct ConnCache {
     epoch: u64,
-    by_node: Vec<Option<Rc<crate::backend::Conn>>>,
+    by_node: Vec<Option<Pipe>>,
+}
+
+/// A route to one backend node: worker-local conn or the process-wide shard.
+#[derive(Clone)]
+enum Pipe {
+    Local(Rc<crate::backend::Conn>),
+    Shard(tokio::sync::mpsc::Sender<crate::shard::RemoteOutbound>),
+}
+
+impl Pipe {
+    fn is_dead(&self) -> bool {
+        match self {
+            Pipe::Local(conn) => conn.is_dead(),
+            Pipe::Shard(tx) => tx.is_closed(),
+        }
+    }
+}
+
+// the rare full-queue leftover; flushed with an awaited send
+enum ColdSend {
+    Local(Rc<crate::backend::Conn>, Outbound),
+    Shard(
+        tokio::sync::mpsc::Sender<crate::shard::RemoteOutbound>,
+        crate::shard::RemoteOutbound,
+        Rc<ReplyQueue>,
+    ),
+}
+
+impl ColdSend {
+    async fn flush(self) {
+        match self {
+            ColdSend::Local(conn, out) => conn.send_wait(out).await,
+            ColdSend::Shard(tx, out, q) => {
+                if let Err(e) = Box::pin(tx.send(out)).await
+                    && let crate::shard::RemoteSink::Session { seq, .. } = e.0.reply
+                {
+                    let _ = q.send(Reply::At(seq, Bytes::from_static(ERR_BACKEND_LOST)));
+                }
+            }
+        }
+    }
 }
 
 struct MultiState {
@@ -1205,6 +1298,9 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         topo_cache: RefCell::new(shared.topo.load_full()),
     };
 
+    if shared.fabric.is_some() {
+        shared.registry.borrow_mut().insert(id, reply_q.clone());
+    }
     let (close_tx, close_rx) = oneshot::channel::<u64>();
     let writer = tokio::task::spawn_local(write_loop(
         shared.clone(),
@@ -1341,14 +1437,28 @@ async fn scatter_one(
 ) -> oneshot::Receiver<Bytes> {
     let (tx, rx) = oneshot::channel();
     let expect = 1 + u32::from(head.is_some());
-    let conn = shared.backends.shared(addr, id, readonly);
-    conn.send(Outbound {
-        head,
-        frame,
-        expect,
-        sink: Sink::One(tx),
-    })
-    .await;
+    match &shared.fabric {
+        Some(f) => {
+            let out = crate::shard::RemoteOutbound {
+                head,
+                frame,
+                expect,
+                reply: crate::shard::RemoteSink::One(tx),
+            };
+            // a closed pipe drops the oneshot; the receiver reads that as LOST
+            let _ = f.pipe(addr, readonly).send(out).await;
+        }
+        None => {
+            let conn = shared.backends.shared(addr, id, readonly);
+            conn.send(Outbound {
+                head,
+                frame,
+                expect,
+                sink: Sink::One(tx),
+            })
+            .await;
+        }
+    }
     rx
 }
 
@@ -1601,6 +1711,7 @@ async fn write_loop(
         shared: &'a Shared,
         link: &'a WriterLink,
         reply: &'a ReplyQueue,
+        client_id: u64,
     }
     impl Drop for ExitBump<'_> {
         fn drop(&mut self) {
@@ -1608,6 +1719,7 @@ async fn write_loop(
             // queued frames and their backing buffer must not outlive the writer
             // via lingering backend sinks
             drop(std::mem::take(&mut *self.reply.q.borrow_mut()));
+            self.shared.registry.borrow_mut().remove(&self.client_id);
             mark_closed(self.link);
             stats::bump(&self.shared.stats.workers[self.shared.worker].writers_exited);
             self.link.oob_notify.notify_waiters();
@@ -1617,6 +1729,7 @@ async fn write_loop(
         shared: &shared,
         link: &link,
         reply: &reply_q,
+        client_id,
     };
     let mut next_emit: u64 = 0;
     let mut swept_to: u64 = 0;
@@ -1687,14 +1800,36 @@ async fn write_loop(
                     {
                         stats::bump(&shared.stats.workers[shared.worker].redirects);
                         let _ = shared.refresh.send(());
-                        let conn = shared.backends.shared(&target, client_id, false);
-                        conn.send(Outbound {
-                            head: ask.then(|| Bytes::from_static(ASKING_FRAME)),
-                            frame: req,
-                            expect: base_expect + u32::from(ask),
-                            sink: Sink::Client(reply_q.clone(), seq),
-                        })
-                        .await;
+                        let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
+                        let expect = base_expect + u32::from(ask);
+                        match &shared.fabric {
+                            Some(f) => {
+                                let out = crate::shard::RemoteOutbound {
+                                    head,
+                                    frame: req,
+                                    expect,
+                                    reply: crate::shard::RemoteSink::Session {
+                                        home: shared.worker as u32,
+                                        token: client_id,
+                                        seq,
+                                    },
+                                };
+                                if f.pipe(&target, false).send(out).await.is_err() {
+                                    let _ = reply_q
+                                        .send(Reply::At(seq, Bytes::from_static(ERR_BACKEND_LOST)));
+                                }
+                            }
+                            None => {
+                                let conn = shared.backends.shared(&target, client_id, false);
+                                conn.send(Outbound {
+                                    head,
+                                    frame: req,
+                                    expect,
+                                    sink: Sink::Client(reply_q.clone(), seq),
+                                })
+                                .await;
+                            }
+                        }
                         continue;
                     }
                     // clients believe the proxy owns every slot: never leak redirects

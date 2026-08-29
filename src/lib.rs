@@ -11,5 +11,6 @@ pub mod multikey;
 pub mod resp;
 pub mod route;
 pub mod server;
+pub mod shard;
 pub mod stats;
 pub mod topology;

@@ -60,6 +60,7 @@ pub struct Config {
     pub maxclients: usize,
     pub bootstrap: Vec<String>,
     pub backend_conns: usize,
+    pub backend_sharding: bool,
     pub requirepass: String,
     pub backend_user: String,
     pub backend_pass: String,
@@ -81,6 +82,7 @@ impl Default for Config {
             maxclients: 10000,
             bootstrap: Vec::new(),
             backend_conns: 1,
+            backend_sharding: false,
             requirepass: String::new(),
             backend_user: String::new(),
             backend_pass: String::new(),
@@ -123,6 +125,13 @@ impl Config {
                 self.bootstrap = value.split(',').map(|s| s.trim().to_string()).collect();
             }
             "backend-conns" => self.backend_conns = parse_bounded(key, value, 1, 512)?,
+            "backend-sharding" => {
+                self.backend_sharding = match value {
+                    "yes" | "on" | "true" => true,
+                    "no" | "off" | "false" => false,
+                    _ => return Err(format!("{key}: expected yes or no, got '{value}'")),
+                }
+            }
             "requirepass" => self.requirepass = value.to_string(),
             "backend-auth-user" => self.backend_user = value.to_string(),
             "backend-auth-pass" => self.backend_pass = value.to_string(),
