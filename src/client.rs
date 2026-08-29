@@ -75,8 +75,12 @@ impl ReplyTx {
         if self.closed.get() {
             return Err(reply);
         }
-        self.q.borrow_mut().push_back(reply);
-        self.bell.notify_one();
+        let mut q = self.q.borrow_mut();
+        q.push_back(reply);
+        // the writer only parks on an empty queue: notify on that transition
+        if q.len() == 1 {
+            self.bell.notify_one();
+        }
         Ok(())
     }
 
