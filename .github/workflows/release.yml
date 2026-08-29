@@ -95,7 +95,8 @@ jobs:
         run: |
           TAG=$(git describe --tags --abbrev=0)
           PREV=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)
-          git log --no-merges --pretty='- %h %s' ${PREV:+$PREV..}$TAG > /tmp/commits
+          git log --no-merges --pretty='- %h %s' ${PREV:+$PREV..}$TAG \
+            | grep -vE '^- [0-9a-f]+ (docs|test|review|ci)[:(]' > /tmp/commits || true
           section() {
             grep -E "^- [0-9a-f]+ $2" /tmp/commits > /tmp/sec || return 0
             printf '### %s\n' "$1" >> /tmp/notes.md
@@ -106,8 +107,7 @@ jobs:
           section Features 'feat[:(]'
           section Performance 'perf[:(]'
           section 'Bug fixes' 'fix[:(]'
-          section Documentation 'docs[:(]'
-          grep -vE '^- [0-9a-f]+ (feat|perf|fix|docs)[:(]' /tmp/commits > /tmp/sec || true
+          grep -vE '^- [0-9a-f]+ (feat|perf|fix)[:(]' /tmp/commits > /tmp/sec || true
           if [ -s /tmp/sec ]; then printf '### Other\n' >> /tmp/notes.md; cat /tmp/sec >> /tmp/notes.md; printf '\n' >> /tmp/notes.md; fi
           if [ -n "$PREV" ]; then
             printf '**Full Changelog**: https://github.com/%s/compare/%s...%s\n' "$GITHUB_REPOSITORY" "$PREV" "$TAG" >> /tmp/notes.md
@@ -118,7 +118,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG=$(git describe --tags --abbrev=0)
-          gh release create "$TAG" --verify-tag --notes-file /tmp/notes.md dist/* || {
-            gh release edit "$TAG" --notes-file /tmp/notes.md
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file /tmp/notes.md dist/* || {
+            gh release edit "$TAG" --title "$TAG" --notes-file /tmp/notes.md
             gh release upload "$TAG" dist/* --clobber
           }
