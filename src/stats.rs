@@ -1,7 +1,10 @@
 //! Per-worker counters, cacheline-padded, summed on demand for INFO.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// One worker's counters; padding keeps writers on distinct cachelines.
 #[repr(align(64))]
@@ -21,11 +24,21 @@ pub struct WorkerStats {
     pub cache_armed: AtomicU64,
 }
 
+/// What CLIENT LIST reports about one connection; touched only on connect,
+/// disconnect and SETNAME.
+pub struct ClientInfo {
+    pub addr: SocketAddr,
+    pub fd: i32,
+    pub name: Box<str>,
+    pub since: Instant,
+}
+
 /// Process-wide stats shared across workers.
 pub struct Stats {
     pub workers: Vec<WorkerStats>,
     pub clients: AtomicUsize,
     pub total_connections: AtomicU64,
+    pub registry: Mutex<HashMap<u64, ClientInfo>>,
 }
 
 impl Stats {
@@ -34,7 +47,14 @@ impl Stats {
             workers: (0..workers).map(|_| WorkerStats::default()).collect(),
             clients: AtomicUsize::new(0),
             total_connections: AtomicU64::new(0),
+            registry: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub fn registry(&self) -> std::sync::MutexGuard<'_, HashMap<u64, ClientInfo>> {
+        self.registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn sum<F: Fn(&WorkerStats) -> &AtomicU64>(&self, field: F) -> u64 {

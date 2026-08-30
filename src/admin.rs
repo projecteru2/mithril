@@ -70,6 +70,31 @@ pub fn time() -> Vec<u8> {
     out
 }
 
+/// CLIENT LIST over every worker's sessions, one line per connection.
+pub fn client_list(stats: &Stats) -> Vec<u8> {
+    let mut rows: Vec<(u64, String)> = stats
+        .registry()
+        .iter()
+        .map(|(id, c)| {
+            (
+                *id,
+                format!(
+                    "id={id} addr={} fd={} name={} age={} cmd=\n",
+                    c.addr,
+                    c.fd,
+                    c.name,
+                    c.since.elapsed().as_secs()
+                ),
+            )
+        })
+        .collect();
+    rows.sort_unstable_by_key(|(id, _)| *id);
+    let text: String = rows.into_iter().map(|(_, row)| row).collect();
+    let mut out = Vec::new();
+    resp::bulk(&mut out, text.as_bytes());
+    out
+}
+
 pub fn command_reply(args: &[&[u8]], proto: u8) -> Vec<u8> {
     let mut out = Vec::new();
     let sub = args.get(1).map(|s| s.to_ascii_lowercase());
@@ -163,7 +188,8 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
         .as_secs();
     let text = format!(
         "# Server\r\nredis_version:{SERVER_VERSION}\r\nredis_mode:cluster\r\n\
-         mithril_version:{}\r\nprocess_id:{}\r\ntcp_port:{}\r\nuptime_in_seconds:{}\r\n\r\n\
+         mithril_version:{}\r\nprocess_id:{}\r\ntcp_port:{}\r\nuptime_in_seconds:{}\r\n\
+         config_file:{}\r\n\r\n\
          # Clients\r\nconnected_clients:{}\r\n\r\n\
          # Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n\
          total_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\n\
@@ -178,6 +204,7 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
         std::process::id(),
         cfg.port,
         now.saturating_sub(started),
+        cfg.config_file,
         stats.clients.load(Ordering::Relaxed),
         stats.total_connections.load(Ordering::Relaxed),
         stats.sum(|w| &w.commands),

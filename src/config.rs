@@ -53,6 +53,7 @@ impl fmt::Display for SlaveMode {
 /// Proxy configuration, immutable after startup except where noted.
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub config_file: String,
     pub bind: String,
     pub port: u16,
     pub announce_addr: String,
@@ -78,6 +79,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            config_file: String::new(),
             bind: "0.0.0.0".to_string(),
             port: DEFAULT_PORT,
             announce_addr: String::new(),
@@ -106,7 +108,10 @@ impl Config {
     /// Parses a config file; call [`Config::finish`] after CLI overrides.
     pub fn load(path: &str) -> Result<Config, String> {
         let text = fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-        let mut cfg = Config::default();
+        let mut cfg = Config {
+            config_file: path.to_string(),
+            ..Config::default()
+        };
         for (ln, raw) in text.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {

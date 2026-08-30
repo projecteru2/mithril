@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::hash::BuildHasherDefault;
 use std::io::IoSlice;
+use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::rc::Rc;
 
@@ -327,6 +328,10 @@ impl Session {
             if !self.exit_pubsub_if_done().await {
                 let passthrough = self.proto.get() >= 3 && !pubsub_allowed(spec);
                 if !passthrough {
+                    // a pipelined QUIT must not backfill confirmations still in flight
+                    if spec.name == "quit" {
+                        self.drain_acks().await;
+                    }
                     self.dispatch_pubsub(spec, frame, argc);
                     return;
                 }
@@ -968,7 +973,10 @@ impl Session {
             if let Some(state) = self.multi.borrow_mut().as_mut() {
                 state.aborted = true;
             }
-            self.emit_error(&format!("ERR {} is not allowed in transactions", spec.name));
+            self.emit_error(&format!(
+                "ERR '{}' in MULTI / EXEC, only support keyed single-slot commands",
+                spec.name
+            ));
             return;
         }
         let new_slot = {
@@ -1244,9 +1252,14 @@ impl Session {
                 self.emit_local(out);
             }
             Some(b"setname") if args.len() == 3 => {
-                *self.name.borrow_mut() = String::from_utf8_lossy(args[2]).into_owned();
+                let name = String::from_utf8_lossy(args[2]);
+                if let Some(c) = self.shared.stats.registry().get_mut(&self.id) {
+                    c.name = Box::from(&*name);
+                }
+                *self.name.borrow_mut() = name.into_owned();
                 self.emit_local(Bytes::from_static(resp::OK));
             }
+            Some(b"list") => self.emit_local(admin::client_list(&self.shared.stats)),
             Some(b"getname") => {
                 let name = self.name.borrow();
                 if name.is_empty() {
@@ -1268,18 +1281,22 @@ impl Session {
             if !self.subs.borrow().is_empty() {
                 return false;
             }
-            while !self.link.ack_seqs.borrow().is_empty() {
-                if self.relay_dead() || self.link.closed.get() {
-                    break;
-                }
-                tokio::select! {
-                    _ = self.link.acks_drained.notified() => {}
-                    _ = self.link.closed_notify.notified() => break,
-                }
-            }
+            self.drain_acks().await;
         }
         self.stop_pubsub();
         true
+    }
+
+    async fn drain_acks(&self) {
+        while !self.link.ack_seqs.borrow().is_empty() {
+            if self.relay_dead() || self.link.closed.get() {
+                return;
+            }
+            tokio::select! {
+                _ = self.link.acks_drained.notified() => {}
+                _ = self.link.closed_notify.notified() => return,
+            }
+        }
     }
 
     fn relay_dead(&self) -> bool {
@@ -1318,10 +1335,11 @@ impl Session {
             "ping" => self.promise_acks(1),
             _ if spec.kind == Kind::Subscribe => self.promise_subscription(&frame, argc),
             _ => {
-                self.emit_error(
-                    "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / RESET \
-                     are allowed in this context",
-                );
+                self.emit_error(&format!(
+                    "ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / \
+                     PING / QUIT / RESET are allowed in this context",
+                    spec.name
+                ));
                 return;
             }
         }
@@ -1613,11 +1631,42 @@ enum Merge {
     Ok,
 }
 
+// CLIENT LIST membership for the session's lifetime
+struct Listed<'a> {
+    stats: &'a Stats,
+    id: u64,
+}
+
+impl<'a> Listed<'a> {
+    fn new(stats: &'a Stats, id: u64, addr: std::net::SocketAddr, fd: i32) -> Listed<'a> {
+        stats.registry().insert(
+            id,
+            stats::ClientInfo {
+                addr,
+                fd,
+                name: Box::from(""),
+                since: std::time::Instant::now(),
+            },
+        );
+        Listed { stats, id }
+    }
+}
+
+impl Drop for Listed<'_> {
+    fn drop(&mut self) {
+        self.stats.registry().remove(&self.id);
+    }
+}
+
 /// Serves one client connection to completion.
 pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
     if stream.set_nodelay(true).is_err() {
         return;
     }
+    let Ok(addr) = stream.peer_addr() else {
+        return;
+    };
+    let _listed = Listed::new(&shared.stats, id, addr, stream.as_raw_fd());
     let (mut read_half, write_half) = stream.into_split();
     let reply_q = ReplyQueue::new(shared.fabric.is_some());
     let link: Rc<WriterLink> = Rc::new(WriterLink::default());

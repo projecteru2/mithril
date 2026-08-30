@@ -105,6 +105,7 @@ static TABLE: &[Spec] = &[
     c("mset", -3, W, 1, -1, 2, Kind::Mset),
     c("msetnx", -3, W, 1, -1, 2, Kind::Single),
     c("multi", 1, T, 0, 0, 0, Kind::Local),
+    c("object", -3, R, 2, 2, 1, Kind::Single),
     c("persist", 2, W, 1, 1, 1, Kind::Single),
     c("pexpire", 3, W, 1, 1, 1, Kind::Single),
     c("pexpireat", 3, W, 1, 1, 1, Kind::Single),

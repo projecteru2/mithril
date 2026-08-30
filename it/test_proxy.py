@@ -543,3 +543,43 @@ def test_cache_untouched_writes_send_no_invalidations(cache_proxy, cluster_direc
     info = r.info()
     delta = int(info["cache_invalidations"]) - before
     assert 1 <= delta <= int(info["worker_threads"]), delta
+
+
+def test_subscribe_then_quit_pipelined_confirms_first(raw_socket, key_prefix):
+    s = raw_socket()
+    s.sendall(_resp_encode(["SUBSCRIBE", f"{key_prefix}:ch"]) + _resp_encode(["QUIT"]))
+    reader = _RespReader(s)
+    assert reader.read() == [b"subscribe", f"{key_prefix}:ch".encode(), 1]
+    assert reader.read() == b"OK"
+
+
+def test_object_encoding_routes_by_key(r, key_prefix):
+    key = f"{key_prefix}:obj"
+    assert r.set(key, "12345")
+    assert r.object("encoding", key) in ("int", "embstr")
+    assert r.execute_command("OBJECT", "REFCOUNT", key) >= 1
+
+
+def test_client_list_shows_this_connection(new_conn):
+    c = new_conn()
+    c.client_setname("it-list")
+    cid = c.client_id()
+    rows = [row for row in c.client_list() if int(row["id"]) == cid]
+    assert len(rows) == 1
+    assert rows[0]["name"] == "it-list"
+    assert rows[0]["addr"]
+
+
+def test_pubsub_context_and_multi_errors_match_redis_wording(new_conn):
+    c = new_conn()
+    p = c.pubsub()
+    p.subscribe("it:ctx")
+    assert p.get_message(timeout=2)["type"] == "subscribe"
+    with pytest.raises(redis.ResponseError, match=r"Can't execute 'get'"):
+        p.execute_command("GET", "x")
+    p.close()
+    c2 = new_conn()
+    with pytest.raises(redis.ResponseError, match=r"in MULTI / EXEC, only support"):
+        pipe = c2.pipeline(transaction=True)
+        pipe.execute_command("CLIENT", "LIST")
+        pipe.execute()
