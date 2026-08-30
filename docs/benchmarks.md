@@ -71,6 +71,25 @@ side queues behind the flood's cross-worker reply hop — if unpipelined
 latency under mixed saturation is the priority, pick `yes` or `no`
 explicitly.
 
+### MGET through the reply cache (same rig, commit 64015c9 lineage)
+
+redis-benchmark P16, 12 M requests per cell, 100k random values per key
+name, `reply-cache yes` vs default; two passes with the order swapped:
+
+| cell | default | cache |
+|---|---|---|
+| 3-key MGET, cross-slot | 773k / p50 0.87-0.88 | **1.30-1.33M / p50 0.38-0.39** |
+| 3-key MGET, one slot | **1.14M** / p50 0.64 | 872-940k / p50 0.55→**0.28** |
+| 8-key MGET, one slot | 377-591k / p50 1.06-1.08 | 447-557k / p50 1.18-1.29 |
+
+A cross-slot MGET whose keys hit skips its whole fan-out, which is where
+the cache pays most. Fills are admitted in proportion to each shape's
+measured hit ratio (see architecture.md), so shapes whose working set
+cannot live in the cache run near the uncached rate instead of paying
+the servers' key-tracking cost on every miss — that cost sits outside
+the servers' per-command timing and once dominated these cells at a
+seventh of the uncached rate.
+
 ## Bare-metal reference (2026-08, 4-worker proxies, 6-node cluster)
 
 Method: memtier_benchmark on a 16-core bare-metal Linux host, cpuset-pinned
