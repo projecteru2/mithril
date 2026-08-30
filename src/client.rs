@@ -457,11 +457,18 @@ impl Session {
         pipe
     }
 
-    fn queue_at(&self, pipe: &Pipe, seq: u64, frame: Bytes, expect: u32) -> Option<Box<ColdSend>> {
+    fn queue_at(
+        &self,
+        pipe: &Pipe,
+        seq: u64,
+        head: Option<Bytes>,
+        frame: Bytes,
+        expect: u32,
+    ) -> Option<Box<ColdSend>> {
         match pipe {
             Pipe::Local(conn) => {
                 let out = Outbound {
-                    head: None,
+                    head,
                     frame,
                     expect,
                     sink: Sink::Client(self.reply_q.clone(), seq),
@@ -477,7 +484,7 @@ impl Session {
                     return None;
                 };
                 let out = crate::shard::RemoteOutbound {
-                    head: None,
+                    head,
                     frame,
                     expect,
                     reply: crate::shard::RemoteSink::Session { queue, seq },
@@ -539,9 +546,9 @@ impl Session {
         slot: u16,
         readonly: bool,
         frame: Bytes,
-        fill: Option<Bytes>,
+        mut fill: Option<Bytes>,
     ) -> Option<Box<ColdSend>> {
-        let pipe = {
+        let (pipe, is_replica) = {
             let topo = self.topo();
             let picked = self
                 .with_rng(|r| route::pick(&topo, slot, readonly, self.shared.cfg.slave_mode, r));
@@ -554,14 +561,25 @@ impl Session {
                 self.emit_at(seq, Bytes::from_static(ERR_NO_OWNER));
                 return None;
             };
-            self.cached_pipe(&topo, idx, is_replica)
+            (self.cached_pipe(&topo, idx, is_replica), is_replica)
         };
+        // replica connections are untracked: their replies never fill
+        if is_replica
+            && let Some(key) = fill.take()
+            && let Some(cache) = &self.shared.cache
+        {
+            cache.abandon_fill(&key);
+        }
+        let head = fill
+            .is_some()
+            .then(|| Bytes::from_static(crate::cache::CACHING_FRAME));
+        let expect = 1 + u32::from(head.is_some());
         self.track_inflight(seq, &frame, 1, fill);
-        self.queue_at(&pipe, seq, frame, 1)
+        self.queue_at(&pipe, seq, head, frame, expect)
     }
 
     async fn send_at(&self, pipe: &Pipe, seq: u64, frame: Bytes, expect: u32) {
-        if let Some(cold) = self.queue_at(pipe, seq, frame, expect) {
+        if let Some(cold) = self.queue_at(pipe, seq, None, frame, expect) {
             cold.flush().await;
         }
     }
@@ -2116,6 +2134,13 @@ async fn write_loop(
                         && let Some((req, base_expect)) = take_retry_frame(&link.inflight, seq, ask)
                     {
                         stats::bump(&shared.stats.workers[shared.worker].redirects);
+                        // the retry carries no CACHING opt-in: it cannot fill
+                        if link.fills_armed.get() > 0
+                            && let Some(key) = take_fill(&link, seq)
+                            && let Some(cache) = &shared.cache
+                        {
+                            cache.abandon_fill(&key);
+                        }
                         let _ = shared.refresh.send(());
                         let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
                         let expect = base_expect + u32::from(ask);
@@ -2246,7 +2271,6 @@ fn release_gates(gates: &RefCell<FanoutGates>, slots: &[u16]) {
     }
 }
 
-// a redirect retry leaves the fill in place for the retried reply
 fn take_fill(link: &WriterLink, seq: u64) -> Option<Bytes> {
     let mut inf = link.inflight.borrow_mut();
     let idx = inf.binary_search_by_key(&seq, |e| e.seq).ok()?;

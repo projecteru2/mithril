@@ -522,3 +522,24 @@ def test_cache_store_option_targets_read_their_writes(cache_proxy, key_prefix):
     pipe.set(dst, "v2")
     pipe.get(dst)
     assert pipe.execute() == [True, "v2"]
+
+
+def test_cache_untouched_writes_send_no_invalidations(cache_proxy, cluster_direct, key_prefix):
+    r = cache_proxy
+    seen = f"{key_prefix}:seen"
+    assert r.set(seen, "v1")
+    assert r.get(seen) == "v1"
+    assert r.get(seen) == "v1"
+    before = int(r.info()["cache_invalidations"])
+    for i in range(200):
+        cluster_direct.set(f"{key_prefix}:never:{i}", "x")
+    cluster_direct.set(seen, "v2")
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        if r.get(seen) == "v2":
+            break
+        time.sleep(0.05)
+    assert r.get(seen) == "v2"
+    info = r.info()
+    delta = int(info["cache_invalidations"]) - before
+    assert 1 <= delta <= int(info["worker_threads"]), delta

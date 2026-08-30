@@ -12,6 +12,7 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::cache::TrackingFrames;
 use crate::client::{Reply, ReplyQueue};
 use crate::config::Config;
 use crate::log_debug;
@@ -98,14 +99,34 @@ impl Conn {
 pub struct Backends {
     cfg: Rc<Config>,
     pools: RefCell<HashMap<Box<str>, PoolPair>>,
+    tracking: Option<TrackingFrames>,
 }
 
 impl Backends {
-    pub fn new(cfg: Rc<Config>) -> Rc<Backends> {
+    pub fn new(cfg: Rc<Config>, tracking: Option<TrackingFrames>) -> Rc<Backends> {
         Rc::new(Backends {
             cfg,
             pools: RefCell::new(HashMap::new()),
+            tracking,
         })
+    }
+
+    /// Redirects every live shared connection to `addr` at a new tracker.
+    pub async fn rearm(&self, addr: &str, frame: &Bytes) {
+        let conns: Vec<Rc<Conn>> = match self.pools.borrow().get(addr) {
+            Some([Some(pool), _]) => pool.shared.borrow().clone(),
+            _ => Vec::new(),
+        };
+        for conn in conns {
+            let (tx, _) = oneshot::channel();
+            conn.send(Outbound {
+                head: None,
+                frame: frame.clone(),
+                expect: 1,
+                sink: Sink::One(tx),
+            })
+            .await;
+        }
     }
 
     /// Returns the sticky shared connection for `addr`.
@@ -174,10 +195,15 @@ impl Backends {
             abort: tokio::sync::Notify::new(),
         });
         let task_conn = conn.clone();
+        // only master reads fill the cache: replica connections stay untracked
+        let tracking = match &self.tracking {
+            Some(t) if !readonly && !abortable => t.borrow().get(addr).cloned(),
+            _ => None,
+        };
         let addr = addr.to_string();
         let cfg = self.cfg.clone();
         tokio::task::spawn_local(async move {
-            run_conn(&addr, rx, readonly, abortable, &cfg, &task_conn).await;
+            run_conn(&addr, rx, readonly, abortable, tracking, &cfg, &task_conn).await;
             task_conn.dead.set(true);
         });
         conn
@@ -232,9 +258,16 @@ pub async fn dial_raw(addr: &str, cfg: &Config) -> std::io::Result<TcpStream> {
         return Ok(stream);
     }
     let (mut r, mut w) = stream.into_split();
-    handshake(&mut r, &mut w, false, &cfg.backend_user, &cfg.backend_pass)
-        .await
-        .map_err(std::io::Error::other)?;
+    handshake(
+        &mut r,
+        &mut w,
+        false,
+        &cfg.backend_user,
+        &cfg.backend_pass,
+        None,
+    )
+    .await
+    .map_err(std::io::Error::other)?;
     r.reunite(w).map_err(std::io::Error::other)
 }
 
@@ -302,6 +335,7 @@ async fn run_conn(
     mut rx: mpsc::Receiver<Outbound>,
     readonly: bool,
     abortable: bool,
+    tracking: Option<Bytes>,
     cfg: &Config,
     conn: &Conn,
 ) {
@@ -316,6 +350,7 @@ async fn run_conn(
             readonly,
             &cfg.backend_user,
             &cfg.backend_pass,
+            tracking.as_deref(),
         )
         .await?;
         Ok::<_, String>((r, w))
@@ -437,6 +472,7 @@ pub(crate) async fn handshake(
     readonly: bool,
     user: &str,
     pass: &str,
+    tracking: Option<&[u8]>,
 ) -> Result<(), String> {
     let mut cmds: Vec<u8> = Vec::new();
     let mut expected = 0u32;
@@ -450,6 +486,10 @@ pub(crate) async fn handshake(
     }
     if readonly {
         cmds.extend_from_slice(b"*1\r\n$8\r\nREADONLY\r\n");
+        expected += 1;
+    }
+    if let Some(t) = tracking {
+        cmds.extend_from_slice(t);
         expected += 1;
     }
     if expected == 0 {

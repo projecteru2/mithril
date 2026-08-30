@@ -34,7 +34,7 @@ const SNAP_WINDOW: Duration = Duration::from_millis(10);
 const QUIET_FLOOR: u64 = 128;
 const DRAIN_POLL: Duration = Duration::from_millis(50);
 
-type ShardWiring = (Arc<shard::Fabric>, mpsc::UnboundedReceiver<shard::NewConn>);
+type ShardWiring = (Arc<shard::Fabric>, mpsc::UnboundedReceiver<shard::Control>);
 
 static TOPO_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Set on SIGINT/SIGTERM; accept loops stop taking new connections.
@@ -86,6 +86,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     } else {
         None
     };
+    let coverage = (cfg.reply_cache && cfg.backend_sharding).then(crate::cache::Coverage::new);
     let mut conn_txs = Vec::with_capacity(cfg.workers);
     for worker in 0..cfg.workers {
         let (conn_tx, conn_rx) = mpsc::channel::<Admitted>(ACCEPT_QUEUE);
@@ -105,6 +106,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
             refresh,
             worker,
             started,
+            coverage: coverage.clone(),
         };
         std::thread::Builder::new()
             .name(format!("mithril-{worker}"))
@@ -289,6 +291,7 @@ struct WorkerCtx {
     refresh: mpsc::UnboundedSender<()>,
     worker: usize,
     started: u64,
+    coverage: Option<Arc<crate::cache::Coverage>>,
 }
 
 fn worker_thread(
@@ -303,6 +306,7 @@ fn worker_thread(
         refresh,
         worker,
         started,
+        coverage,
     } = ctx;
     let Some(rt) = current_thread_rt("worker") else {
         return;
@@ -310,23 +314,34 @@ fn worker_thread(
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
         let local_cfg = Rc::new((*cfg).clone());
+        let cache = cfg
+            .reply_cache
+            .then(|| crate::cache::ReplyCache::new(&cfg, stats.clone(), worker, coverage));
+        let tracking = cache.as_ref().map(|c| c.tracking_frames());
         let fabric = shard.map(|(fabric, ctl_rx)| {
-            tokio::task::spawn_local(shard::control_loop(ctl_rx, fabric.clone(), cfg.clone()));
+            tokio::task::spawn_local(shard::control_loop(
+                ctl_rx,
+                fabric.clone(),
+                cfg.clone(),
+                cache.clone(),
+                tracking.clone(),
+            ));
             fabric
         });
-        let cache = cfg.reply_cache.then(|| {
-            let cache = crate::cache::ReplyCache::new(&cfg, stats.clone(), worker);
-            tokio::task::spawn_local(crate::cache::run_trackers(
-                cache.clone(),
-                topo.clone(),
-                local_cfg.clone(),
-            ));
-            cache
-        });
+        let backends = Backends::new(local_cfg.clone(), tracking);
+        if let Some(cache) = &cache {
+            let wiring = Rc::new(crate::cache::Wiring {
+                cache: cache.clone(),
+                backends: backends.clone(),
+                fabric: fabric.clone(),
+                cfg: local_cfg.clone(),
+            });
+            tokio::task::spawn_local(crate::cache::run_trackers(wiring, topo.clone()));
+        }
         let shared = Rc::new(Shared {
-            cfg: local_cfg.clone(),
+            cfg: local_cfg,
             topo,
-            backends: Backends::new(local_cfg),
+            backends,
             stats: stats.clone(),
             worker,
             refresh,

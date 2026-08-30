@@ -2,6 +2,7 @@
 //! the worker its address hashes to; other workers hand requests across.
 
 use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -9,6 +10,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::backend::{BATCH, ERR_BACKEND_LOST, OUTBOUND_QUEUE, ensure_read_room, write_slices};
+use crate::cache::{ReplyCache, TrackingFrames};
 use crate::config::Config;
 use crate::log_debug;
 
@@ -39,14 +41,22 @@ pub struct NewConn {
     pub rx: mpsc::Receiver<RemoteOutbound>,
 }
 
+/// Messages to a worker's control loop.
+pub enum Control {
+    Conn(NewConn),
+    /// Cache invalidations received by a tracker on the owner worker.
+    Invalidate(Arc<[Bytes]>),
+    Flush,
+}
+
 /// Process-wide shard fabric shared by every worker.
 pub struct Fabric {
-    controls: Vec<mpsc::UnboundedSender<NewConn>>,
+    controls: Vec<mpsc::UnboundedSender<Control>>,
     conns: Mutex<[HashMap<Box<str>, mpsc::Sender<RemoteOutbound>>; 2]>,
 }
 
 impl Fabric {
-    pub fn new(controls: Vec<mpsc::UnboundedSender<NewConn>>) -> Arc<Fabric> {
+    pub fn new(controls: Vec<mpsc::UnboundedSender<Control>>) -> Arc<Fabric> {
         Arc::new(Fabric {
             controls,
             conns: Mutex::new([HashMap::new(), HashMap::new()]),
@@ -67,13 +77,52 @@ impl Fabric {
         }
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
         conns.insert(addr.into(), tx.clone());
-        let owner = fnv(addr.as_bytes()) as usize % self.controls.len();
-        let _ = self.controls[owner].send(NewConn {
+        let _ = self.controls[self.owner(addr)].send(Control::Conn(NewConn {
             addr: addr.to_string(),
             readonly,
             rx,
-        });
+        }));
         tx
+    }
+
+    /// The worker that runs the node's pipe and tracker.
+    pub fn owner(&self, addr: &str) -> usize {
+        fnv(addr.as_bytes()) as usize % self.controls.len()
+    }
+
+    /// Redirects the node's live pipe at a new tracker; a pipe dialed later
+    /// learns it from the handshake.
+    pub async fn rearm(&self, addr: &str, frame: Bytes) {
+        let tx = self
+            .conns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[0]
+            .get(addr)
+            .filter(|tx| !tx.is_closed())
+            .cloned();
+        if let Some(tx) = tx {
+            let (otx, _) = oneshot::channel();
+            let _ = tx
+                .send(RemoteOutbound {
+                    head: None,
+                    frame,
+                    expect: 1,
+                    reply: RemoteSink::One(otx),
+                })
+                .await;
+        }
+    }
+
+    pub fn invalidate(&self, keys: Arc<[Bytes]>) {
+        for c in &self.controls {
+            let _ = c.send(Control::Invalidate(keys.clone()));
+        }
+    }
+
+    pub fn flush(&self) {
+        for c in &self.controls {
+            let _ = c.send(Control::Flush);
+        }
     }
 
     // generation-safe: a replacement pipe created meanwhile must survive
@@ -89,19 +138,42 @@ impl Fabric {
     }
 }
 
-/// Owner-worker loop: spawns a conn task for every pipe the fabric assigns here.
+/// Worker control loop: runs the pipes the fabric assigns here and applies
+/// broadcast cache invalidations.
 pub async fn control_loop(
-    mut ctl: mpsc::UnboundedReceiver<NewConn>,
+    mut ctl: mpsc::UnboundedReceiver<Control>,
     fabric: Arc<Fabric>,
     cfg: Arc<Config>,
+    cache: Option<Rc<ReplyCache>>,
+    tracking: Option<TrackingFrames>,
 ) {
-    while let Some(nc) = ctl.recv().await {
-        let fabric = fabric.clone();
-        let cfg = cfg.clone();
-        tokio::task::spawn_local(async move {
-            run_shard_conn(&nc.addr, nc.readonly, nc.rx, &cfg).await;
-            fabric.forget(&nc.addr, nc.readonly);
-        });
+    while let Some(msg) = ctl.recv().await {
+        match msg {
+            Control::Conn(nc) => {
+                let frame = match &tracking {
+                    Some(t) if !nc.readonly => t.borrow().get(nc.addr.as_str()).cloned(),
+                    _ => None,
+                };
+                let fabric = fabric.clone();
+                let cfg = cfg.clone();
+                tokio::task::spawn_local(async move {
+                    run_shard_conn(&nc.addr, nc.readonly, nc.rx, frame, &cfg).await;
+                    fabric.forget(&nc.addr, nc.readonly);
+                });
+            }
+            Control::Invalidate(keys) => {
+                if let Some(c) = &cache {
+                    for k in keys.iter() {
+                        c.invalidate(k);
+                    }
+                }
+            }
+            Control::Flush => {
+                if let Some(c) = &cache {
+                    c.clear();
+                }
+            }
+        }
     }
 }
 
@@ -110,6 +182,7 @@ async fn run_shard_conn(
     addr: &str,
     readonly: bool,
     mut rx: mpsc::Receiver<RemoteOutbound>,
+    tracking: Option<Bytes>,
     cfg: &Config,
 ) {
     let setup = async {
@@ -123,6 +196,7 @@ async fn run_shard_conn(
             readonly,
             &cfg.backend_user,
             &cfg.backend_pass,
+            tracking.as_deref(),
         )
         .await?;
         Ok::<_, String>((r, w))
