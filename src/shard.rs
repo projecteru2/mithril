@@ -1,18 +1,14 @@
 //! Cross-worker backend sharding: one pipelined connection per node, owned by
 //! the worker its address hashes to; other workers hand requests across.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::backend::{
-    BATCH, ERR_BACKEND_LOST, OUTBOUND_QUEUE, Outbound, check_rearm, drain_channel,
-    ensure_read_room, stage, write_slices,
-};
+use crate::backend::{OUTBOUND_QUEUE, Outbound, check_rearm, drain_channel, open, pump};
 use crate::cache::{ReplyCache, TrackingFrames};
 use crate::config::Config;
 use crate::log_debug;
@@ -173,7 +169,6 @@ pub async fn control_loop(
     }
 }
 
-// mirrors backend::run_conn for the crossable sink type; never abortable
 async fn run_shard_conn(
     addr: &str,
     readonly: bool,
@@ -181,59 +176,13 @@ async fn run_shard_conn(
     tracking: Option<Bytes>,
     cfg: &Config,
 ) {
-    let setup = async {
-        let stream = crate::backend::connect(addr, cfg.tcp_keepalive_secs)
-            .await
-            .map_err(|e| e.to_string())?;
-        let (mut r, mut w) = stream.into_split();
-        crate::backend::handshake(&mut r, &mut w, readonly, cfg, tracking.as_deref()).await?;
-        Ok::<_, String>((r, w))
-    };
-    let (mut read_half, mut write_half) = match setup.await {
-        Ok(h) => h,
+    match open(addr, readonly, cfg, tracking.as_deref()).await {
+        Ok(halves) => pump(addr, &mut rx, halves, None, deliver).await,
         Err(e) => {
             log_debug!("shard connect {addr}: {e}");
             drain_channel(&mut rx, deliver);
-            return;
-        }
-    };
-    let mut pending: VecDeque<crate::backend::Pending<RemoteSink>> = VecDeque::new();
-    let mut front_err: Option<Bytes> = None;
-    let mut batch: Vec<RemoteOutbound> = Vec::with_capacity(BATCH);
-    let mut frames: Vec<Bytes> = Vec::with_capacity(BATCH * 2);
-    let mut buf = bytes::BytesMut::with_capacity(crate::backend::READ_INIT);
-    let mut cur = crate::resp::Cursor::default();
-    'io: loop {
-        if let Err(e) =
-            crate::backend::pair_replies(&mut buf, &mut cur, &mut pending, &mut front_err, deliver)
-        {
-            log_debug!("shard backend {addr} protocol error: {e}");
-            break 'io;
-        }
-        ensure_read_room(&mut buf);
-        tokio::select! {
-            n = rx.recv_many(&mut batch, BATCH) => {
-                if n == 0 {
-                    break 'io;
-                }
-                stage(&mut batch, &mut pending, &mut frames);
-                let mut slices: Vec<std::io::IoSlice<'_>> =
-                    frames.iter().map(|f| std::io::IoSlice::new(f)).collect();
-                if write_slices(&mut write_half, &mut slices).await.is_err() {
-                    break 'io;
-                }
-            }
-            r = read_half.read_buf(&mut buf) => {
-                if matches!(r, Ok(0) | Err(_)) {
-                    break 'io;
-                }
-            }
         }
     }
-    for p in pending.drain(..) {
-        deliver(p.sink, Bytes::from_static(ERR_BACKEND_LOST));
-    }
-    drain_channel(&mut rx, deliver);
 }
 
 fn deliver(sink: RemoteSink, frame: Bytes) {

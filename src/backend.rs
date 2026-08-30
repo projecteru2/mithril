@@ -22,6 +22,7 @@ pub const OUTBOUND_QUEUE: usize = 8192;
 pub const READ_CHUNK: usize = 64 * 1024;
 pub const READ_INIT: usize = 8 * 1024;
 pub const BATCH: usize = 256;
+const IOV_STACK: usize = 16;
 const MAX_EXCLUSIVE_PER_NODE: usize = 512;
 
 pub const ASKING_FRAME: &[u8] = b"*1\r\n$6\r\nASKING\r\n";
@@ -97,7 +98,6 @@ impl Conn {
         self.dead.get()
     }
 
-    /// True when `n` requests can be queued without waiting.
     pub fn has_room(&self, n: usize) -> bool {
         self.tx.capacity() >= n
     }
@@ -146,7 +146,7 @@ impl Backends {
     }
 
     /// Returns the sticky shared connection for `addr`.
-    pub fn shared(self: &Rc<Self>, addr: &str, sticky: u64, readonly: bool) -> Rc<Conn> {
+    pub fn shared(&self, addr: &str, sticky: u64, readonly: bool) -> Rc<Conn> {
         let pool = self.pool(addr, readonly);
         let want = self.cfg.backend_conns;
         let idx = (sticky % want as u64) as usize;
@@ -166,15 +166,13 @@ impl Backends {
     }
 
     /// Leases an exclusive connection; drop returns it or frees its quota.
-    pub fn take_exclusive(self: &Rc<Self>, addr: &str) -> Option<ExclusiveLease> {
+    pub fn take_exclusive(&self, addr: &str) -> Option<ExclusiveLease> {
         let pool = self.pool(addr, false);
         let conn = loop {
             let idle = pool.idle_exclusive.borrow_mut().pop();
             match idle {
                 Some(c) if !c.is_dead() => break c,
-                Some(_) => pool
-                    .exclusive_count
-                    .set(pool.exclusive_count.get().saturating_sub(1)),
+                Some(_) => pool.release_exclusive(),
                 None => {
                     if pool.exclusive_count.get() >= MAX_EXCLUSIVE_PER_NODE {
                         return None;
@@ -187,7 +185,7 @@ impl Backends {
         Some(ExclusiveLease {
             conn,
             pool,
-            complete: Cell::new(false),
+            complete: false,
         })
     }
 
@@ -234,7 +232,7 @@ impl Backends {
 pub struct ExclusiveLease {
     conn: Rc<Conn>,
     pool: Rc<Pool>,
-    complete: Cell<bool>,
+    complete: bool,
 }
 
 impl ExclusiveLease {
@@ -242,23 +240,21 @@ impl ExclusiveLease {
         &self.conn
     }
 
-    pub fn complete(self) {
-        self.complete.set(true);
+    pub fn complete(mut self) {
+        self.complete = true;
     }
 }
 
 impl Drop for ExclusiveLease {
     fn drop(&mut self) {
-        if self.complete.get() && !self.conn.is_dead() {
+        if self.complete && !self.conn.is_dead() {
             self.pool
                 .idle_exclusive
                 .borrow_mut()
                 .push(self.conn.clone());
         } else {
             self.conn.abort();
-            self.pool
-                .exclusive_count
-                .set(self.pool.exclusive_count.get().saturating_sub(1));
+            self.pool.release_exclusive();
         }
     }
 }
@@ -271,7 +267,13 @@ struct Pool {
     exclusive_count: Cell<usize>,
 }
 
-// reply pairing assumes RESP2 backends: no unsolicited pushes
+impl Pool {
+    fn release_exclusive(&self) {
+        self.exclusive_count
+            .set(self.exclusive_count.get().saturating_sub(1));
+    }
+}
+
 pub(crate) struct Pending<S> {
     pub(crate) expect: u32,
     pub(crate) sink: S,
@@ -291,7 +293,23 @@ pub async fn dial_raw(addr: &str, cfg: &Config) -> std::io::Result<TcpStream> {
 }
 
 /// Writes every slice fully, advancing across partial writes.
-pub async fn write_slices<W: tokio::io::AsyncWrite + Unpin>(
+/// Writes every frame with writev; small batches build the iovec on the stack.
+pub async fn write_frames<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    frames: &[Bytes],
+) -> std::io::Result<()> {
+    if frames.len() <= IOV_STACK {
+        let mut iov = [IoSlice::new(&[]); IOV_STACK];
+        for (s, f) in iov.iter_mut().zip(frames) {
+            *s = IoSlice::new(f);
+        }
+        return write_slices(w, &mut iov[..frames.len()]).await;
+    }
+    let mut iov: Vec<IoSlice<'_>> = frames.iter().map(|f| IoSlice::new(f)).collect();
+    write_slices(w, &mut iov).await
+}
+
+async fn write_slices<W: tokio::io::AsyncWrite + Unpin>(
     w: &mut W,
     slices: &mut [IoSlice<'_>],
 ) -> std::io::Result<()> {
@@ -313,7 +331,7 @@ pub fn ensure_read_room(buf: &mut BytesMut) {
     }
 }
 
-// pairs buffered replies against the pipeline; Err is a protocol error
+// assumes RESP2 backends: a reply with no request pending is a desync, not a push
 pub(crate) fn pair_replies<S>(
     buf: &mut BytesMut,
     cur: &mut resp::Cursor,
@@ -326,13 +344,14 @@ pub(crate) fn pair_replies<S>(
             resp::Scan::Complete(len) => {
                 let frame = buf.split_to(len).freeze();
                 match pending.front_mut() {
+                    None => return Err("reply without a request"),
                     Some(front) if front.expect > 1 => {
                         front.expect -= 1;
                         if front_err.is_none() && frame.first() == Some(&b'-') {
                             *front_err = Some(frame);
                         }
                     }
-                    _ => {
+                    Some(_) => {
                         if let Some(d) = pending.pop_front() {
                             // a failed head frame is the reply: the request never ran as sent
                             deliver(d.sink, front_err.take().unwrap_or(frame));
@@ -354,69 +373,67 @@ async fn run_conn(
     cfg: &Config,
     conn: &Conn,
 ) {
-    let abortable = role == Role::Exclusive;
-    let setup = async {
-        let stream = connect(addr, cfg.tcp_keepalive_secs)
-            .await
-            .map_err(|e| e.to_string())?;
-        let (mut r, mut w) = stream.into_split();
-        handshake(
-            &mut r,
-            &mut w,
-            role == Role::Replica,
-            cfg,
-            tracking.as_deref(),
-        )
-        .await?;
-        Ok::<_, String>((r, w))
-    };
+    let abort = (role == Role::Exclusive).then_some(&conn.abort);
     let halves = tokio::select! {
-        _ = conn.abort.notified(), if abortable => Err("aborted".to_string()),
-        r = setup => r,
+        _ = abort_signal(abort) => Err("aborted".to_string()),
+        r = open(addr, role == Role::Replica, cfg, tracking.as_deref()) => r,
     };
-    let (mut read_half, mut write_half) = match halves {
-        Ok(h) => h,
+    match halves {
+        Ok(halves) => pump(addr, &mut rx, halves, abort, deliver).await,
         Err(e) => {
             log_debug!("connect {addr}: {e}");
             drain_channel(&mut rx, deliver);
-            return;
         }
-    };
+    }
+}
 
-    // one task owns both directions; a dead connection still drains its queue
-    let mut pending: VecDeque<Pending<Sink>> = VecDeque::new();
+/// Connects and handshakes one backend socket.
+pub(crate) async fn open(
+    addr: &str,
+    readonly: bool,
+    cfg: &Config,
+    tracking: Option<&[u8]>,
+) -> Result<(OwnedReadHalf, OwnedWriteHalf), String> {
+    let stream = connect(addr, cfg.tcp_keepalive_secs)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (mut r, mut w) = stream.into_split();
+    handshake(&mut r, &mut w, readonly, cfg, tracking).await?;
+    Ok((r, w))
+}
+
+/// Drives one connection: batches requests into writev, pairs replies to sinks,
+/// and fails what is left once the socket or the abort ends it.
+pub(crate) async fn pump<S, D: Fn(S, Bytes) + Copy>(
+    addr: &str,
+    rx: &mut mpsc::Receiver<Outbound<S>>,
+    (mut read_half, mut write_half): (OwnedReadHalf, OwnedWriteHalf),
+    abort: Option<&tokio::sync::Notify>,
+    deliver: D,
+) {
+    let mut pending: VecDeque<Pending<S>> = VecDeque::new();
     let mut front_err: Option<Bytes> = None;
-    let mut batch: Vec<Outbound> = Vec::with_capacity(BATCH);
+    let mut batch: Vec<Outbound<S>> = Vec::with_capacity(BATCH);
     let mut frames: Vec<Bytes> = Vec::with_capacity(BATCH * 2);
     let mut buf = BytesMut::with_capacity(READ_INIT);
     let mut cur = resp::Cursor::default();
     let mut tx_open = true;
     'io: loop {
-        if let Err(e) = pair_replies(&mut buf, &mut cur, &mut pending, &mut front_err, deliver) {
-            log_debug!("backend {addr} protocol error: {e}");
-            break 'io;
-        }
         if !tx_open && pending.is_empty() {
             break 'io;
         }
         ensure_read_room(&mut buf);
         tokio::select! {
-            _ = conn.abort.notified(), if abortable => {
-                break 'io;
-            }
+            _ = abort_signal(abort) => break 'io,
             n = rx.recv_many(&mut batch, BATCH), if tx_open => {
                 if n == 0 {
                     tx_open = false;
-                    if pending.is_empty() {
-                        break 'io;
-                    }
                     continue;
                 }
                 stage(&mut batch, &mut pending, &mut frames);
-                let mut slices: Vec<IoSlice<'_>> = frames.iter().map(|f| IoSlice::new(f)).collect();
                 let wrote = tokio::select! {
-                    _ = conn.abort.notified(), if abortable => false,
-                    r = write_slices(&mut write_half, &mut slices) => r.is_ok(),
+                    _ = abort_signal(abort) => false,
+                    r = write_frames(&mut write_half, &frames) => r.is_ok(),
                 };
                 if !wrote {
                     break 'io;
@@ -426,14 +443,24 @@ async fn run_conn(
                 if matches!(r, Ok(0) | Err(_)) {
                     break 'io;
                 }
+                if let Err(e) = pair_replies(&mut buf, &mut cur, &mut pending, &mut front_err, deliver) {
+                    log_debug!("backend {addr} protocol error: {e}");
+                    break 'io;
+                }
             }
         }
     }
-
     for p in pending.drain(..) {
         deliver(p.sink, Bytes::from_static(ERR_BACKEND_LOST));
     }
-    drain_channel(&mut rx, deliver);
+    drain_channel(rx, deliver);
+}
+
+async fn abort_signal(abort: Option<&tokio::sync::Notify>) {
+    match abort {
+        Some(n) => n.notified().await,
+        None => std::future::pending().await,
+    }
 }
 
 fn deliver(sink: Sink, frame: Bytes) {

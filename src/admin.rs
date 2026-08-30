@@ -1,5 +1,7 @@
 //! Proxy-answered commands and single-virtual-node cluster emulation.
 
+use std::borrow::Cow;
+use std::fmt::Write;
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7,10 +9,34 @@ use crate::command::Spec;
 use crate::config::Config;
 use crate::crc16::{self, SLOTS};
 use crate::resp;
-use crate::stats::Stats;
+use crate::stats::{ClientInfo, Stats};
 
 pub const SERVER_VERSION: &str = "7.4.0";
 const CLUSTER_BUS_OFFSET: u32 = 10000;
+const HEX: &[u8; 16] = b"0123456789abcdef";
+const CLUSTER_INFO: &str = "cluster_enabled:1\r\ncluster_state:ok\r\ncluster_slots_assigned:16384\r\n\
+     cluster_slots_ok:16384\r\ncluster_slots_pfail:0\r\ncluster_slots_fail:0\r\n\
+     cluster_known_nodes:1\r\ncluster_size:1\r\n";
+const CONFIG_KEYS: [&str; 18] = [
+    "bind",
+    "port",
+    "announce-addr",
+    "worker-threads",
+    "maxclients",
+    "bootstrap",
+    "backend-conns",
+    "backend-sharding",
+    "reply-cache",
+    "reply-cache-max-bytes",
+    "reply-cache-max-age-secs",
+    "requirepass",
+    "slave-mode",
+    "placement",
+    "tcp-keepalive",
+    "query-buffer-limit",
+    "topology-refresh-secs",
+    "loglevel",
+];
 
 pub fn ping(args: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -47,124 +73,117 @@ pub fn time() -> Vec<u8> {
         .unwrap_or_default();
     let mut out = Vec::new();
     out.extend_from_slice(b"*2\r\n");
-    resp::bulk(&mut out, now.as_secs().to_string().as_bytes());
-    resp::bulk(&mut out, now.subsec_micros().to_string().as_bytes());
+    let mut digits = [0u8; resp::DEC_BUF];
+    resp::bulk(&mut out, resp::u64_digits(&mut digits, now.as_secs()));
+    resp::bulk(
+        &mut out,
+        resp::u64_digits(&mut digits, u64::from(now.subsec_micros())),
+    );
     out
 }
 
 /// CLIENT LIST over every worker's sessions, one line per connection.
 pub fn client_list(stats: &Stats) -> Vec<u8> {
-    let mut rows: Vec<(u64, String)> = stats
-        .registry()
-        .iter()
-        .map(|(id, c)| {
-            (
-                *id,
-                format!(
-                    "id={id} addr={} fd={} name={} age={} cmd=\n",
-                    c.addr,
-                    c.fd,
-                    c.name,
-                    c.since.elapsed().as_secs()
-                ),
-            )
-        })
-        .collect();
-    rows.sort_unstable_by_key(|(id, _)| *id);
-    let text: String = rows.into_iter().map(|(_, row)| row).collect();
-    let mut out = Vec::new();
+    let registry = stats.registry();
+    let mut rows: Vec<(&u64, &ClientInfo)> = registry.iter().collect();
+    rows.sort_unstable_by_key(|(id, _)| **id);
+    let mut text = String::with_capacity(rows.len() * 96);
+    for (id, c) in rows {
+        let _ = writeln!(
+            text,
+            "id={id} addr={} fd={} name={} age={} cmd=",
+            c.addr,
+            c.fd,
+            c.name,
+            c.since.elapsed().as_secs()
+        );
+    }
+    drop(registry);
+    let mut out = Vec::with_capacity(text.len() + 16);
     resp::bulk(&mut out, text.as_bytes());
     out
 }
 
 pub fn command_reply(args: &[&[u8]], proto: u8) -> Vec<u8> {
     let mut out = Vec::new();
-    let sub = args.get(1).map(|s| s.to_ascii_lowercase());
-    match sub.as_deref() {
-        None => {
-            resp::array_header(&mut out, crate::command::table().len());
-            for spec in crate::command::table() {
-                command_entry(&mut out, spec);
+    let table = crate::command::table();
+    let sub = |name: &[u8]| sub_is(args, 1, name);
+    if args.len() < 2 {
+        resp::array_header(&mut out, table.len());
+        for spec in table {
+            command_entry(&mut out, spec);
+        }
+    } else if sub(b"count") {
+        resp::integer(&mut out, table.len() as i64);
+    } else if sub(b"docs") {
+        out.extend_from_slice(if proto >= 3 { b"%0\r\n" } else { b"*0\r\n" });
+    } else if sub(b"info") {
+        resp::array_header(&mut out, args.len() - 2);
+        for name in &args[2..] {
+            match crate::command::lookup(name) {
+                Some(spec) => command_entry(&mut out, spec),
+                None if proto >= 3 => out.extend_from_slice(resp::NIL_RESP3),
+                None => out.extend_from_slice(resp::NIL_ARRAY),
             }
         }
-        Some(b"count") => resp::integer(&mut out, crate::command::table().len() as i64),
-        Some(b"docs") => {
-            out.extend_from_slice(if proto >= 3 { b"%0\r\n" } else { b"*0\r\n" });
-        }
-        Some(b"info") => {
-            resp::array_header(&mut out, args.len() - 2);
-            for name in &args[2..] {
-                match crate::command::lookup(name) {
-                    Some(spec) => command_entry(&mut out, spec),
-                    None => out.extend_from_slice(b"*-1\r\n"),
-                }
-            }
-        }
-        Some(_) => resp::write_error(&mut out, "ERR unknown COMMAND subcommand"),
+    } else {
+        resp::write_error(&mut out, "ERR unknown COMMAND subcommand");
     }
     out
 }
 
 pub fn cluster(args: &[&[u8]], cfg: &Config, proto: u8) -> Vec<u8> {
     let mut out = Vec::new();
-    let sub = args
-        .get(1)
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_default();
-    match sub.as_slice() {
-        b"info" => {
-            let text = "cluster_enabled:1\r\ncluster_state:ok\r\ncluster_slots_assigned:16384\r\n\
-                 cluster_slots_ok:16384\r\ncluster_slots_pfail:0\r\ncluster_slots_fail:0\r\n\
-                 cluster_known_nodes:1\r\ncluster_size:1\r\n";
-            resp::bulk(&mut out, text.as_bytes());
-        }
-        b"myid" => resp::bulk(&mut out, node_id(&cfg.announce_addr).as_bytes()),
-        b"keyslot" => match args.get(2) {
+    let sub = |name: &[u8]| sub_is(args, 1, name);
+    if sub(b"info") {
+        resp::bulk(&mut out, CLUSTER_INFO.as_bytes());
+    } else if sub(b"myid") {
+        resp::bulk(&mut out, node_id(&cfg.announce_addr).as_bytes());
+    } else if sub(b"keyslot") {
+        match args.get(2) {
             Some(key) => resp::integer(&mut out, i64::from(crc16::slot(key))),
             None => resp::write_error(&mut out, "ERR wrong number of arguments"),
-        },
-        b"nodes" => {
-            let (host, port) = split_announce(&cfg.announce_addr);
-            let line = format!(
-                "{} {host}:{port}@{} myself,master - 0 0 1 connected 0-16383\n",
-                node_id(&cfg.announce_addr),
-                port as u32 + CLUSTER_BUS_OFFSET,
-            );
-            resp::bulk(&mut out, line.as_bytes());
         }
-        b"slots" => {
-            let (host, port) = split_announce(&cfg.announce_addr);
-            out.extend_from_slice(b"*1\r\n*3\r\n");
-            resp::integer(&mut out, 0);
-            resp::integer(&mut out, SLOTS as i64 - 1);
-            out.extend_from_slice(b"*3\r\n");
-            resp::bulk(&mut out, host.as_bytes());
-            resp::integer(&mut out, i64::from(port));
-            resp::bulk(&mut out, node_id(&cfg.announce_addr).as_bytes());
-        }
-        b"shards" => {
-            let open = if proto >= 3 {
-                b"%2\r\n".as_ref()
-            } else {
-                b"*4\r\n".as_ref()
-            };
-            out.extend_from_slice(b"*1\r\n");
-            out.extend_from_slice(open);
-            resp::bulk(&mut out, b"slots");
-            out.extend_from_slice(b"*2\r\n");
-            resp::integer(&mut out, 0);
-            resp::integer(&mut out, SLOTS as i64 - 1);
-            resp::bulk(&mut out, b"nodes");
-            out.extend_from_slice(b"*1\r\n");
-            shard_node(&mut out, cfg, proto);
-        }
-        _ => resp::write_error(&mut out, "ERR unsupported CLUSTER subcommand"),
+    } else if sub(b"nodes") {
+        let (host, port) = split_announce(&cfg.announce_addr);
+        let line = format!(
+            "{} {host}:{port}@{} myself,master - 0 0 1 connected 0-16383\n",
+            node_id(&cfg.announce_addr),
+            port as u32 + CLUSTER_BUS_OFFSET,
+        );
+        resp::bulk(&mut out, line.as_bytes());
+    } else if sub(b"slots") {
+        let (host, port) = split_announce(&cfg.announce_addr);
+        out.extend_from_slice(b"*1\r\n*3\r\n");
+        resp::integer(&mut out, 0);
+        resp::integer(&mut out, SLOTS as i64 - 1);
+        out.extend_from_slice(b"*3\r\n");
+        resp::bulk(&mut out, host.as_bytes());
+        resp::integer(&mut out, i64::from(port));
+        resp::bulk(&mut out, node_id(&cfg.announce_addr).as_bytes());
+    } else if sub(b"shards") {
+        let open = if proto >= 3 {
+            b"%2\r\n".as_ref()
+        } else {
+            b"*4\r\n".as_ref()
+        };
+        out.extend_from_slice(b"*1\r\n");
+        out.extend_from_slice(open);
+        resp::bulk(&mut out, b"slots");
+        out.extend_from_slice(b"*2\r\n");
+        resp::integer(&mut out, 0);
+        resp::integer(&mut out, SLOTS as i64 - 1);
+        resp::bulk(&mut out, b"nodes");
+        out.extend_from_slice(b"*1\r\n");
+        shard_node(&mut out, cfg, proto);
+    } else {
+        resp::write_error(&mut out, "ERR unsupported CLUSTER subcommand");
     }
     out
 }
 
 pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
-    let cpu = cpu_seconds();
+    let (cpu_sys, cpu_user) = cpu_seconds();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -190,8 +209,8 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
         now.saturating_sub(started),
         cfg.config_file,
         stats.clients.load(Ordering::Relaxed),
-        cpu.0,
-        cpu.1,
+        cpu_sys,
+        cpu_user,
         stats.total_connections.load(Ordering::Relaxed),
         stats.sum(|w| &w.commands),
         stats.sum(|w| &w.bytes_in),
@@ -224,35 +243,28 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
 
 pub fn config_cmd(args: &[&[u8]], cfg: &Config) -> Vec<u8> {
     let mut out = Vec::new();
-    let sub = args
-        .get(1)
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_default();
-    match sub.as_slice() {
-        b"get" if args.len() == 3 => {
-            let pairs = config_pairs(cfg);
-            let pattern = String::from_utf8_lossy(args[2]).to_ascii_lowercase();
-            let matched: Vec<_> = pairs
-                .iter()
-                .filter(|(k, _)| pattern == "*" || *k == pattern)
-                .collect();
-            resp::array_header(&mut out, matched.len() * 2);
-            for (k, v) in matched {
-                resp::bulk(&mut out, k.as_bytes());
-                resp::bulk(&mut out, v.as_bytes());
-            }
+    if sub_is(args, 1, b"get") && args.len() == 3 {
+        let want = args[2];
+        let wanted = |k: &&&str| want == b"*" || k.as_bytes().eq_ignore_ascii_case(want);
+        resp::array_header(&mut out, CONFIG_KEYS.iter().filter(wanted).count() * 2);
+        for k in CONFIG_KEYS.iter().filter(wanted) {
+            resp::bulk(&mut out, k.as_bytes());
+            resp::bulk(&mut out, config_value(cfg, k).as_bytes());
         }
-        b"set" if args.len() == 4 => match (args[2].to_ascii_lowercase().as_slice(), args[3]) {
-            (b"loglevel", v) => match crate::log::parse_level(&String::from_utf8_lossy(v)) {
+    } else if sub_is(args, 1, b"set") && args.len() == 4 {
+        if !sub_is(args, 2, b"loglevel") {
+            resp::write_error(&mut out, "ERR unsupported CONFIG SET parameter");
+        } else {
+            match crate::log::parse_level(&String::from_utf8_lossy(args[3])) {
                 Ok(level) => {
                     crate::log::set_level(level);
                     out.extend_from_slice(resp::OK);
                 }
                 Err(e) => resp::write_error(&mut out, &format!("ERR {e}")),
-            },
-            _ => resp::write_error(&mut out, "ERR unsupported CONFIG SET parameter"),
-        },
-        _ => resp::write_error(&mut out, "ERR unsupported CONFIG subcommand"),
+            }
+        }
+    } else {
+        resp::write_error(&mut out, "ERR unsupported CONFIG subcommand");
     }
     out
 }
@@ -265,7 +277,7 @@ fn node_id(announce: &str) -> String {
         x = x
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        id.push(char::from_digit((x >> 60) as u32 & 0xf, 16).unwrap_or('0'));
+        id.push(HEX[(x >> 60) as usize & 0xf] as char);
     }
     id
 }
@@ -310,7 +322,6 @@ fn shard_node(out: &mut Vec<u8>, cfg: &Config, proto: u8) {
     resp::bulk(out, b"online");
 }
 
-// (system, user) seconds of CPU this process has used
 fn cpu_seconds() -> (f64, f64) {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
     // SAFETY: RUSAGE_SELF with a pointer to writable rusage-sized storage;
@@ -336,47 +347,32 @@ fn yesno(v: bool) -> &'static str {
     if v { "yes" } else { "no" }
 }
 
-fn config_pairs(cfg: &Config) -> Vec<(&'static str, String)> {
-    vec![
-        ("bind", cfg.bind.clone()),
-        ("port", cfg.port.to_string()),
-        ("announce-addr", cfg.announce_addr.clone()),
-        ("worker-threads", cfg.workers.to_string()),
-        ("maxclients", cfg.maxclients.to_string()),
-        ("bootstrap", cfg.bootstrap.join(",")),
-        ("backend-conns", cfg.backend_conns.to_string()),
-        ("backend-sharding", yesno(cfg.backend_sharding).to_string()),
-        ("reply-cache", yesno(cfg.reply_cache).to_string()),
-        (
-            "reply-cache-max-bytes",
-            cfg.reply_cache_max_bytes.to_string(),
-        ),
-        (
-            "reply-cache-max-age-secs",
-            cfg.reply_cache_max_age_secs.to_string(),
-        ),
-        (
-            "requirepass",
-            if cfg.requirepass.is_empty() {
-                ""
-            } else {
-                "*****"
-            }
-            .to_string(),
-        ),
-        ("slave-mode", cfg.slave_mode.to_string()),
-        ("placement", cfg.placement.to_string()),
-        ("tcp-keepalive", cfg.tcp_keepalive_secs.to_string()),
-        ("query-buffer-limit", cfg.query_buffer_limit.to_string()),
-        (
-            "topology-refresh-secs",
-            cfg.topology_refresh_secs.to_string(),
-        ),
-        (
-            "loglevel",
-            crate::log::level_name(crate::log::level()).to_string(),
-        ),
-    ]
+fn config_value<'a>(cfg: &'a Config, key: &str) -> Cow<'a, str> {
+    match key {
+        "bind" => Cow::Borrowed(&cfg.bind),
+        "port" => cfg.port.to_string().into(),
+        "announce-addr" => Cow::Borrowed(&cfg.announce_addr),
+        "worker-threads" => cfg.workers.to_string().into(),
+        "maxclients" => cfg.maxclients.to_string().into(),
+        "bootstrap" => cfg.bootstrap.join(",").into(),
+        "backend-conns" => cfg.backend_conns.to_string().into(),
+        "backend-sharding" => yesno(cfg.backend_sharding).into(),
+        "reply-cache" => yesno(cfg.reply_cache).into(),
+        "reply-cache-max-bytes" => cfg.reply_cache_max_bytes.to_string().into(),
+        "reply-cache-max-age-secs" => cfg.reply_cache_max_age_secs.to_string().into(),
+        "requirepass" if cfg.requirepass.is_empty() => "".into(),
+        "requirepass" => "*****".into(),
+        "slave-mode" => cfg.slave_mode.to_string().into(),
+        "placement" => cfg.placement.to_string().into(),
+        "tcp-keepalive" => cfg.tcp_keepalive_secs.to_string().into(),
+        "query-buffer-limit" => cfg.query_buffer_limit.to_string().into(),
+        "topology-refresh-secs" => cfg.topology_refresh_secs.to_string().into(),
+        _ => crate::log::level_name(crate::log::level()).into(),
+    }
+}
+
+fn sub_is(args: &[&[u8]], i: usize, name: &[u8]) -> bool {
+    args.get(i).is_some_and(|s| s.eq_ignore_ascii_case(name))
 }
 
 #[cfg(test)]

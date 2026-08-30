@@ -4,7 +4,6 @@ use std::cell::{Cell, Ref, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::hash::BuildHasherDefault;
-use std::io::IoSlice;
 use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -323,7 +322,7 @@ impl Session {
             self.emit_error_frame(Bytes::from_static(ERR_NOAUTH));
             return;
         }
-        if self.pubsub.borrow().is_some() {
+        if self.has_relay.get() {
             if !self.exit_pubsub_if_done().await {
                 let passthrough = self.proto.get() >= 3 && !pubsub_allowed(spec);
                 if !passthrough {
@@ -346,8 +345,8 @@ impl Session {
             return;
         }
         // writes drop their keys before they are queued: read-your-writes
-        if let Some(cache) = &self.shared.cache
-            && spec.is_write()
+        if spec.is_write()
+            && let Some(cache) = &self.shared.cache
         {
             match spec.kind {
                 Kind::Single | Kind::MultiSum | Kind::Mset => {}
@@ -412,8 +411,16 @@ impl Session {
                     cold.await;
                 }
             }
-            Kind::Eval => Box::pin(self.forward_eval(frame, argc)).await,
-            Kind::Xread => Box::pin(self.forward_xread(spec, frame, argc)).await,
+            Kind::Eval => {
+                if let Some(cold) = self.forward_eval(frame, argc) {
+                    cold.await;
+                }
+            }
+            Kind::Xread => {
+                if let Some(cold) = self.forward_xread(spec, frame, argc) {
+                    cold.await;
+                }
+            }
             Kind::Subscribe => self.enter_pubsub(spec, frame, argc),
             Kind::Scan => self.run_scan(frame, argc),
             Kind::Dbsize => Box::pin(self.run_broadcast(frame, Merge::Sum)).await,
@@ -422,10 +429,13 @@ impl Session {
     }
 
     // one relaxed epoch load replaces the arc-swap hazard load on the hot path
-    fn topo(&self) -> std::cell::Ref<'_, std::sync::Arc<Topology>> {
-        if crate::server::topo_epoch() != self.topo_cache.borrow().epoch {
-            *self.topo_cache.borrow_mut() = self.shared.topo.load_full();
+    fn topo(&self) -> Ref<'_, std::sync::Arc<Topology>> {
+        let cached = self.topo_cache.borrow();
+        if crate::server::topo_epoch() == cached.epoch {
+            return cached;
         }
+        drop(cached);
+        *self.topo_cache.borrow_mut() = self.shared.topo.load_full();
         self.topo_cache.borrow()
     }
 
@@ -469,40 +479,11 @@ impl Session {
         frame: Bytes,
         expect: u32,
     ) -> Option<Box<ColdSend>> {
-        match pipe {
-            Pipe::Local(conn) => {
-                let out = Outbound {
-                    head,
-                    frame,
-                    expect,
-                    sink: Sink::Client(self.reply_q.clone(), seq),
-                };
-                match conn.try_send(out) {
-                    Ok(()) => None,
-                    Err(out) => Some(Box::new(ColdSend::Local(conn.clone(), out))),
-                }
-            }
-            Pipe::Shard(tx) => {
-                let Some(queue) = self.reply_q.shard_handle() else {
-                    self.emit_at(seq, Bytes::from_static(ERR_BACKEND_LOST));
-                    return None;
-                };
-                let out = crate::shard::RemoteOutbound {
-                    head,
-                    frame,
-                    expect,
-                    sink: crate::shard::RemoteSink::Session { queue, seq },
-                };
-                match tx.try_send(out) {
-                    Ok(()) => None,
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(out)) => Some(Box::new(
-                        ColdSend::Shard(tx.clone(), out, self.reply_q.clone()),
-                    )),
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        self.emit_at(seq, Bytes::from_static(ERR_BACKEND_LOST));
-                        None
-                    }
-                }
+        match queue_on(pipe, &self.reply_q, seq, head, frame, expect) {
+            Ok(cold) => cold,
+            Err(()) => {
+                self.emit_at(seq, Bytes::from_static(ERR_BACKEND_LOST));
+                None
             }
         }
     }
@@ -614,78 +595,37 @@ impl Session {
         });
     }
 
-    async fn forward_eval(&self, frame: Bytes, argc: usize) {
+    fn forward_eval(&self, frame: Bytes, argc: usize) -> Option<Cold<'_>> {
         let (numkeys, slot) = {
             let mut args = resp::Args::new(&frame, argc);
-            let numkeys: i64 = args
-                .nth(2)
-                .and_then(|a| std::str::from_utf8(a).ok())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(-1);
-            let slot = if numkeys >= 1 {
-                args.next().map(crc16::slot)
-            } else {
-                None
-            };
-            (numkeys, slot)
+            let numkeys = eval_numkeys(&mut args).unwrap_or(-1);
+            (numkeys, args.next().map(crc16::slot))
         };
         if numkeys < 0 || 3 + numkeys as usize > argc {
             self.emit_error("ERR Number of keys can't be negative");
-            return;
+            return None;
         }
         if numkeys == 0 {
-            self.forward_any_master(frame).await;
-            return;
+            return Some(Box::pin(self.forward_any_master(frame)));
         }
-        if let Some(slot) = slot
-            && self.fanouts_pending()
-            && !self.wait_fanouts(&[slot]).await
-        {
-            self.closing.set(true);
-            return;
-        }
-        let seq = self.alloc_seq();
-        let Some(pipe) = self.owner_pipe(seq, slot) else {
-            return;
+        let Some(slot) = slot else {
+            self.emit_error("ERR missing key");
+            return None;
         };
-        self.track_inflight(seq, &frame, 1, None);
-        self.send_at(&pipe, seq, frame, 1).await;
+        let seq = self.alloc_seq();
+        self.send_single(seq, slot, false, frame)
     }
 
-    async fn forward_xread(&self, spec: &Spec, frame: Bytes, argc: usize) {
-        let parsed = {
-            let mut blocking = false;
-            let mut streams = None;
-            let mut slot = None;
-            for (i, a) in resp::Args::new(&frame, argc).enumerate() {
-                match streams {
-                    None if a.eq_ignore_ascii_case(b"streams") => streams = Some(i),
-                    None => blocking |= a.eq_ignore_ascii_case(b"block"),
-                    Some(p) if i == p + 1 => slot = Some(crc16::slot(a)),
-                    Some(_) => {}
-                }
-            }
-            match (streams, slot) {
-                (Some(p), Some(slot)) if (argc - p - 1).is_multiple_of(2) => Some((slot, blocking)),
-                _ => None,
-            }
-        };
-        let Some((slot, blocking)) = parsed else {
+    fn forward_xread(&self, spec: &Spec, frame: Bytes, argc: usize) -> Option<Cold<'_>> {
+        let Some((slot, blocking)) = xread_slot(&frame, argc) else {
             self.emit_error("ERR Unbalanced XREAD list of streams");
-            return;
+            return None;
         };
-        if self.fanouts_pending() && !self.wait_fanouts(&[slot]).await {
-            self.closing.set(true);
-            return;
-        }
         if blocking {
-            self.spawn_blocking(slot, frame);
-            return;
+            return self.block_at(slot, frame);
         }
         let seq = self.alloc_seq();
-        if let Some(cold) = self.route_single(seq, slot, spec.is_readonly(), frame, None) {
-            cold.flush().await;
-        }
+        self.send_single(seq, slot, spec.is_readonly(), frame)
     }
 
     fn forward_blocking(&self, spec: &Spec, frame: Bytes, argc: usize) -> Option<Cold<'_>> {
@@ -693,6 +633,27 @@ impl Session {
             self.emit_error("ERR missing key");
             return None;
         };
+        self.block_at(slot, frame)
+    }
+
+    // one slot-routed request; only a pending fan-out gate puts it on the boxed path
+    fn send_single(&self, seq: u64, slot: u16, readonly: bool, frame: Bytes) -> Option<Cold<'_>> {
+        if self.fanouts_pending() {
+            return Some(Box::pin(async move {
+                if !self.wait_fanouts(&[slot]).await {
+                    self.closing.set(true);
+                    return;
+                }
+                if let Some(cold) = self.route_single(seq, slot, readonly, frame, None) {
+                    cold.flush().await;
+                }
+            }));
+        }
+        let cold = self.route_single(seq, slot, readonly, frame, None)?;
+        Some(Box::pin(cold.flush()))
+    }
+
+    fn block_at(&self, slot: u16, frame: Bytes) -> Option<Cold<'_>> {
         if self.fanouts_pending() {
             return Some(Box::pin(async move {
                 if self.wait_fanouts(&[slot]).await {
@@ -733,13 +694,19 @@ impl Session {
                 let Some(gate) = self.fanouts.borrow().get(slot).cloned() else {
                     break;
                 };
-                tokio::select! {
-                    _ = gate.notified() => {}
-                    _ = self.link.closed_notify.notified() => return false,
+                if !self.notified_or_closed(&gate).await {
+                    return false;
                 }
             }
         }
         true
+    }
+
+    async fn notified_or_closed(&self, n: &tokio::sync::Notify) -> bool {
+        tokio::select! {
+            _ = n.notified() => true,
+            _ = self.link.closed_notify.notified() => false,
+        }
     }
 
     // fast path: no gate pending and every pipe has room, so nothing awaits
@@ -756,27 +723,12 @@ impl Session {
             Planned::Parts(plan) => plan,
             Planned::Failed => return None,
             Planned::Single(slot) => {
-                if let Some(cache) = &self.shared.cache
-                    && spec.is_write()
+                if spec.is_write()
+                    && let Some(cache) = &self.shared.cache
                 {
                     write_keys(spec, &frame, argc, |k| cache.invalidate(k));
                 }
-                let readonly = spec.is_readonly();
-                if self.fanouts_pending() {
-                    return Some(Box::pin(async move {
-                        if !self.wait_fanouts(&[slot]).await {
-                            self.closing.set(true);
-                            return;
-                        }
-                        if let Some(cold) = self.route_single(seq, slot, readonly, frame, None) {
-                            cold.flush().await;
-                        }
-                    }));
-                }
-                return match self.route_single(seq, slot, readonly, frame, None) {
-                    Some(cold) => Some(Box::pin(cold.flush())),
-                    None => None,
-                };
+                return self.send_single(seq, slot, spec.is_readonly(), frame);
             }
         };
         let n = plan.parts.len();
@@ -811,19 +763,22 @@ impl Session {
     fn plan_fanout(&self, seq: u64, spec: &Spec, frame: &Bytes, argc: usize) -> Planned {
         let readonly = spec.is_readonly();
         let mode = self.shared.cfg.slave_mode;
-        let nkeys = key_indices(spec, argc).count();
+        let nkeys = key_indices(spec, argc).len();
         let mut keys: Vec<&[u8]> = Vec::with_capacity(nkeys);
         let mut slots: Vec<u16> = Vec::with_capacity(nkeys);
         let mut values: Option<Vec<&[u8]>> = (spec.step == 2).then(|| Vec::with_capacity(nkeys));
         let mut args = resp::Args::new(frame, argc);
         let mut cur = 0;
+        let mut same_slot = true;
         for want in key_indices(spec, argc) {
             let Some(key) = args.nth(want - cur) else {
                 break;
             };
             cur = want + 1;
+            let slot = crc16::slot(key);
+            same_slot &= slots.first().is_none_or(|&s| s == slot);
             keys.push(key);
-            slots.push(crc16::slot(key));
+            slots.push(slot);
             if let Some(vals) = values.as_mut()
                 && let Some(v) = args.next()
             {
@@ -831,9 +786,7 @@ impl Session {
                 cur += 1;
             }
         }
-        if let Some(&first) = slots.first()
-            && slots.iter().all(|&s| s == first)
-        {
+        if same_slot && let Some(&first) = slots.first() {
             return Planned::Single(first);
         }
         let total = keys.len();
@@ -1046,9 +999,7 @@ impl Session {
             Kind::Single | Kind::MultiSum | Kind::Mget | Kind::Mset
         );
         if !queueable {
-            if let Some(state) = self.multi.borrow_mut().as_mut() {
-                state.aborted = true;
-            }
+            self.abort_multi();
             self.emit_error(&format!(
                 "ERR '{}' in MULTI / EXEC, only support keyed single-slot commands",
                 spec.name
@@ -1329,29 +1280,29 @@ impl Session {
 
     fn handle_client_cmd(&self, args: &[&[u8]]) {
         let sub = |name: &[u8]| args.get(1).is_some_and(|s| s.eq_ignore_ascii_case(name));
-        match args.get(1) {
-            Some(_) if sub(b"id") => {
-                let mut out = Vec::new();
-                resp::integer(&mut out, self.id as i64);
-                self.emit_local(out);
-            }
-            Some(_) if sub(b"setname") && args.len() == 3 => match self.set_name(args[2]) {
+        if sub(b"id") {
+            let mut out = Vec::new();
+            resp::integer(&mut out, self.id as i64);
+            self.emit_local(out);
+        } else if sub(b"setname") && args.len() == 3 {
+            match self.set_name(args[2]) {
                 Ok(()) => self.emit_local(Bytes::from_static(resp::OK)),
                 Err(e) => self.emit_error(e),
-            },
-            Some(_) if sub(b"list") => self.emit_local(admin::client_list(&self.shared.stats)),
-            Some(_) if sub(b"getname") => {
-                let name = self.name.borrow();
-                if name.is_empty() {
-                    self.emit_local(Bytes::from_static(resp::NIL_BULK));
-                } else {
-                    let mut out = Vec::new();
-                    resp::bulk(&mut out, name.as_bytes());
-                    drop(name);
-                    self.emit_local(out);
-                }
             }
-            _ => self.emit_error("ERR unsupported CLIENT subcommand"),
+        } else if sub(b"list") {
+            self.emit_local(admin::client_list(&self.shared.stats));
+        } else if sub(b"getname") {
+            let name = self.name.borrow();
+            if name.is_empty() {
+                self.emit_local(Bytes::from_static(resp::NIL_BULK));
+            } else {
+                let mut out = Vec::new();
+                resp::bulk(&mut out, name.as_bytes());
+                drop(name);
+                self.emit_local(out);
+            }
+        } else {
+            self.emit_error("ERR unsupported CLIENT subcommand");
         }
     }
 
@@ -1372,9 +1323,8 @@ impl Session {
             if self.relay_dead() || self.link.closed.get() {
                 return;
             }
-            tokio::select! {
-                _ = self.link.acks_drained.notified() => {}
-                _ = self.link.closed_notify.notified() => return,
+            if !self.notified_or_closed(&self.link.acks_drained).await {
+                return;
             }
         }
     }
@@ -1817,13 +1767,10 @@ impl ParkedRing {
 }
 
 /// Serves one client connection to completion.
-pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
+pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: std::net::SocketAddr, id: u64) {
     if stream.set_nodelay(true).is_err() {
         return;
     }
-    let Ok(addr) = stream.peer_addr() else {
-        return;
-    };
     let _listed = Listed::new(&shared.stats, id, addr, stream.as_raw_fd());
     let (mut read_half, write_half) = stream.into_split();
     let reply_q = ReplyQueue::new(shared.fabric.is_some());
@@ -1967,11 +1914,7 @@ fn collect_args(frame: &Bytes, argc: usize) -> Vec<&[u8]> {
 fn write_keys(spec: &Spec, frame: &Bytes, argc: usize, mut f: impl FnMut(&[u8])) {
     let mut args = resp::Args::new(frame, argc);
     if spec.kind == Kind::Eval {
-        let numkeys: usize = args
-            .nth(2)
-            .and_then(|a| std::str::from_utf8(a).ok())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let numkeys = eval_numkeys(&mut args).map_or(0, |n| n.max(0) as usize);
         for key in args.take(numkeys) {
             f(key);
         }
@@ -1997,7 +1940,7 @@ fn write_keys(spec: &Spec, frame: &Bytes, argc: usize, mut f: impl FnMut(&[u8]))
 }
 
 // argument indices holding keys, per the spec's first/last/step triple
-fn key_indices(spec: &Spec, argc: usize) -> impl Iterator<Item = usize> {
+fn key_indices(spec: &Spec, argc: usize) -> impl ExactSizeIterator<Item = usize> {
     let first = spec.first_key as usize;
     let last = if spec.last_key < 0 {
         (argc as i64 + i64::from(spec.last_key)).max(0) as usize
@@ -2017,6 +1960,71 @@ fn pipe_for(shared: &Shared, addr: &str, id: u64, readonly: bool) -> Pipe {
         Some(f) => Pipe::Shard(f.pipe(addr, readonly)),
         None => Pipe::Local(shared.backends.shared(addr, id, readonly)),
     }
+}
+
+// queues one request for the session's reply stream; Err when its shard is gone
+fn queue_on(
+    pipe: &Pipe,
+    reply_q: &Rc<ReplyQueue>,
+    seq: u64,
+    head: Option<Bytes>,
+    frame: Bytes,
+    expect: u32,
+) -> Result<Option<Box<ColdSend>>, ()> {
+    match pipe {
+        Pipe::Local(conn) => {
+            let out = Outbound {
+                head,
+                frame,
+                expect,
+                sink: Sink::Client(reply_q.clone(), seq),
+            };
+            Ok(conn
+                .try_send(out)
+                .err()
+                .map(|out| Box::new(ColdSend::Local(conn.clone(), out))))
+        }
+        Pipe::Shard(tx) => {
+            let queue = reply_q.shard_handle().ok_or(())?;
+            let out = crate::shard::RemoteOutbound {
+                head,
+                frame,
+                expect,
+                sink: crate::shard::RemoteSink::Session { queue, seq },
+            };
+            match tx.try_send(out) {
+                Ok(()) => Ok(None),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(out)) => Ok(Some(Box::new(
+                    ColdSend::Shard(tx.clone(), out, reply_q.clone()),
+                ))),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(()),
+            }
+        }
+    }
+}
+
+fn eval_numkeys(args: &mut resp::Args<'_>) -> Option<i64> {
+    args.nth(2)
+        .and_then(|a| std::str::from_utf8(a).ok())
+        .and_then(|s| s.parse().ok())
+}
+
+// the first stream key's slot and whether BLOCK precedes STREAMS; None when unbalanced
+fn xread_slot(frame: &Bytes, argc: usize) -> Option<(u16, bool)> {
+    let mut blocking = false;
+    let mut streams = None;
+    for (i, a) in resp::Args::new(frame, argc).enumerate() {
+        match streams {
+            None if a.eq_ignore_ascii_case(b"streams") => streams = Some(i),
+            None => blocking |= a.eq_ignore_ascii_case(b"block"),
+            Some(p) => {
+                return (argc - p - 1)
+                    .is_multiple_of(2)
+                    .then(|| (crc16::slot(a), blocking));
+            }
+        }
+    }
+    None
 }
 
 // a request with a oneshot sink, built for either pipe flavor
@@ -2398,32 +2406,13 @@ async fn write_loop(
                         let _ = shared.refresh.send(());
                         let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
                         let expect = base_expect + u32::from(ask);
-                        match pipe_for(&shared, &target, client_id, false) {
-                            Pipe::Shard(tx) => {
-                                let Some(queue) = reply_q.shard_handle() else {
-                                    let _ = reply_q
-                                        .send(Reply::At(seq, Bytes::from_static(ERR_BACKEND_LOST)));
-                                    continue;
-                                };
-                                let out = Outbound {
-                                    head,
-                                    frame: req,
-                                    expect,
-                                    sink: crate::shard::RemoteSink::Session { queue, seq },
-                                };
-                                if tx.send(out).await.is_err() {
-                                    let _ = reply_q
-                                        .send(Reply::At(seq, Bytes::from_static(ERR_BACKEND_LOST)));
-                                }
-                            }
-                            Pipe::Local(conn) => {
-                                conn.send(Outbound {
-                                    head,
-                                    frame: req,
-                                    expect,
-                                    sink: Sink::Client(reply_q.clone(), seq),
-                                })
-                                .await;
+                        let pipe = pipe_for(&shared, &target, client_id, false);
+                        match queue_on(&pipe, &reply_q, seq, head, req, expect) {
+                            Ok(Some(cold)) => cold.flush().await,
+                            Ok(None) => {}
+                            Err(()) => {
+                                let _ = reply_q
+                                    .send(Reply::At(seq, Bytes::from_static(ERR_BACKEND_LOST)));
                             }
                         }
                         continue;
@@ -2490,19 +2479,13 @@ async fn write_loop(
             swept_to = next_emit;
         }
         if !ready.is_empty() {
-            let mut total = 0usize;
-            let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(ready.len());
-            for f in &ready {
-                total += f.len();
-                slices.push(IoSlice::new(f));
-            }
-            if crate::backend::write_slices(&mut write_half, &mut slices)
+            let total: usize = ready.iter().map(Bytes::len).sum();
+            if crate::backend::write_frames(&mut write_half, &ready)
                 .await
                 .is_err()
             {
                 return;
             }
-            drop(slices);
             stats::add(&shared.wstats.bytes_out, total as u64);
             ready.clear();
         }

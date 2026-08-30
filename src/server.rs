@@ -50,6 +50,7 @@ type ShardWiring = (
 /// Admission ticket holding one maxclients slot; drop returns the slot.
 struct Admitted {
     stream: Option<std::net::TcpStream>,
+    peer: SocketAddr,
     stats: Arc<Stats>,
 }
 
@@ -69,7 +70,6 @@ struct WorkerCtx {
     coverage: Option<Arc<crate::cache::Coverage>>,
 }
 
-// least-loaded placement: recent activity per worker, placements this window
 struct Placer {
     snap: Vec<u64>,
     buckets: Vec<u64>,
@@ -91,7 +91,7 @@ impl Placer {
         }
     }
 
-    // every worker by placement key, for the rare full-queue fallback
+    // the full-queue fallback order
     fn rank(&mut self) {
         self.order.clear();
         self.order.extend(0..self.snap.len());
@@ -111,9 +111,13 @@ impl Placer {
             self.placed[i] = 0;
             total += self.buckets[i];
         }
+        if total < QUIET_FLOOR {
+            self.buckets.fill(0);
+            return;
+        }
         let share = (total / self.snap.len() as u64).max(1);
         for b in self.buckets.iter_mut() {
-            *b = if total < QUIET_FLOOR { 0 } else { *b / share };
+            *b /= share;
         }
     }
 
@@ -185,7 +189,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
             });
             ctl_rxs.push((cr, ir));
         }
-        Some((shard::Fabric::new(ctl_txs), ctl_rxs))
+        Some((shard::Fabric::new(ctl_txs), ctl_rxs.into_iter()))
     } else {
         None
     };
@@ -198,10 +202,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
         let topo = topo.clone();
         let stats = stats.clone();
         let refresh = refresh_tx.clone();
-        // receivers ship in worker order; fabric controls index by worker
-        let shard = shard_parts.as_mut().map(|(f, crs)| {
-            let (cr, ir) = crs.remove(0);
-            (f.clone(), cr, ir)
+        let shard = shard_parts.as_mut().and_then(|(f, crs)| {
+            let (cr, ir) = crs.next()?;
+            Some((f.clone(), cr, ir))
         });
         let ctx = WorkerCtx {
             cfg,
@@ -322,7 +325,7 @@ fn acceptor_thread(
             let Some(accepted) = accepted else {
                 continue;
             };
-            let (stream, _) = match accepted {
+            let (stream, peer) = match accepted {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -334,12 +337,13 @@ fn acceptor_thread(
             stats.total_connections.fetch_add(1, Ordering::Relaxed);
             let mut admitted = Admitted {
                 stream: stream.into_std().ok(),
+                peer,
                 stats: stats.clone(),
             };
             if admitted.stream.is_none() {
                 continue;
             }
-            // a full queue falls to the next-best key and never stalls accepts
+            // a full queue falls to the next-best key; accepts wait only when every queue is full
             'place: loop {
                 let best = placer.best();
                 match conn_txs[best].try_send(admitted) {
@@ -352,6 +356,9 @@ fn acceptor_thread(
                 placer.rank();
                 for k in 0..conn_txs.len() {
                     let i = placer.order[k];
+                    if i == best {
+                        continue;
+                    }
                     match conn_txs[i].try_send(admitted) {
                         Ok(()) => {
                             placer.placed(i);
@@ -442,8 +449,10 @@ fn worker_thread(
             let shared = shared.clone();
             let id = next_client;
             next_client += shared.cfg.workers as u64;
+            let peer = admitted.peer;
             tokio::task::spawn_local(async move {
-                serve(shared, stream, id).await;
+                serve(shared, stream, peer, id).await;
+                // the maxclients slot is held until the session ends
                 drop(admitted);
             });
         }
@@ -462,9 +471,10 @@ fn reject_maxclients(stream: TcpStream) {
 }
 
 fn bind_listener(bind: &str, port: u16) -> std::io::Result<std::net::TcpListener> {
-    let addr: SocketAddr = format!("{bind}:{port}")
+    let ip: std::net::IpAddr = bind
         .parse()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let addr = SocketAddr::new(ip, port);
     let socket = socket2::Socket::new(
         socket2::Domain::for_address(addr),
         socket2::Type::STREAM,
@@ -496,11 +506,8 @@ fn refresher_thread(
                 tokio::time::sleep(REFRESH_DEBOUNCE).await;
                 while notify.try_recv().is_ok() {}
             }
-            let seeds: Vec<String> = {
-                let current = topo.load();
-                current.nodes.iter().map(|n| n.addr.clone()).collect()
-            };
-            match fetch_topology(&cfg, seeds.iter().map(String::as_str)).await {
+            let current = topo.load_full();
+            match fetch_topology(&cfg, current.nodes.iter().map(|n| n.addr.as_str())).await {
                 Ok(mut new_topo) => {
                     // the pointer lands before the epoch: a reader of the epoch sees this topology
                     let epoch = topo_epoch() + 1;
