@@ -227,11 +227,12 @@ impl ReplyCache {
         {
             return;
         }
-        // the copy unpins the request read buffer the key slice points into
+        // both copies unpin the socket buffers the slices point into: a small
+        // entry must not hold a whole read chunk for its cache lifetime
         self.insert_hot(
             Box::from(&key[..]),
             Entry {
-                frame: frame.clone(),
+                frame: Bytes::copy_from_slice(frame),
                 at: Instant::now(),
             },
         );
