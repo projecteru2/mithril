@@ -12,19 +12,6 @@ use crate::stats::Stats;
 pub const SERVER_VERSION: &str = "7.4.0";
 const CLUSTER_BUS_OFFSET: u32 = 10000;
 
-/// Emulated node id: 40 hex chars derived from the announce address.
-fn node_id(announce: &str) -> String {
-    let mut id = String::with_capacity(40);
-    let mut x = crate::shard::fnv(announce.as_bytes());
-    for _ in 0..40 {
-        x = x
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        id.push(char::from_digit((x >> 60) as u32 & 0xf, 16).unwrap_or('0'));
-    }
-    id
-}
-
 pub fn ping(args: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::new();
     match args.len() {
@@ -268,6 +255,19 @@ pub fn config_cmd(args: &[&[u8]], cfg: &Config) -> Vec<u8> {
         _ => resp::write_error(&mut out, "ERR unsupported CONFIG subcommand"),
     }
     out
+}
+
+/// Emulated node id: 40 hex chars derived from the announce address.
+fn node_id(announce: &str) -> String {
+    let mut id = String::with_capacity(40);
+    let mut x = crate::shard::fnv(announce.as_bytes());
+    for _ in 0..40 {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        id.push(char::from_digit((x >> 60) as u32 & 0xf, 16).unwrap_or('0'));
+    }
+    id
 }
 
 fn command_entry(out: &mut Vec<u8>, spec: &Spec) {

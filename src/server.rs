@@ -37,15 +37,94 @@ const DRAIN_POLL: Duration = Duration::from_millis(50);
 // invalidation batches a worker may fall behind before its cache flushes
 const INVAL_QUEUE: usize = 4096;
 
+static TOPO_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Set on SIGINT/SIGTERM; accept loops stop taking new connections.
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 type ShardWiring = (
     Arc<shard::Fabric>,
     mpsc::UnboundedReceiver<shard::NewConn>,
     mpsc::Receiver<shard::Invalidations>,
 );
 
-static TOPO_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Set on SIGINT/SIGTERM; accept loops stop taking new connections.
-static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Admission ticket holding one maxclients slot; drop returns the slot.
+struct Admitted {
+    stream: Option<std::net::TcpStream>,
+    stats: Arc<Stats>,
+}
+
+impl Drop for Admitted {
+    fn drop(&mut self) {
+        self.stats.clients.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct WorkerCtx {
+    cfg: Arc<Config>,
+    topo: Arc<ArcSwap<Topology>>,
+    stats: Arc<Stats>,
+    refresh: mpsc::UnboundedSender<()>,
+    worker: usize,
+    started: u64,
+    coverage: Option<Arc<crate::cache::Coverage>>,
+}
+
+// least-loaded placement: recent activity per worker, placements this window
+struct Placer {
+    snap: Vec<u64>,
+    buckets: Vec<u64>,
+    placed: Vec<u64>,
+    next: usize,
+    least_loaded: bool,
+}
+
+impl Placer {
+    fn new(workers: usize, least_loaded: bool) -> Placer {
+        Placer {
+            snap: vec![0; workers],
+            buckets: vec![0; workers],
+            placed: vec![0; workers],
+            next: 0,
+            least_loaded,
+        }
+    }
+
+    fn refresh(&mut self, stats: &Stats) {
+        let mut total = 0u64;
+        for i in 0..self.snap.len() {
+            let c = stats.workers[i].commands.load(Ordering::Relaxed);
+            self.buckets[i] = c - self.snap[i];
+            self.snap[i] = c;
+            self.placed[i] = 0;
+            total += self.buckets[i];
+        }
+        let share = (total / self.snap.len() as u64).max(1);
+        for b in self.buckets.iter_mut() {
+            *b = if total < QUIET_FLOOR { 0 } else { *b / share };
+        }
+    }
+
+    // the least (placed, bucket) key; rotation order breaks ties
+    fn best(&self) -> usize {
+        let n = self.snap.len();
+        let mut best = self.next;
+        if self.least_loaded {
+            let key = |i: usize| (self.placed[i], self.buckets[i]);
+            for k in 1..n {
+                let i = (self.next + k) % n;
+                if key(i) < key(best) {
+                    best = i;
+                }
+            }
+        }
+        best
+    }
+
+    fn placed(&mut self, i: usize) {
+        self.placed[i] += 1;
+        self.next = (i + 1) % self.snap.len();
+    }
+}
 
 /// Runs the proxy until SIGINT/SIGTERM; Err on fatal startup failure.
 pub fn run(cfg: Config) -> Result<(), String> {
@@ -187,18 +266,6 @@ fn wait_for_signal() {
     });
 }
 
-/// Admission ticket holding one maxclients slot; drop returns the slot.
-struct Admitted {
-    stream: Option<std::net::TcpStream>,
-    stats: Arc<Stats>,
-}
-
-impl Drop for Admitted {
-    fn drop(&mut self) {
-        self.stats.clients.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
 // kernel reuseport hashing skews connections binomially; one acceptor places
 fn acceptor_thread(
     listener: std::net::TcpListener,
@@ -286,16 +353,6 @@ fn acceptor_thread(
     });
 }
 
-struct WorkerCtx {
-    cfg: Arc<Config>,
-    topo: Arc<ArcSwap<Topology>>,
-    stats: Arc<Stats>,
-    refresh: mpsc::UnboundedSender<()>,
-    worker: usize,
-    started: u64,
-    coverage: Option<Arc<crate::cache::Coverage>>,
-}
-
 fn worker_thread(
     ctx: WorkerCtx,
     mut conn_rx: mpsc::Receiver<Admitted>,
@@ -372,63 +429,6 @@ fn worker_thread(
         // channel closed: keep the LocalSet alive so open sessions drain
         tokio::time::sleep(DRAIN_TIMEOUT).await;
     });
-}
-
-// least-loaded placement: recent activity per worker, placements this window
-struct Placer {
-    snap: Vec<u64>,
-    buckets: Vec<u64>,
-    placed: Vec<u64>,
-    next: usize,
-    least_loaded: bool,
-}
-
-impl Placer {
-    fn new(workers: usize, least_loaded: bool) -> Placer {
-        Placer {
-            snap: vec![0; workers],
-            buckets: vec![0; workers],
-            placed: vec![0; workers],
-            next: 0,
-            least_loaded,
-        }
-    }
-
-    fn refresh(&mut self, stats: &Stats) {
-        let mut total = 0u64;
-        for i in 0..self.snap.len() {
-            let c = stats.workers[i].commands.load(Ordering::Relaxed);
-            self.buckets[i] = c - self.snap[i];
-            self.snap[i] = c;
-            self.placed[i] = 0;
-            total += self.buckets[i];
-        }
-        let share = (total / self.snap.len() as u64).max(1);
-        for b in self.buckets.iter_mut() {
-            *b = if total < QUIET_FLOOR { 0 } else { *b / share };
-        }
-    }
-
-    // the least (placed, bucket) key; rotation order breaks ties
-    fn best(&self) -> usize {
-        let n = self.snap.len();
-        let mut best = self.next;
-        if self.least_loaded {
-            let key = |i: usize| (self.placed[i], self.buckets[i]);
-            for k in 1..n {
-                let i = (self.next + k) % n;
-                if key(i) < key(best) {
-                    best = i;
-                }
-            }
-        }
-        best
-    }
-
-    fn placed(&mut self, i: usize) {
-        self.placed[i] += 1;
-        self.next = (i + 1) % self.snap.len();
-    }
 }
 
 fn reject_maxclients(stream: TcpStream) {

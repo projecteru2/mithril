@@ -271,6 +271,12 @@ struct Pool {
     exclusive_count: Cell<usize>,
 }
 
+// reply pairing assumes RESP2 backends: no unsolicited pushes
+pub(crate) struct Pending<S> {
+    pub(crate) expect: u32,
+    pub(crate) sink: S,
+}
+
 /// Dials a raw authenticated backend connection for relays and the refresher.
 pub async fn dial_raw(addr: &str, cfg: &Config) -> std::io::Result<TcpStream> {
     let stream = connect(addr, cfg.tcp_keepalive_secs).await?;
@@ -300,10 +306,11 @@ pub async fn write_slices<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
-// reply pairing assumes RESP2 backends: no unsolicited pushes
-pub(crate) struct Pending<S> {
-    pub(crate) expect: u32,
-    pub(crate) sink: S,
+/// Grows a read buffer geometrically to READ_CHUNK; idle sessions stay small.
+pub fn ensure_read_room(buf: &mut BytesMut) {
+    if buf.capacity() - buf.len() < 2048 {
+        buf.reserve(buf.capacity().clamp(READ_INIT, READ_CHUNK));
+    }
 }
 
 // pairs buffered replies against the pipeline; Err is a protocol error
@@ -427,13 +434,6 @@ async fn run_conn(
         deliver(p.sink, Bytes::from_static(ERR_BACKEND_LOST));
     }
     drain_channel(&mut rx, deliver);
-}
-
-/// Grows a read buffer geometrically to READ_CHUNK; idle sessions stay small.
-pub fn ensure_read_room(buf: &mut BytesMut) {
-    if buf.capacity() - buf.len() < 2048 {
-        buf.reserve(buf.capacity().clamp(READ_INIT, READ_CHUNK));
-    }
 }
 
 fn deliver(sink: Sink, frame: Bytes) {

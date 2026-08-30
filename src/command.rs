@@ -1,7 +1,5 @@
 //! Static command table: name, arity, flags, key positions, and routing kind.
 
-const MAX_NAME: usize = 24;
-
 const FLAG_WRITE: u8 = 1;
 const FLAG_READONLY: u8 = 1 << 1;
 pub const FLAG_NO_AUTH: u8 = 1 << 2;
@@ -11,6 +9,8 @@ pub const FLAG_TXN_CTRL: u8 = 1 << 3;
 pub const FLAG_CACHE: u8 = 1 << 4;
 /// Writes a destination key named by a STORE/STOREDIST option.
 pub const FLAG_STORE: u8 = 1 << 5;
+const MAX_NAME: usize = 24;
+
 const PREFIX_LEN: usize = 8;
 
 const LUT_BITS: u32 = 9;

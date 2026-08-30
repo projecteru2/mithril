@@ -242,13 +242,6 @@ pub fn integer(out: &mut Vec<u8>, n: i64) {
     out.extend_from_slice(b"\r\n");
 }
 
-/// Appends a RESP array header.
-pub(crate) fn array_header(out: &mut Vec<u8>, n: usize) {
-    out.push(b'*');
-    push_usize(out, n);
-    out.extend_from_slice(b"\r\n");
-}
-
 /// Appends a simple error reply.
 pub fn write_error(out: &mut Vec<u8>, msg: &str) {
     out.push(b'-');
@@ -344,6 +337,22 @@ pub fn split_inline(line: &[u8]) -> Option<Vec<Vec<u8>>> {
     Some(args)
 }
 
+/// Returns a bulk-string frame's payload.
+pub fn bulk_payload(frame: &[u8]) -> Option<&[u8]> {
+    if frame.first() != Some(&b'$') {
+        return None;
+    }
+    let start = frame.iter().position(|&b| b == b'\n')? + 1;
+    frame.get(start..frame.len().saturating_sub(2))
+}
+
+/// Appends a RESP array header.
+pub(crate) fn array_header(out: &mut Vec<u8>, n: usize) {
+    out.push(b'*');
+    push_usize(out, n);
+    out.extend_from_slice(b"\r\n");
+}
+
 // i64::MIN marks a malformed integer line, distinct from a valid -1
 pub(crate) fn scan_int_line(buf: &[u8], pos: usize) -> Option<(i64, usize)> {
     let end = find_crlf(buf, pos)?;
@@ -363,15 +372,6 @@ pub(crate) fn scan_int_line(buf: &[u8], pos: usize) -> Option<(i64, usize)> {
         v = v * 10 + i64::from(b - b'0');
     }
     Some((if neg { -v } else { v }, end))
-}
-
-/// Returns a bulk-string frame's payload.
-pub fn bulk_payload(frame: &[u8]) -> Option<&[u8]> {
-    if frame.first() != Some(&b'$') {
-        return None;
-    }
-    let start = frame.iter().position(|&b| b == b'\n')? + 1;
-    frame.get(start..frame.len().saturating_sub(2))
 }
 
 /// Appends a signed RESP integer payload in decimal.
@@ -401,6 +401,37 @@ pub(crate) fn u64_digits(buf: &mut [u8; DEC_BUF], mut n: u64) -> &[u8] {
         }
     }
     &buf[i..]
+}
+
+pub(crate) fn scan_bulk(buf: &[u8], pos: usize) -> BulkScan {
+    match buf.get(pos) {
+        Some(b'$') | Some(b'=') => {}
+        Some(_) => return Some(Err("expected bulk string")),
+        None => return None,
+    }
+    let (n, body) = scan_int_line(buf, pos + 1)?;
+    if n == -1 {
+        return Some(Ok(Bulk {
+            payload_start: body,
+            payload_end: body,
+            next: body,
+        }));
+    }
+    if n < 0 || n as usize > MAX_BULK_LEN {
+        return Some(Err("bad bulk length"));
+    }
+    let end = body + n as usize + 2;
+    if buf.len() < end {
+        return None;
+    }
+    if &buf[end - 2..end] != b"\r\n" {
+        return Some(Err("bulk missing terminator"));
+    }
+    Some(Ok(Bulk {
+        payload_start: body,
+        payload_end: end - 2,
+        next: end,
+    }))
 }
 
 fn scan_at(buf: &[u8], pos: usize, depth: usize) -> Option<Scan> {
@@ -447,37 +478,6 @@ fn scan_inline(buf: &[u8]) -> ReqScan {
         None if buf.len() > MAX_INLINE_LEN => ReqScan::Invalid("inline request too long"),
         None => ReqScan::Incomplete,
     }
-}
-
-pub(crate) fn scan_bulk(buf: &[u8], pos: usize) -> BulkScan {
-    match buf.get(pos) {
-        Some(b'$') | Some(b'=') => {}
-        Some(_) => return Some(Err("expected bulk string")),
-        None => return None,
-    }
-    let (n, body) = scan_int_line(buf, pos + 1)?;
-    if n == -1 {
-        return Some(Ok(Bulk {
-            payload_start: body,
-            payload_end: body,
-            next: body,
-        }));
-    }
-    if n < 0 || n as usize > MAX_BULK_LEN {
-        return Some(Err("bad bulk length"));
-    }
-    let end = body + n as usize + 2;
-    if buf.len() < end {
-        return None;
-    }
-    if &buf[end - 2..end] != b"\r\n" {
-        return Some(Err("bulk missing terminator"));
-    }
-    Some(Ok(Bulk {
-        payload_start: body,
-        payload_end: end - 2,
-        next: end,
-    }))
 }
 
 fn hex_val(b: u8) -> Option<u8> {

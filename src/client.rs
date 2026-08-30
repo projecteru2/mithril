@@ -66,44 +66,6 @@ pub struct ReplyQueue {
     inner: QueueInner,
 }
 
-enum QueueInner {
-    Local {
-        q: RefCell<VecDeque<Reply>>,
-        bell: tokio::sync::Notify,
-        closed: Cell<bool>,
-    },
-    Shared(std::sync::Arc<SharedQueue>),
-}
-
-/// Cross-worker reply queue for sharded sessions.
-pub struct SharedQueue {
-    state: std::sync::Mutex<SharedState>,
-    bell: tokio::sync::Notify,
-}
-
-struct SharedState {
-    closed: bool,
-    q: VecDeque<Reply>,
-}
-
-impl SharedQueue {
-    /// Delivers a reply straight from an owner worker.
-    pub fn send(&self, reply: Reply) -> Result<(), Reply> {
-        let Ok(mut state) = self.state.lock() else {
-            return Err(reply);
-        };
-        if state.closed {
-            return Err(reply);
-        }
-        state.q.push_back(reply);
-        // the writer only parks on an empty queue: notify on that transition
-        if state.q.len() == 1 {
-            self.bell.notify_one();
-        }
-        Ok(())
-    }
-}
-
 impl ReplyQueue {
     fn new(shared: bool) -> Rc<ReplyQueue> {
         let inner = if shared {
@@ -203,6 +165,44 @@ impl ReplyQueue {
                 }
             }
         }
+    }
+}
+
+enum QueueInner {
+    Local {
+        q: RefCell<VecDeque<Reply>>,
+        bell: tokio::sync::Notify,
+        closed: Cell<bool>,
+    },
+    Shared(std::sync::Arc<SharedQueue>),
+}
+
+struct SharedState {
+    closed: bool,
+    q: VecDeque<Reply>,
+}
+
+/// Cross-worker reply queue for sharded sessions.
+pub struct SharedQueue {
+    state: std::sync::Mutex<SharedState>,
+    bell: tokio::sync::Notify,
+}
+
+impl SharedQueue {
+    /// Delivers a reply straight from an owner worker.
+    pub fn send(&self, reply: Reply) -> Result<(), Reply> {
+        let Ok(mut state) = self.state.lock() else {
+            return Err(reply);
+        };
+        if state.closed {
+            return Err(reply);
+        }
+        state.q.push_back(reply);
+        // the writer only parks on an empty queue: notify on that transition
+        if state.q.len() == 1 {
+            self.bell.notify_one();
+        }
+        Ok(())
     }
 }
 
@@ -1711,6 +1711,54 @@ impl Drop for Listed<'_> {
     }
 }
 
+// out-of-order replies by sequence distance; the back slot is always Some
+#[derive(Default)]
+struct ParkedRing {
+    base: u64,
+    slots: VecDeque<Option<Bytes>>,
+}
+
+impl ParkedRing {
+    fn put(&mut self, seq: u64, frame: Bytes) {
+        if self.slots.is_empty() {
+            self.base = seq;
+        } else if seq < self.base {
+            self.slots.reserve((self.base - seq) as usize);
+            for _ in seq..self.base {
+                self.slots.push_front(None);
+            }
+            self.base = seq;
+        }
+        let idx = (seq - self.base) as usize;
+        if idx >= self.slots.len() {
+            self.slots.resize(idx + 1, None);
+        }
+        self.slots[idx] = Some(frame);
+    }
+
+    fn take(&mut self, seq: u64) -> Option<Bytes> {
+        while self.base < seq && !self.slots.is_empty() {
+            self.slots.pop_front();
+            self.base += 1;
+        }
+        if self.base != seq {
+            return None;
+        }
+        let frame = self.slots.front_mut()?.take()?;
+        self.slots.pop_front();
+        self.base += 1;
+        // a drained ring must not retain a large excursion's capacity for the connection's life
+        if self.slots.is_empty() && self.slots.capacity() > 1024 {
+            self.slots = VecDeque::new();
+        }
+        Some(frame)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+}
+
 /// Serves one client connection to completion.
 pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
     if stream.set_nodelay(true).is_err() {
@@ -2185,54 +2233,6 @@ fn backfill_acks(link: &Rc<WriterLink>, reply_q: &Rc<ReplyQueue>) {
         let _ = reply_q.send(Reply::Ack(seq, Bytes::from_static(ERR_BACKEND_LOST)));
     }
     link.acks_drained.notify_one();
-}
-
-// out-of-order replies by sequence distance; the back slot is always Some
-#[derive(Default)]
-struct ParkedRing {
-    base: u64,
-    slots: VecDeque<Option<Bytes>>,
-}
-
-impl ParkedRing {
-    fn put(&mut self, seq: u64, frame: Bytes) {
-        if self.slots.is_empty() {
-            self.base = seq;
-        } else if seq < self.base {
-            self.slots.reserve((self.base - seq) as usize);
-            for _ in seq..self.base {
-                self.slots.push_front(None);
-            }
-            self.base = seq;
-        }
-        let idx = (seq - self.base) as usize;
-        if idx >= self.slots.len() {
-            self.slots.resize(idx + 1, None);
-        }
-        self.slots[idx] = Some(frame);
-    }
-
-    fn take(&mut self, seq: u64) -> Option<Bytes> {
-        while self.base < seq && !self.slots.is_empty() {
-            self.slots.pop_front();
-            self.base += 1;
-        }
-        if self.base != seq {
-            return None;
-        }
-        let frame = self.slots.front_mut()?.take()?;
-        self.slots.pop_front();
-        self.base += 1;
-        // a drained ring must not retain a large excursion's capacity for the connection's life
-        if self.slots.is_empty() && self.slots.capacity() > 1024 {
-            self.slots = VecDeque::new();
-        }
-        Some(frame)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.slots.is_empty()
-    }
 }
 
 async fn write_loop(

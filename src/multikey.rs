@@ -94,28 +94,6 @@ where
         .collect())
 }
 
-/// Splits a multi-bulk reply into its top-level element frames.
-fn split_array(frame: &[u8]) -> Option<Vec<&[u8]>> {
-    if frame.first() != Some(&b'*') {
-        return None;
-    }
-    let (n, header_end) = resp::scan_int_line(frame, 1)?;
-    if n < 0 {
-        return None;
-    }
-    let count = n as usize;
-    let mut items = Vec::with_capacity(count);
-    let mut pos = header_end;
-    for _ in 0..count {
-        let resp::Scan::Complete(len) = resp::scan_value(&frame[pos..]) else {
-            return None;
-        };
-        items.push(&frame[pos..pos + len]);
-        pos += len;
-    }
-    Some(items)
-}
-
 /// Merges MGET part replies back into client key order.
 pub fn merge_mget(total: usize, parts: &[(Vec<usize>, Bytes)]) -> Result<Bytes, Bytes> {
     let mut slots: Vec<&[u8]> = vec![resp::NIL_BULK; total];
@@ -163,15 +141,6 @@ pub fn merge_ok<'r>(parts: impl Iterator<Item = &'r Bytes>) -> Result<Bytes, Byt
     Ok(Bytes::from_static(crate::resp::OK))
 }
 
-/// Parses an integer reply frame.
-pub(crate) fn parse_int(frame: &[u8]) -> Option<i64> {
-    if frame.first() != Some(&b':') {
-        return None;
-    }
-    let end = frame.iter().position(|&b| b == b'\r')?;
-    std::str::from_utf8(&frame[1..end]).ok()?.parse().ok()
-}
-
 /// Packs (master index, node cursor) into one synthetic SCAN cursor.
 pub fn pack_cursor(master_idx: usize, node_cursor: u64) -> u64 {
     ((master_idx as u64) << SCAN_CURSOR_BITS) | (node_cursor & ((1 << SCAN_CURSOR_BITS) - 1))
@@ -205,6 +174,37 @@ pub fn rebuild_scan_reply(cursor: u64, keys_frame: &[u8]) -> Vec<u8> {
     crate::resp::bulk(&mut out, cursor);
     out.extend_from_slice(keys_frame);
     out
+}
+
+/// Parses an integer reply frame.
+pub(crate) fn parse_int(frame: &[u8]) -> Option<i64> {
+    if frame.first() != Some(&b':') {
+        return None;
+    }
+    let end = frame.iter().position(|&b| b == b'\r')?;
+    std::str::from_utf8(&frame[1..end]).ok()?.parse().ok()
+}
+
+/// Splits a multi-bulk reply into its top-level element frames.
+fn split_array(frame: &[u8]) -> Option<Vec<&[u8]>> {
+    if frame.first() != Some(&b'*') {
+        return None;
+    }
+    let (n, header_end) = resp::scan_int_line(frame, 1)?;
+    if n < 0 {
+        return None;
+    }
+    let count = n as usize;
+    let mut items = Vec::with_capacity(count);
+    let mut pos = header_end;
+    for _ in 0..count {
+        let resp::Scan::Complete(len) = resp::scan_value(&frame[pos..]) else {
+            return None;
+        };
+        items.push(&frame[pos..pos + len]);
+        pos += len;
+    }
+    Some(items)
 }
 
 #[cfg(test)]

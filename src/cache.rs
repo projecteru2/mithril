@@ -448,32 +448,6 @@ impl ReplyCache {
     }
 }
 
-fn entry_size(key_len: usize, frame_len: usize) -> usize {
-    key_len + frame_len + ENTRY_OVERHEAD
-}
-
-// frees a large generation a chunk at a time so no request waits on the whole drop
-fn retire(map: Map) {
-    if map.len() <= DROP_CHUNK || tokio::runtime::Handle::try_current().is_err() {
-        return;
-    }
-    tokio::task::spawn_local(async move {
-        let mut map = map;
-        let mut drain = map.drain();
-        while drain.by_ref().take(DROP_CHUNK).count() == DROP_CHUNK {
-            tokio::task::yield_now().await;
-        }
-    });
-}
-
-fn replace_set(cur: &mut HashSet<Box<str>>, want: &HashSet<&str>) -> bool {
-    if cur.len() == want.len() && want.iter().all(|a| cur.contains(*a)) {
-        return false;
-    }
-    *cur = want.iter().map(|&a| Box::from(a)).collect();
-    true
-}
-
 /// Where a worker's trackers deliver what they receive.
 pub struct Wiring {
     pub cache: Rc<ReplyCache>,
@@ -528,6 +502,44 @@ impl Wiring {
     }
 }
 
+// coverage accounting survives task aborts through this guard
+struct UpGuard {
+    w: Rc<Wiring>,
+    addr: Box<str>,
+}
+
+impl Drop for UpGuard {
+    fn drop(&mut self) {
+        self.w.cache.tracker_down(&self.addr);
+    }
+}
+
+fn entry_size(key_len: usize, frame_len: usize) -> usize {
+    key_len + frame_len + ENTRY_OVERHEAD
+}
+
+// frees a large generation a chunk at a time so no request waits on the whole drop
+fn retire(map: Map) {
+    if map.len() <= DROP_CHUNK || tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    tokio::task::spawn_local(async move {
+        let mut map = map;
+        let mut drain = map.drain();
+        while drain.by_ref().take(DROP_CHUNK).count() == DROP_CHUNK {
+            tokio::task::yield_now().await;
+        }
+    });
+}
+
+fn replace_set(cur: &mut HashSet<Box<str>>, want: &HashSet<&str>) -> bool {
+    if cur.len() == want.len() && want.iter().all(|a| cur.contains(*a)) {
+        return false;
+    }
+    *cur = want.iter().map(|&a| Box::from(a)).collect();
+    true
+}
+
 /// Keeps this worker's tracking connections alive; spawned once per worker.
 pub async fn run_trackers(w: Rc<Wiring>, topo: Arc<ArcSwap<Topology>>) {
     let mut running: HashMap<Box<str>, tokio::task::JoinHandle<()>> = HashMap::new();
@@ -568,18 +580,6 @@ async fn run_tracker(addr: Box<str>, w: Rc<Wiring>) {
             log_debug!("tracker {addr}: {e}");
         }
         tokio::time::sleep(TRACKER_RETRY).await;
-    }
-}
-
-// coverage accounting survives task aborts through this guard
-struct UpGuard {
-    w: Rc<Wiring>,
-    addr: Box<str>,
-}
-
-impl Drop for UpGuard {
-    fn drop(&mut self) {
-        self.w.cache.tracker_down(&self.addr);
     }
 }
 
