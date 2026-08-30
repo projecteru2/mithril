@@ -2,8 +2,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::hash::BuildHasherDefault;
 use std::io::IoSlice;
+use std::pin::Pin;
 use std::rc::Rc;
 
 use arc_swap::ArcSwap;
@@ -398,9 +400,15 @@ impl Session {
             Kind::Exec => Box::pin(self.handle_exec()).await,
             Kind::AnyMaster => self.forward_any_master(frame).await,
             Kind::MultiSum | Kind::Mget | Kind::Mset => {
-                Box::pin(self.fan_out(spec, &frame, argc)).await
+                if let Some(cold) = self.fan_out(spec, frame, argc) {
+                    cold.await;
+                }
             }
-            Kind::Blocking => Box::pin(self.forward_blocking(spec, frame, argc)).await,
+            Kind::Blocking => {
+                if let Some(cold) = self.forward_blocking(spec, frame, argc) {
+                    cold.await;
+                }
+            }
             Kind::Eval => Box::pin(self.forward_eval(frame, argc)).await,
             Kind::Xread => Box::pin(self.forward_xread(spec, frame, argc)).await,
             Kind::Subscribe => self.enter_pubsub(spec, frame, argc),
@@ -672,16 +680,22 @@ impl Session {
         }
     }
 
-    async fn forward_blocking(&self, spec: &Spec, frame: Bytes, argc: usize) {
+    fn forward_blocking(&self, spec: &Spec, frame: Bytes, argc: usize) -> Option<Cold<'_>> {
         let Some(slot) = self.key_slot(&frame, argc, spec.first_key as usize) else {
             self.emit_error("ERR missing key");
-            return;
+            return None;
         };
-        if self.fanouts_pending() && !self.wait_fanouts(&[slot]).await {
-            self.closing.set(true);
-            return;
+        if self.fanouts_pending() {
+            return Some(Box::pin(async move {
+                if self.wait_fanouts(&[slot]).await {
+                    self.spawn_blocking(slot, frame);
+                } else {
+                    self.closing.set(true);
+                }
+            }));
         }
         self.spawn_blocking(slot, frame);
+        None
     }
 
     fn spawn_blocking(&self, slot: u16, frame: Bytes) {
@@ -721,63 +735,109 @@ impl Session {
         true
     }
 
-    async fn fan_out(&self, spec: &Spec, frame: &Bytes, argc: usize) {
+    // fast path: no gate pending and every pipe has room, so nothing awaits
+    fn fan_out(&self, spec: &Spec, frame: Bytes, argc: usize) -> Option<Cold<'_>> {
         let seq = self.alloc_seq();
-        let readonly = spec.is_readonly();
-        let mode = self.shared.cfg.slave_mode;
         if spec.kind == Kind::Mset && !(argc - 1).is_multiple_of(2) {
             self.emit_at(
                 seq,
                 error_frame("ERR wrong number of arguments for 'mset' command"),
             );
-            return;
+            return None;
         }
-        let split = {
-            let args = collect_args(frame, argc);
-            let mut keys: Vec<&[u8]> = Vec::with_capacity(argc);
-            let mut values: Option<Vec<&[u8]>> =
-                (spec.step == 2).then(|| Vec::with_capacity(argc / 2));
-            for i in key_indices(spec, argc) {
-                keys.push(args[i]);
-                if let Some(vals) = values.as_mut() {
-                    vals.push(args[i + 1]);
-                }
+        let plan = self.plan_fanout(seq, spec, &frame, argc)?;
+        let n = plan.parts.len();
+        if self.fanouts_pending() || !plan.pipes.iter().all(|p| p.has_room(n)) {
+            return Some(Box::pin(self.fan_out_slow(plan)));
+        }
+        let receivers = plan
+            .parts
+            .iter()
+            .zip(&plan.pipes)
+            .map(|(part, pipe)| try_scatter(pipe, part.frame.clone()))
+            .collect();
+        self.launch_fanout(plan, receivers);
+        None
+    }
+
+    // splits the keys per slot and resolves every pipe; None after an error reply
+    fn plan_fanout(&self, seq: u64, spec: &Spec, frame: &Bytes, argc: usize) -> Option<FanoutPlan> {
+        let readonly = spec.is_readonly();
+        let mode = self.shared.cfg.slave_mode;
+        let args = collect_args(frame, argc);
+        let mut keys: Vec<&[u8]> = Vec::with_capacity(argc);
+        let mut values: Option<Vec<&[u8]>> = (spec.step == 2).then(|| Vec::with_capacity(argc / 2));
+        for i in key_indices(spec, argc) {
+            keys.push(args[i]);
+            if let Some(vals) = values.as_mut() {
+                vals.push(args[i + 1]);
             }
-            let total = keys.len();
-            let marks = match &self.shared.cache {
-                Some(cache) if spec.is_write() => Some(WriteMarks::new(
-                    cache,
-                    keys.iter().map(|k| frame.slice_ref(k)).collect(),
-                )),
-                _ => None,
-            };
-            let topo = self.topo();
-            let mut slots = Vec::new();
-            let parts = self.with_rng(|rng| {
-                multikey::split(spec.name.as_bytes(), &keys, values.as_deref(), |slot| {
-                    slots.push(slot);
-                    route::pick(&topo, slot, readonly, mode, rng)
-                })
-            });
-            parts.map(|p| {
-                let pipes: Vec<Pipe> = p
-                    .iter()
-                    .map(|part| self.cached_pipe(&topo, part.node, part.readonly))
-                    .collect();
-                (p, pipes, total, marks, slots)
-            })
+        }
+        let total = keys.len();
+        let marks = match &self.shared.cache {
+            Some(cache) if spec.is_write() => Some(WriteMarks::new(
+                cache,
+                keys.iter().map(|k| frame.slice_ref(k)).collect(),
+            )),
+            _ => None,
         };
-        let (parts, pipes, total, marks, slots) = match split {
-            Ok(v) => v,
+        let topo = self.topo();
+        let mut slots = Vec::new();
+        let parts = self.with_rng(|rng| {
+            multikey::split(spec.name.as_bytes(), &keys, values.as_deref(), |slot| {
+                slots.push(slot);
+                route::pick(&topo, slot, readonly, mode, rng)
+            })
+        });
+        let parts = match parts {
+            Ok(p) => p,
             Err(e) => {
                 self.emit_at(seq, error_frame(&format!("CLUSTERDOWN {e}")));
-                return;
+                return None;
             }
         };
-        if self.fanouts_pending() && !self.wait_fanouts(&slots).await {
+        let pipes = parts
+            .iter()
+            .map(|part| self.cached_pipe(&topo, part.node, part.readonly))
+            .collect();
+        Some(FanoutPlan {
+            seq,
+            merge: match spec.kind {
+                Kind::Mget => Merge::Mget,
+                Kind::Mset => Merge::Ok,
+                _ => Merge::Sum,
+            },
+            parts,
+            pipes,
+            total,
+            marks,
+            slots,
+        })
+    }
+
+    async fn fan_out_slow(&self, plan: FanoutPlan) {
+        if self.fanouts_pending() && !self.wait_fanouts(&plan.slots).await {
             self.closing.set(true);
             return;
         }
+        let mut receivers = Vec::with_capacity(plan.parts.len());
+        for (part, pipe) in plan.parts.iter().zip(&plan.pipes) {
+            receivers.push(scatter_pipe(pipe, part.frame.clone()).await);
+        }
+        self.launch_fanout(plan, receivers);
+    }
+
+    // every part is queued by now, so later commands stay behind this one
+    fn launch_fanout(&self, plan: FanoutPlan, receivers: Vec<oneshot::Receiver<Bytes>>) {
+        let FanoutPlan {
+            seq,
+            merge,
+            parts,
+            pipes: _,
+            total,
+            marks,
+            slots,
+        } = plan;
         let gate = Rc::new(tokio::sync::Notify::new());
         {
             let mut gates = self.fanouts.borrow_mut();
@@ -789,17 +849,6 @@ impl Session {
         let shared = self.shared.clone();
         let reply_q = self.reply_q.clone();
         let id = self.id;
-        let merge = match spec.kind {
-            Kind::Mget => Merge::Mget,
-            Kind::Mset => Merge::Ok,
-            _ => Merge::Sum,
-        };
-        // every part is queued before this returns, so later commands stay behind it
-        let mut receivers = Vec::with_capacity(parts.len());
-        for (part, pipe) in parts.iter().zip(pipes) {
-            // the clone retains the frame for a possible redirect resend
-            receivers.push(scatter_pipe(pipe, part.frame.clone()).await);
-        }
         // detached deliberately: completion is bounded by backend replies.
         tokio::task::spawn_local(async move {
             let _marks = marks;
@@ -1417,6 +1466,27 @@ impl Pipe {
             Pipe::Shard(tx) => tx.is_closed(),
         }
     }
+
+    fn has_room(&self, n: usize) -> bool {
+        match self {
+            Pipe::Local(conn) => conn.has_room(n),
+            Pipe::Shard(tx) => tx.capacity() >= n,
+        }
+    }
+}
+
+// the awaited remainder of a command whose fast path could not finish
+type Cold<'a> = Pin<Box<dyn Future<Output = ()> + 'a>>;
+
+// a fan-out resolved and ready to queue; the frames retain themselves for resends
+struct FanoutPlan {
+    seq: u64,
+    merge: Merge,
+    parts: Vec<multikey::Part>,
+    pipes: Vec<Pipe>,
+    total: usize,
+    marks: Option<WriteMarks>,
+    slots: Vec<u16>,
 }
 
 // the rare full-queue leftover; flushed with an awaited send
@@ -1734,8 +1804,32 @@ fn key_indices(spec: &Spec, argc: usize) -> impl Iterator<Item = usize> {
     (first..end).step_by((spec.step as usize).max(1))
 }
 
-// hot fan-out path: the pipe was resolved through the session cache
-async fn scatter_pipe(pipe: Pipe, frame: Bytes) -> oneshot::Receiver<Bytes> {
+// the caller checked has_room: a full queue here drops the oneshot, and the
+// receiver reads that as LOST rather than hanging
+fn try_scatter(pipe: &Pipe, frame: Bytes) -> oneshot::Receiver<Bytes> {
+    let (tx, rx) = oneshot::channel();
+    match pipe {
+        Pipe::Local(conn) => {
+            let _ = conn.try_send(Outbound {
+                head: None,
+                frame,
+                expect: 1,
+                sink: Sink::One(tx),
+            });
+        }
+        Pipe::Shard(sender) => {
+            let _ = sender.try_send(crate::shard::RemoteOutbound {
+                head: None,
+                frame,
+                expect: 1,
+                reply: crate::shard::RemoteSink::One(tx),
+            });
+        }
+    }
+    rx
+}
+
+async fn scatter_pipe(pipe: &Pipe, frame: Bytes) -> oneshot::Receiver<Bytes> {
     let (tx, rx) = oneshot::channel();
     match pipe {
         Pipe::Local(conn) => {

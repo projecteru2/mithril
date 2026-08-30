@@ -88,6 +88,11 @@ impl Conn {
         self.dead.get()
     }
 
+    /// True when `n` requests can be queued without waiting.
+    pub fn has_room(&self, n: usize) -> bool {
+        self.tx.capacity() >= n
+    }
+
     /// Force-closes the connection so the backend cancels blocked commands.
     pub fn abort(&self) {
         self.dead.set(true);
