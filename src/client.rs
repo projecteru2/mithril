@@ -777,14 +777,28 @@ impl Session {
         if self.fanouts_pending() || !plan.pipes.iter().all(|p| p.has_room(n)) {
             return Some(Box::pin(self.fan_out_slow(plan)));
         }
-        let receivers = plan
-            .parts
-            .iter()
-            .zip(&plan.pipes)
-            .map(|(part, pipe)| try_scatter(pipe, part.frame.clone()))
-            .collect();
+        // has_room is a snapshot; a queue another worker filled meanwhile is awaited
+        let mut receivers = Vec::with_capacity(n);
+        for (i, (part, pipe)) in plan.parts.iter().zip(&plan.pipes).enumerate() {
+            let (staged, rx) = stage_one(pipe, None, part.frame.clone());
+            receivers.push(rx);
+            if let Err(staged) = staged.try_send() {
+                return Some(Box::pin(self.fan_out_resume(plan, receivers, i, staged)));
+            }
+        }
         self.launch_fanout(plan, receivers);
         None
+    }
+
+    async fn fan_out_resume(
+        &self,
+        plan: FanoutPlan,
+        receivers: Vec<oneshot::Receiver<Bytes>>,
+        at: usize,
+        staged: Staged,
+    ) {
+        staged.send().await;
+        self.scatter_rest(plan, receivers, at + 1).await;
     }
 
     // splits the keys per slot and resolves every pipe; one slot needs no fan-out
@@ -869,8 +883,17 @@ impl Session {
             self.closing.set(true);
             return;
         }
-        let mut receivers = Vec::with_capacity(plan.parts.len());
-        for (part, pipe) in plan.parts.iter().zip(&plan.pipes) {
+        let receivers = Vec::with_capacity(plan.parts.len());
+        self.scatter_rest(plan, receivers, 0).await;
+    }
+
+    async fn scatter_rest(
+        &self,
+        plan: FanoutPlan,
+        mut receivers: Vec<oneshot::Receiver<Bytes>>,
+        from: usize,
+    ) {
+        for (part, pipe) in plan.parts.iter().zip(&plan.pipes).skip(from) {
             receivers.push(scatter_pipe(pipe, part.frame.clone()).await);
         }
         self.launch_fanout(plan, receivers);
@@ -1252,7 +1275,10 @@ impl Session {
                 }
                 i += 3;
             } else if args[i].eq_ignore_ascii_case(b"setname") && i + 1 < args.len() {
-                *self.name.borrow_mut() = String::from_utf8_lossy(args[i + 1]).into_owned();
+                if let Err(e) = self.set_name(args[i + 1]) {
+                    self.emit_error(e);
+                    return;
+                }
                 i += 2;
             } else {
                 self.emit_error("ERR syntax error in HELLO");
@@ -1299,14 +1325,10 @@ impl Session {
                 resp::integer(&mut out, self.id as i64);
                 self.emit_local(out);
             }
-            Some(_) if sub(b"setname") && args.len() == 3 => {
-                let name = String::from_utf8_lossy(args[2]);
-                if let Some(c) = self.shared.stats.registry().get_mut(&self.id) {
-                    c.name = Box::from(&*name);
-                }
-                *self.name.borrow_mut() = name.into_owned();
-                self.emit_local(Bytes::from_static(resp::OK));
-            }
+            Some(_) if sub(b"setname") && args.len() == 3 => match self.set_name(args[2]) {
+                Ok(()) => self.emit_local(Bytes::from_static(resp::OK)),
+                Err(e) => self.emit_error(e),
+            },
             Some(_) if sub(b"list") => self.emit_local(admin::client_list(&self.shared.stats)),
             Some(_) if sub(b"getname") => {
                 let name = self.name.borrow();
@@ -1465,9 +1487,26 @@ impl Session {
         *self.pubsub.borrow_mut() = Some(PubsubHandle { tx, task });
     }
 
+    fn set_name(&self, name: &[u8]) -> Result<(), &'static str> {
+        match std::str::from_utf8(name) {
+            Ok(name) if name.bytes().all(|b| (b'!'..=b'~').contains(&b)) => {
+                self.store_name(name);
+                Ok(())
+            }
+            _ => Err("ERR Client names cannot contain spaces, newlines or special characters."),
+        }
+    }
+
+    fn store_name(&self, name: &str) {
+        if let Some(c) = self.shared.stats.registry().get_mut(&self.id) {
+            c.name = Box::from(name);
+        }
+        *self.name.borrow_mut() = name.to_owned();
+    }
+
     fn do_reset(&self) {
         *self.multi.borrow_mut() = None;
-        self.name.borrow_mut().clear();
+        self.store_name("");
         self.proto.set(2);
         self.link.proto_switches.push(self.next_seq.get(), 2);
         self.authed.set(self.shared.cfg.requirepass.is_empty());
@@ -1972,15 +2011,20 @@ enum Staged {
 }
 
 impl Staged {
-    // a full or closed queue drops the oneshot, which the receiver reads as LOST
-    fn try_send(self) {
+    // a closed queue drops the oneshot, which the receiver reads as LOST; a
+    // full one hands the request back to be awaited
+    fn try_send(self) -> Result<(), Staged> {
         match self {
-            Staged::Local(conn, out) => {
-                let _ = conn.try_send(out);
-            }
-            Staged::Shard(tx, out) => {
-                let _ = tx.try_send(out);
-            }
+            Staged::Local(conn, out) => match conn.try_send(out) {
+                Ok(()) => Ok(()),
+                Err(out) => Err(Staged::Local(conn, out)),
+            },
+            Staged::Shard(tx, out) => match tx.try_send(out) {
+                Err(tokio::sync::mpsc::error::TrySendError::Full(out)) => {
+                    Err(Staged::Shard(tx, out))
+                }
+                _ => Ok(()),
+            },
         }
     }
 
@@ -2018,13 +2062,6 @@ fn stage_one(pipe: &Pipe, head: Option<Bytes>, frame: Bytes) -> (Staged, oneshot
         ),
     };
     (staged, rx)
-}
-
-// the caller checked has_room, so nothing waits
-fn try_scatter(pipe: &Pipe, frame: Bytes) -> oneshot::Receiver<Bytes> {
-    let (staged, rx) = stage_one(pipe, None, frame);
-    staged.try_send();
-    rx
 }
 
 async fn scatter_pipe(pipe: &Pipe, frame: Bytes) -> oneshot::Receiver<Bytes> {

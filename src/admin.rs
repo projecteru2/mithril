@@ -189,9 +189,9 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
         cfg.port,
         now.saturating_sub(started),
         cfg.config_file,
+        stats.clients.load(Ordering::Relaxed),
         cpu.0,
         cpu.1,
-        stats.clients.load(Ordering::Relaxed),
         stats.total_connections.load(Ordering::Relaxed),
         stats.sum(|w| &w.commands),
         stats.sum(|w| &w.bytes_in),
@@ -383,6 +383,31 @@ fn config_pairs(cfg: &Config) -> Vec<(&'static str, String)> {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn info_fields_line_up() {
+        let cfg = test_cfg();
+        let stats = crate::stats::Stats::new(2);
+        stats.clients.store(7, Ordering::Relaxed);
+        let out = info(&cfg, &stats, 0);
+        let text = String::from_utf8_lossy(&out);
+        let field = |k: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("{k}:")))
+                .map(|v| v.trim_end().to_string())
+        };
+        assert_eq!(field("connected_clients").as_deref(), Some("7"));
+        assert_eq!(
+            field("worker_threads").as_deref(),
+            Some(cfg.workers.to_string().as_str())
+        );
+        assert!(field("used_cpu_sys").unwrap().parse::<f64>().is_ok());
+        assert!(field("used_cpu_user").unwrap().parse::<f64>().is_ok());
+        assert_eq!(
+            field("config_file").as_deref(),
+            Some(cfg.config_file.as_str())
+        );
+    }
 
     fn test_cfg() -> Config {
         let mut cfg = Config::default();

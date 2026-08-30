@@ -74,6 +74,7 @@ struct Placer {
     snap: Vec<u64>,
     buckets: Vec<u64>,
     placed: Vec<u64>,
+    order: Vec<usize>,
     next: usize,
     least_loaded: bool,
 }
@@ -84,8 +85,20 @@ impl Placer {
             snap: vec![0; workers],
             buckets: vec![0; workers],
             placed: vec![0; workers],
+            order: Vec::with_capacity(workers),
             next: 0,
             least_loaded,
+        }
+    }
+
+    // every worker by placement key, for the rare full-queue fallback
+    fn rank(&mut self) {
+        self.order.clear();
+        self.order.extend(0..self.snap.len());
+        self.order.rotate_left(self.next);
+        if self.least_loaded {
+            let (placed, buckets) = (&self.placed, &self.buckets);
+            self.order.sort_by_key(|&i| (placed[i], buckets[i]));
         }
     }
 
@@ -326,11 +339,19 @@ fn acceptor_thread(
             if admitted.stream.is_none() {
                 continue;
             }
-            // a full queue falls through the rotation and never stalls accepts
+            // a full queue falls to the next-best key and never stalls accepts
             'place: loop {
                 let best = placer.best();
+                match conn_txs[best].try_send(admitted) {
+                    Ok(()) => {
+                        placer.placed(best);
+                        break 'place;
+                    }
+                    Err(e) => admitted = e.into_inner(),
+                }
+                placer.rank();
                 for k in 0..conn_txs.len() {
-                    let i = (best + k) % conn_txs.len();
+                    let i = placer.order[k];
                     match conn_txs[i].try_send(admitted) {
                         Ok(()) => {
                             placer.placed(i);
