@@ -1,6 +1,7 @@
 # Compatibility
 
-The 37-test integration suite runs against each backend with full cluster
+The 47-test integration suite runs against each backend, in every mode
+combination (`backend-sharding`, `reply-cache`), with full cluster
 teardown/recreate between versions:
 
 | backend | server version | result |
@@ -36,8 +37,9 @@ memtier_benchmark, redis-benchmark.
 - Multi-key commands with single-node semantics (MSETNX, RENAME, SMOVE,
   BITOP, the *STORE family, ...) route by their first key; the owning node
   enforces same-slot, exactly as a direct cluster connection would.
-- Server-management commands are not proxied: WAIT, OBJECT, DEBUG, LATENCY,
-  MEMORY, SHUTDOWN, FAILOVER, REPLICAOF, SAVE/BGSAVE, DUMP/RESTORE, MIGRATE
-  and similar return unknown-command.
+- Server-management commands are not proxied: WAIT, DEBUG, LATENCY, MEMORY,
+  SHUTDOWN, FAILOVER, REPLICAOF, SAVE/BGSAVE, DUMP/RESTORE, MIGRATE and
+  similar return unknown-command. OBJECT routes by its key.
+- CLIENT supports ID, SETNAME, GETNAME and LIST (id, addr, fd, name, age).
 - No TLS, no unix-domain listener, no slowlog, no keyspace notifications,
   no Prometheus endpoint (stats via INFO).
