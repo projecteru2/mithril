@@ -20,6 +20,8 @@ would. EVAL routes by its first key (or any master when it has none).
 MGET, MSET, DEL, UNLINK, EXISTS, TOUCH and PFCOUNT split per slot, execute
 in parallel, and merge: MGET order-preserving, MSET all-OK, the rest summed.
 A redirected part is retried once against its new owner before merging.
+Keys that all hash to one slot (hash tags) skip the split: the command
+routes as a single request with no merge step.
 
 ## Cluster-wide
 
