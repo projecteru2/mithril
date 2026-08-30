@@ -27,6 +27,7 @@ impl Topology {
         let mut nodes = Vec::new();
         let mut slot_specs: Vec<(u16, Vec<(u16, u16)>)> = Vec::new();
         let mut master_ids: Vec<(&str, u16)> = Vec::new();
+        let mut masters = Vec::new();
         let mut replica_refs: Vec<(u16, &str)> = Vec::new();
 
         for line in raw.lines() {
@@ -45,11 +46,18 @@ impl Topology {
             let fail = flags.contains("fail") && !flags.contains("failover");
             if is_master {
                 master_ids.push((id, idx));
-                let ranges = fields
-                    .skip(4)
-                    .filter(|f| !f.starts_with('['))
-                    .filter_map(parse_slot_range)
-                    .collect::<Vec<_>>();
+                let mut ranges = Vec::new();
+                let mut importing = false;
+                for field in fields.skip(4) {
+                    if field.starts_with('[') {
+                        importing |= field.contains("-<-");
+                    } else if let Some(range) = parse_slot_range(field) {
+                        ranges.push(range);
+                    }
+                }
+                if importing || !ranges.is_empty() {
+                    masters.push(idx);
+                }
                 slot_specs.push((idx, ranges));
             } else {
                 replica_refs.push((idx, master_ref));
@@ -61,9 +69,8 @@ impl Topology {
             });
         }
 
-        let masters: Vec<u16> = master_ids.iter().map(|&(_, idx)| idx).collect();
         if masters.is_empty() {
-            return Err("no masters in topology".to_string());
+            return Err("no slot-owning masters in topology".to_string());
         }
         for (idx, master_ref) in replica_refs {
             let Some((_, midx)) = master_ids.iter().find(|(id, _)| *id == master_ref) else {
@@ -84,9 +91,6 @@ impl Topology {
                     slots[s as usize] = idx;
                 }
             }
-        }
-        if slots.iter().all(|&s| s == NO_NODE) {
-            return Err("no slots assigned".to_string());
         }
         Ok(Topology {
             epoch: 0,
@@ -141,6 +145,19 @@ a1b2 127.0.0.1:7003@17003 master - 0 1 3 connected 10923-11999 12001-16383\n\
         let m = topo.owner(0).unwrap() as usize;
         assert_eq!(topo.nodes[m].replicas.len(), 1);
         assert!(topo.owner(5461) != topo.owner(0));
+    }
+
+    #[test]
+    fn only_masters_that_can_hold_keys_are_targets() {
+        let raw = "e7d1 1.2.3.4:7001@17001 master - 0 1 1 connected 0-16383 [100->-c0c0]\n\
+                   b0b0 1.2.3.4:7005@17005 master - 0 1 0 connected\n\
+                   c0c0 1.2.3.4:7006@17006 master - 0 1 0 connected [100-<-e7d1]\n\
+                   99ff 1.2.3.4:7004@17004 slave b0b0 0 1 0 connected\n";
+        let topo = Topology::parse(raw).unwrap();
+        assert_eq!(topo.nodes.len(), 4);
+        assert_eq!(topo.masters, vec![0, 2]);
+        assert_eq!(topo.owner(100), Some(0));
+        assert!(Topology::parse("b0b0 1.2.3.4:7005@17005 master - 0 1 0 connected\n").is_err());
     }
 
     #[test]

@@ -36,8 +36,8 @@ routes as a single request with no merge step.
 ## Cluster-wide
 
 SCAN iterates the whole cluster with synthetic cursors (master index packed
-into the cursor's high bits), DBSIZE sums all masters, FLUSHALL broadcasts
-and requires every master to acknowledge.
+into the cursor's high bits), DBSIZE sums the slot-owning masters, FLUSHALL
+broadcasts to them and requires every one to acknowledge.
 
 ## Transactions
 

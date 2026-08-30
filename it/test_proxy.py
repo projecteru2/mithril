@@ -311,7 +311,10 @@ def test_dbsize_matches_direct_cluster_sum(r, cluster_direct):
         if proxy_size == total_direct or time.time() > deadline:
             break
         time.sleep(0.2)
-    per_node = cluster_direct.dbsize(target_nodes=RedisCluster.ALL_NODES)
+    per_node = {
+        f"{n.host}:{n.port}": cluster_direct.get_redis_connection(n).dbsize()
+        for n in cluster_direct.get_nodes()
+    }
     assert proxy_size == total_direct, (proxy_size, total_direct, per_node)
 
 
