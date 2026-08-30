@@ -582,3 +582,51 @@ def test_pubsub_context_and_multi_errors_match_redis_wording(raw_socket, new_con
         pipe = c.pipeline(transaction=True)
         pipe.execute_command("CLIENT", "LIST")
         pipe.execute()
+
+# --- slot migration ---
+
+
+def test_multikey_survives_a_migrating_slot(r, cluster_direct, key_prefix):
+    a, b, other = f"{{{key_prefix}}}a", f"{{{key_prefix}}}b", f"{key_prefix}:other"
+    slot = key_slot(a.encode())
+    assert key_slot(other.encode()) != slot
+    src_node = cluster_direct.get_node_from_key(a)
+    dst_node = next(
+        n for n in cluster_direct.get_primaries() if (n.host, n.port) != (src_node.host, src_node.port)
+    )
+    src = redis.Redis(host=src_node.host, port=src_node.port, decode_responses=True)
+    dst = redis.Redis(host=dst_node.host, port=dst_node.port, decode_responses=True)
+    src_id = src.execute_command("CLUSTER MYID")
+    dst_id = dst.execute_command("CLUSTER MYID")
+    assert r.mset({a: "1", b: "2", other: "3"})
+    src.execute_command("CLUSTER SETSLOT", slot, "MIGRATING", dst_id)
+    dst.execute_command("CLUSTER SETSLOT", slot, "IMPORTING", src_id)
+    try:
+        assert src.execute_command("MIGRATE", dst_node.host, dst_node.port, "", 0, 5000, "KEYS", a) == "OK"
+        with pytest.raises(redis.exceptions.ResponseError, match="TRYAGAIN|ASK"):
+            src.mget(a, b)
+        assert r.mget(a, b) == ["1", "2"]
+        assert r.mget(a, b, other) == ["1", "2", "3"]
+        assert r.exists(a, b) == 2
+        assert r.exists(a, b, other) == 3
+        assert r.mset({a: "11", b: "22"})
+        assert r.mset({a: "111", b: "222", other: "333"})
+        assert r.mget(a, b, other) == ["111", "222", "333"]
+        pipe = r.pipeline(transaction=False)
+        pipe.mset({a: "x", b: "y"})
+        pipe.set(b, "z")
+        _, second = pipe.execute(raise_on_error=False)
+        assert second is True
+        assert r.get(b) == "z"
+        assert r.mset({a: "p", b: "q"})
+        assert r.mget(a, b) == ["p", "q"]
+        assert r.delete(a, b, other) == 3
+        assert r.mget(a, b) == [None, None]
+    finally:
+        dst.execute_command("ASKING")
+        dst.execute_command("MIGRATE", src_node.host, src_node.port, "", 0, 5000, "KEYS", a)
+        src.execute_command("CLUSTER SETSLOT", slot, "STABLE")
+        dst.execute_command("CLUSTER SETSLOT", slot, "STABLE")
+        r.delete(a, b, other)
+        src.close()
+        dst.close()

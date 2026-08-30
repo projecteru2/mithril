@@ -1,8 +1,9 @@
 # Compatibility
 
-The 47-test integration suite runs against each backend, in every mode
+The 48-test integration suite runs against each backend, in every mode
 combination (`backend-sharding`, `reply-cache`), with full cluster
-teardown/recreate between versions:
+teardown/recreate between versions; it includes a live slot migration
+(CLUSTER SETSLOT MIGRATING/IMPORTING + MIGRATE) under multi-key commands:
 
 | backend | server version | result |
 |---|---|---|

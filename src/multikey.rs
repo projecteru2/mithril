@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use bytes::Bytes;
 
-use crate::resp;
+use crate::{crc16, resp};
 
 const SCAN_CURSOR_BITS: u32 = 51;
 
@@ -94,8 +94,38 @@ where
         .collect())
 }
 
+/// Re-splits a multi-key frame holding `count` keys into single-key requests as
+/// (position, slot, frame), one at a time; `positions` are the keys' client-order indices.
+pub fn singles<'a>(
+    frame: &'a [u8],
+    count: usize,
+    mut positions: impl Iterator<Item = usize> + 'a,
+) -> impl Iterator<Item = (usize, u16, Bytes)> + 'a {
+    let argc = resp::scan_int_line(frame, 1).map_or(0, |(n, _)| n.max(0) as usize);
+    let mut args = resp::Args::new(frame, argc);
+    let name = args.next().unwrap_or_default();
+    let width = argc.saturating_sub(1) / count.max(1);
+    std::iter::from_fn(move || {
+        let pos = positions.next()?;
+        let key = args.next()?;
+        let mut buf = Vec::with_capacity(name.len() + key.len() + 32);
+        if width == 2
+            && let Some(value) = args.next()
+        {
+            resp::write_command(&mut buf, &[name, key, value]);
+        } else {
+            resp::write_command(&mut buf, &[name, key]);
+        }
+        Some((pos, crc16::slot(key), Bytes::from(buf)))
+    })
+}
+
 /// Merges MGET part replies back into client key order.
-pub fn merge_mget(total: usize, parts: &[(Vec<usize>, Bytes)]) -> Result<Bytes, Bytes> {
+pub fn merge_mget(
+    total: usize,
+    parts: &[(Vec<usize>, Bytes)],
+    singles: &[(usize, Bytes)],
+) -> Result<Bytes, Bytes> {
     let mut slots: Vec<&[u8]> = vec![resp::NIL_BULK; total];
     let (mut bytes, mut filled) = (0usize, 0usize);
     for (positions, reply) in parts {
@@ -112,6 +142,12 @@ pub fn merge_mget(total: usize, parts: &[(Vec<usize>, Bytes)]) -> Result<Bytes, 
             slots[*i] = item;
         }
     }
+    for (pos, reply) in singles {
+        let item = single_item(reply).ok_or_else(|| reply.clone())?;
+        bytes += item.len();
+        filled += 1;
+        slots[*pos] = item;
+    }
     let nils = total.saturating_sub(filled) * resp::NIL_BULK.len();
     let mut out = Vec::with_capacity(bytes + nils + 16);
     resp::array_header(&mut out, total);
@@ -122,8 +158,8 @@ pub fn merge_mget(total: usize, parts: &[(Vec<usize>, Bytes)]) -> Result<Bytes, 
 }
 
 /// Sums integer part replies (DEL/UNLINK/EXISTS/TOUCH/PFCOUNT).
-pub fn merge_sum<'r>(parts: impl Iterator<Item = &'r Bytes>) -> Result<Bytes, Bytes> {
-    let mut total: i64 = 0;
+pub fn merge_sum<'r>(parts: impl Iterator<Item = &'r Bytes>, base: i64) -> Result<Bytes, Bytes> {
+    let mut total = base;
     for reply in parts {
         match parse_int(reply) {
             Some(n) => total += n,
@@ -189,6 +225,13 @@ pub(crate) fn parse_int(frame: &[u8]) -> Option<i64> {
 }
 
 /// Splits a multi-bulk reply into its top-level element frames.
+// the item of a one-element array reply; an error reply has none
+fn single_item(frame: &[u8]) -> Option<&[u8]> {
+    frame
+        .strip_prefix(b"*1\r\n")
+        .filter(|item| !item.is_empty())
+}
+
 fn split_array(frame: &[u8]) -> Option<Vec<&[u8]>> {
     if frame.first() != Some(&b'*') {
         return None;
@@ -215,6 +258,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn singles_keep_positions_and_values() {
+        let mut f = Vec::new();
+        resp::write_command(&mut f, &[b"MSET", b"a", b"1", b"b", b"2"]);
+        let got: Vec<_> = singles(&f, 2, [3, 7].into_iter()).collect();
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].0, got[0].1), (3, crc16::slot(b"a")));
+        assert_eq!(&got[0].2[..], b"*3\r\n$4\r\nMSET\r\n$1\r\na\r\n$1\r\n1\r\n");
+        assert_eq!((got[1].0, got[1].1), (7, crc16::slot(b"b")));
+        assert_eq!(&got[1].2[..], b"*3\r\n$4\r\nMSET\r\n$1\r\nb\r\n$1\r\n2\r\n");
+        let mut g = Vec::new();
+        resp::write_command(&mut g, &[b"MGET", b"a", b"b", b"c"]);
+        let frames: Vec<Bytes> = singles(&g, 3, 0..3).map(|(_, _, f)| f).collect();
+        assert_eq!(
+            frames,
+            [
+                Bytes::from_static(b"*2\r\n$4\r\nMGET\r\n$1\r\na\r\n"),
+                Bytes::from_static(b"*2\r\n$4\r\nMGET\r\n$1\r\nb\r\n"),
+                Bytes::from_static(b"*2\r\n$4\r\nMGET\r\n$1\r\nc\r\n"),
+            ]
+        );
+    }
+
+    #[test]
     fn splits_by_slot_even_on_one_node() {
         let keys: Vec<&[u8]> = vec![b"{t}a", b"b", b"{t}c"];
         let slots: Vec<u16> = keys.iter().map(|k| crate::crc16::slot(k)).collect();
@@ -233,7 +299,10 @@ mod tests {
     fn merges_mget_in_order() {
         let p1 = Bytes::from_static(b"*2\r\n$2\r\nv0\r\n$2\r\nv2\r\n");
         let p2 = Bytes::from_static(b"*1\r\n$2\r\nv1\r\n");
-        let merged = merge_mget(3, &[(vec![0, 2], p1), (vec![1], p2)]).unwrap();
+        let merged =
+            merge_mget(3, &[(vec![0, 2], p1.clone()), (vec![1], p2.clone())], &[]).unwrap();
+        let mixed = merge_mget(3, &[(vec![0, 2], p1)], &[(1, p2)]).unwrap();
+        assert_eq!(mixed, merged);
         assert_eq!(
             merged.as_ref(),
             b"*3\r\n$2\r\nv0\r\n$2\r\nv1\r\n$2\r\nv2\r\n"
@@ -247,7 +316,7 @@ mod tests {
             (vec![1], Bytes::from_static(b":1\r\n")),
         ];
         assert_eq!(
-            merge_sum(parts.iter().map(|(_, r)| r)).unwrap().as_ref(),
+            merge_sum(parts.iter().map(|(_, r)| r), 0).unwrap().as_ref(),
             b":3\r\n"
         );
         let oks = [(vec![0], Bytes::from_static(b"+OK\r\n"))];
@@ -256,7 +325,7 @@ mod tests {
             b"+OK\r\n"
         );
         let bad = [(vec![0], Bytes::from_static(b"-ERR nope\r\n"))];
-        assert!(merge_sum(bad.iter().map(|(_, r)| r)).is_err());
+        assert!(merge_sum(bad.iter().map(|(_, r)| r), 0).is_err());
     }
 
     #[test]

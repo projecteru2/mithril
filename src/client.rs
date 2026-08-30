@@ -219,6 +219,7 @@ struct InFlight {
     frame: Bytes,
     expect: u32,
     retried: bool,
+    degraded: bool,
     fill_key: Option<Bytes>,
 }
 
@@ -241,6 +242,34 @@ struct WriterLink {
     acks_drained: Notify,
     // in-flight fills; the reply path skips the ring search at zero
     fills_armed: Cell<usize>,
+    next_seq: Cell<u64>,
+    fanouts: RefCell<FanoutGates>,
+    // slots seen migrating: their same-slot multi-key commands take the gated path
+    migrating: RefCell<Vec<u16>>,
+    migrating_any: Cell<bool>,
+}
+
+impl WriterLink {
+    fn is_migrating(&self, slot: u16) -> bool {
+        self.migrating_any.get() && self.migrating.borrow().contains(&slot)
+    }
+
+    fn mark_migrating(&self, slot: u16) {
+        let mut slots = self.migrating.borrow_mut();
+        if !slots.contains(&slot) {
+            slots.push(slot);
+        }
+        self.migrating_any.set(true);
+    }
+
+    fn retain_migrating(&self, keep: impl Fn(u16) -> bool) {
+        if !self.migrating_any.get() {
+            return;
+        }
+        let mut slots = self.migrating.borrow_mut();
+        slots.retain(|&s| keep(s));
+        self.migrating_any.set(!slots.is_empty());
+    }
 }
 
 // pending protocol flips; `armed` keeps the hot path off the RefCell
@@ -280,7 +309,6 @@ struct Session {
     proto: Cell<u8>,
     authed: Cell<bool>,
     name: RefCell<String>,
-    next_seq: Cell<u64>,
     rng: Cell<u64>,
     multi: RefCell<Option<MultiState>>,
     pubsub: RefCell<Option<PubsubHandle>>,
@@ -291,7 +319,6 @@ struct Session {
     has_relay: Cell<bool>,
     conns: RefCell<ConnCache>,
     topo_cache: RefCell<Arc<Topology>>,
-    fanouts: Rc<RefCell<FanoutGates>>,
 }
 
 impl Session {
@@ -432,9 +459,21 @@ impl Session {
                 }
             }
             Kind::Subscribe => self.enter_pubsub(spec, frame, argc),
-            Kind::Scan => self.run_scan(frame, argc),
-            Kind::Dbsize => Box::pin(self.run_broadcast(frame, Merge::Sum)).await,
-            Kind::Flushall => Box::pin(self.run_broadcast(frame, Merge::Ok)).await,
+            Kind::Scan => {
+                if Box::pin(self.gates_clear()).await {
+                    self.run_scan(frame, argc);
+                }
+            }
+            Kind::Dbsize => {
+                if Box::pin(self.gates_clear()).await {
+                    Box::pin(self.run_broadcast(frame, Merge::Sum)).await;
+                }
+            }
+            Kind::Flushall => {
+                if Box::pin(self.gates_clear()).await {
+                    Box::pin(self.run_broadcast(frame, Merge::Ok)).await;
+                }
+            }
         }
     }
 
@@ -444,8 +483,13 @@ impl Session {
         if topo_epoch() == cached.epoch {
             return cached;
         }
+        let old = Arc::clone(&cached);
         drop(cached);
-        *self.topo_cache.borrow_mut() = self.shared.topo.load_full();
+        let fresh = self.shared.topo.load_full();
+        // a migration mark outlives refreshes until the slot's owner changes
+        self.link
+            .retain_migrating(|slot| old.owner_addr(slot) == fresh.owner_addr(slot));
+        *self.topo_cache.borrow_mut() = fresh;
         self.topo_cache.borrow()
     }
 
@@ -599,6 +643,7 @@ impl Session {
             frame: frame.clone(),
             expect,
             retried: false,
+            degraded: false,
             fill_key: fill,
         });
     }
@@ -689,7 +734,7 @@ impl Session {
     }
 
     fn fanouts_pending(&self) -> bool {
-        !self.fanouts.borrow().is_empty()
+        !self.link.fanouts.borrow().is_empty()
     }
 
     // false once the session closed: the caller drops the command instead of sending it
@@ -699,7 +744,7 @@ impl Session {
                 if self.link.closed.get() {
                     return false;
                 }
-                let Some(gate) = self.fanouts.borrow().get(slot).cloned() else {
+                let Some(gate) = self.link.fanouts.borrow().get(slot).cloned() else {
                     break;
                 };
                 if !self.notified_or_closed(&gate).await {
@@ -708,6 +753,20 @@ impl Session {
             }
         }
         true
+    }
+
+    // cluster-wide commands wait until no fan-out gate is pending on any slot
+    async fn gates_clear(&self) -> bool {
+        loop {
+            let slots: Vec<u16> = self.link.fanouts.borrow().keys().copied().collect();
+            if slots.is_empty() {
+                return true;
+            }
+            if !self.wait_fanouts(&slots).await {
+                self.closing.set(true);
+                return false;
+            }
+        }
     }
 
     async fn notified_or_closed(&self, n: &Notify) -> bool {
@@ -794,7 +853,10 @@ impl Session {
                 cur += 1;
             }
         }
-        if same_slot && let Some(&first) = slots.first() {
+        if same_slot
+            && let Some(&first) = slots.first()
+            && !self.link.is_migrating(first)
+        {
             return Planned::Single(first);
         }
         let total = keys.len();
@@ -836,11 +898,8 @@ impl Session {
         };
         Planned::Parts(FanoutPlan {
             seq,
-            merge: match spec.kind {
-                Kind::Mget => Merge::Mget,
-                Kind::Mset => Merge::Ok,
-                _ => Merge::Sum,
-            },
+            merge: merge_for(spec.kind).unwrap_or(Merge::Sum),
+            degradable: degradable(spec),
             parts,
             pipes,
             total,
@@ -875,6 +934,7 @@ impl Session {
         let FanoutPlan {
             seq,
             merge,
+            degradable,
             parts,
             pipes: _,
             total,
@@ -883,12 +943,12 @@ impl Session {
         } = plan;
         let gate = Rc::new(Notify::new());
         {
-            let mut gates = self.fanouts.borrow_mut();
+            let mut gates = self.link.fanouts.borrow_mut();
             for &slot in &slots {
                 gates.insert(slot, gate.clone());
             }
         }
-        let gates = self.fanouts.clone();
+        let link = self.link.clone();
         let shared = self.shared.clone();
         let reply_q = self.reply_q.clone();
         let id = self.id;
@@ -896,32 +956,58 @@ impl Session {
         tokio::task::spawn_local(async move {
             let _marks = marks;
             let mut results: Vec<(Vec<usize>, Bytes)> = Vec::with_capacity(parts.len());
-            let mut retries: Vec<(Vec<usize>, oneshot::Receiver<Bytes>)> = Vec::new();
-            for (mut part, rx) in parts.into_iter().zip(receivers) {
+            let mut retries: Vec<(multikey::Part, oneshot::Receiver<Bytes>)> = Vec::new();
+            let mut singles = Singles::new(merge);
+            for (part, rx) in parts.into_iter().zip(receivers) {
                 let reply = recv_or_lost(rx).await;
+                if reply.first() != Some(&b'-') {
+                    results.push((part.positions, reply));
+                    continue;
+                }
                 // a redirected part executed nothing: one resend is idempotent
                 match parse_redirect(&reply) {
                     Some((ask, target)) => {
+                        stats::bump(&shared.wstats.redirects);
                         let _ = shared.refresh.send(());
                         let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
-                        let frame = std::mem::take(&mut part.frame);
+                        let frame = part.frame.clone();
                         let rx = scatter_one(&shared, &target, id, false, head, frame).await;
-                        retries.push((part.positions, rx));
+                        retries.push((part, rx));
+                    }
+                    None if degradable && reply.starts_with(b"-TRYAGAIN") => {
+                        // boxed: the resend's state must not widen every fan-out's future
+                        Box::pin(resend_singles(
+                            &shared,
+                            id,
+                            &part.frame,
+                            part.positions.len(),
+                            part.positions.iter().copied(),
+                            &mut singles,
+                        ))
+                        .await;
                     }
                     None => results.push((part.positions, reply)),
                 }
             }
-            release_gates(&gates, &slots);
-            gate.notify_waiters();
-            for (positions, rx) in retries {
-                results.push((positions, recv_or_lost(rx).await));
+            for (part, rx) in retries {
+                let reply = recv_or_lost(rx).await;
+                if degradable && reply.starts_with(b"-TRYAGAIN") {
+                    Box::pin(resend_singles(
+                        &shared,
+                        id,
+                        &part.frame,
+                        part.positions.len(),
+                        part.positions.iter().copied(),
+                        &mut singles,
+                    ))
+                    .await;
+                } else {
+                    results.push((part.positions, reply));
+                }
             }
-            let merged = match merge {
-                Merge::Mget => multikey::merge_mget(total, &results),
-                Merge::Ok => multikey::merge_ok(results.iter().map(|(_, r)| r)),
-                Merge::Sum => multikey::merge_sum(results.iter().map(|(_, r)| r)),
-            };
-            let _ = reply_q.send(Reply::At(seq, merged.unwrap_or_else(|e| e)));
+            release_gates(&link.fanouts, &slots);
+            gate.notify_waiters();
+            let _ = reply_q.send(Reply::At(seq, singles.merge(total, &results)));
         });
     }
 
@@ -994,7 +1080,7 @@ impl Session {
                 replies.push(recv_or_lost(rx).await);
             }
             let merged = match merge {
-                Merge::Sum => multikey::merge_sum(replies.iter()),
+                Merge::Sum => multikey::merge_sum(replies.iter(), 0),
                 Merge::Ok | Merge::Mget => multikey::merge_ok(replies.iter()),
             };
             let _ = reply_q.send(Reply::At(seq, merged.unwrap_or_else(|e| e)));
@@ -1262,7 +1348,9 @@ impl Session {
             return;
         }
         self.proto.set(proto);
-        self.link.proto_switches.push(self.next_seq.get(), proto);
+        self.link
+            .proto_switches
+            .push(self.link.next_seq.get(), proto);
         let mut out = Vec::new();
         if proto >= 3 {
             out.extend_from_slice(b"%7\r\n");
@@ -1476,7 +1564,7 @@ impl Session {
         *self.multi.borrow_mut() = None;
         self.store_name("");
         self.proto.set(2);
-        self.link.proto_switches.push(self.next_seq.get(), 2);
+        self.link.proto_switches.push(self.link.next_seq.get(), 2);
         self.authed.set(self.shared.cfg.requirepass.is_empty());
     }
 
@@ -1487,7 +1575,10 @@ impl Session {
     }
 
     fn outstanding(&self) -> u64 {
-        self.next_seq.get().saturating_sub(self.link.emitted.get())
+        self.link
+            .next_seq
+            .get()
+            .saturating_sub(self.link.emitted.get())
     }
 
     fn window_full(&self) -> bool {
@@ -1495,8 +1586,8 @@ impl Session {
     }
 
     fn alloc_seq(&self) -> u64 {
-        let seq = self.next_seq.get();
-        self.next_seq.set(seq + 1);
+        let seq = self.link.next_seq.get();
+        self.link.next_seq.set(seq + 1);
         seq
     }
 
@@ -1570,6 +1661,7 @@ enum Planned {
 struct FanoutPlan {
     seq: u64,
     merge: Merge,
+    degradable: bool,
     parts: Vec<multikey::Part>,
     pipes: Vec<Pipe>,
     total: usize,
@@ -1721,10 +1813,60 @@ impl PubsubSim {
     }
 }
 
+#[derive(Clone, Copy)]
 enum Merge {
     Mget,
     Sum,
     Ok,
+}
+
+// a whole multi-key request re-issued key by key from the writer loop
+#[derive(Clone, Copy)]
+struct DegradePlan {
+    spec: &'static Spec,
+    argc: usize,
+    merge: Merge,
+    nkeys: usize,
+    slot: u16,
+}
+
+// what a key-by-key resend accumulates: MGET keeps every item, the rest fold on arrival
+enum Singles {
+    Mget(Vec<(usize, Bytes)>),
+    Sum(Result<i64, Bytes>),
+    Ok(Result<(), Bytes>),
+}
+
+impl Singles {
+    fn new(merge: Merge) -> Singles {
+        match merge {
+            Merge::Mget => Singles::Mget(Vec::new()),
+            Merge::Sum => Singles::Sum(Ok(0)),
+            Merge::Ok => Singles::Ok(Ok(())),
+        }
+    }
+
+    fn push(&mut self, pos: usize, reply: Bytes) {
+        match self {
+            Singles::Mget(items) => items.push((pos, reply)),
+            Singles::Sum(Ok(total)) => match multikey::parse_int(&reply) {
+                Some(n) => *total += n,
+                None => *self = Singles::Sum(Err(reply)),
+            },
+            Singles::Ok(Ok(())) if reply.as_ref() != resp::OK => *self = Singles::Ok(Err(reply)),
+            _ => {}
+        }
+    }
+
+    fn merge(self, total: usize, parts: &[(Vec<usize>, Bytes)]) -> Bytes {
+        let replies = || parts.iter().map(|(_, r)| r);
+        let merged = match self {
+            Singles::Mget(items) => multikey::merge_mget(total, parts, &items),
+            Singles::Sum(acc) => acc.and_then(|base| multikey::merge_sum(replies(), base)),
+            Singles::Ok(acc) => acc.and_then(|()| multikey::merge_ok(replies())),
+        };
+        merged.unwrap_or_else(|e| e)
+    }
 }
 
 // CLIENT LIST membership for the session's lifetime
@@ -1851,7 +1993,6 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: SocketAddr, id: 
         proto: Cell::new(2),
         authed: Cell::new(shared.cfg.requirepass.is_empty()),
         name: RefCell::new(String::new()),
-        next_seq: Cell::new(0),
         rng: Cell::new(id | 1),
         multi: RefCell::new(None),
         pubsub: RefCell::new(None),
@@ -1864,7 +2005,6 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: SocketAddr, id: 
             by_node: Vec::new(),
         }),
         topo_cache: RefCell::new(shared.topo.load_full()),
-        fanouts: Rc::new(RefCell::new(FanoutGates::default())),
     };
 
     let (close_tx, close_rx) = oneshot::channel::<u64>();
@@ -1965,7 +2105,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: SocketAddr, id: 
         task.abort();
         let _ = reply_q.send(Reply::At(seq, Bytes::from_static(ERR_BACKEND_LOST)));
     }
-    let final_seq = session.next_seq.get();
+    let final_seq = session.link.next_seq.get();
     drop(session);
     drop(reply_q);
     let _ = close_tx.send(final_seq);
@@ -2144,6 +2284,85 @@ async fn scatter_one(
 async fn recv_or_lost(rx: oneshot::Receiver<Bytes>) -> Bytes {
     rx.await
         .unwrap_or_else(|_| Bytes::from_static(ERR_BACKEND_LOST))
+}
+
+// a migrating slot answers a multi-key request with TRYAGAIN; one key at a time follows ASK
+async fn resend_singles(
+    shared: &Rc<Shared>,
+    id: u64,
+    frame: &[u8],
+    count: usize,
+    positions: impl Iterator<Item = usize>,
+    out: &mut Singles,
+) {
+    let topo = shared.topo.load_full();
+    let mut singles = multikey::singles(frame, count, positions);
+    let mut pending = Vec::with_capacity(count.min(BATCH));
+    let mut followed = Vec::new();
+    let mut refreshed = false;
+    loop {
+        let mut more = false;
+        for (pos, slot, frame) in singles.by_ref().take(BATCH) {
+            more = true;
+            let Some(addr) = topo.owner_addr(slot) else {
+                out.push(pos, Bytes::from_static(ERR_NO_OWNER));
+                continue;
+            };
+            let rx = scatter_one(shared, addr, id, false, None, frame.clone()).await;
+            pending.push((pos, frame, rx));
+        }
+        for (pos, frame, rx) in pending.drain(..) {
+            let reply = recv_or_lost(rx).await;
+            match parse_redirect(&reply) {
+                Some((ask, target)) => {
+                    stats::bump(&shared.wstats.redirects);
+                    if !std::mem::replace(&mut refreshed, true) {
+                        let _ = shared.refresh.send(());
+                    }
+                    let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
+                    let rx = scatter_one(shared, &target, id, false, head, frame).await;
+                    followed.push((pos, rx));
+                }
+                None => out.push(pos, reply),
+            }
+        }
+        for (pos, rx) in followed.drain(..) {
+            out.push(pos, recv_or_lost(rx).await);
+        }
+        if !more {
+            break;
+        }
+    }
+}
+
+// PFCOUNT over several keys is one union's cardinality: re-issued key by key it would sum
+fn degradable(spec: &Spec) -> bool {
+    spec.name != "pfcount"
+}
+
+fn merge_for(kind: Kind) -> Option<Merge> {
+    match kind {
+        Kind::Mget => Some(Merge::Mget),
+        Kind::Mset => Some(Merge::Ok),
+        Kind::MultiSum => Some(Merge::Sum),
+        _ => None,
+    }
+}
+
+fn multikey_plan(frame: &Bytes) -> Option<DegradePlan> {
+    let (argc, _) = resp::scan_int_line(frame, 1)?;
+    let argc = usize::try_from(argc).ok()?;
+    let mut args = resp::Args::new(frame, argc);
+    let spec = command::lookup(args.next()?)?;
+    let merge = merge_for(spec.kind).filter(|_| degradable(spec))?;
+    let slot = crc16::slot(args.nth(spec.first_key as usize - 1)?);
+    Some(DegradePlan {
+        spec,
+        argc,
+        merge,
+        nkeys: key_indices(spec, argc).len(),
+        slot,
+    })
 }
 
 // echoed names are CR/LF-stripped and capped so they cannot forge a second frame
@@ -2395,34 +2614,74 @@ async fn write_loop(
                 if seq < next_emit {
                     continue;
                 }
-                if frame.first() == Some(&b'-')
-                    && let Some((ask, target)) = parse_redirect(&frame)
-                {
-                    if let Some((req, base_expect)) = take_retry_frame(&link.inflight, seq, ask) {
-                        stats::bump(&shared.wstats.redirects);
-                        // the retry carries no CACHING opt-in: it cannot fill
-                        if link.fills_armed.get() > 0
-                            && let Some(key) = take_fill(&link, seq)
-                            && let Some(cache) = &shared.cache
+                if frame.first() == Some(&b'-') {
+                    if let Some((ask, target)) = parse_redirect(&frame) {
+                        if let Some((req, base_expect)) = take_retry_frame(&link.inflight, seq, ask)
                         {
-                            cache.abandon_fill(&key);
-                        }
-                        let _ = shared.refresh.send(());
-                        let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
-                        let expect = base_expect + u32::from(ask);
-                        let pipe = pipe_for(&shared, &target, client_id, false);
-                        match queue_on(&pipe, &reply_q, seq, head, req, expect) {
-                            Ok(Some(cold)) => cold.flush().await,
-                            Ok(None) => {}
-                            Err(()) => {
-                                let _ = reply_q
-                                    .send(Reply::At(seq, Bytes::from_static(ERR_BACKEND_LOST)));
+                            stats::bump(&shared.wstats.redirects);
+                            // the retry carries no CACHING opt-in: it cannot fill
+                            if link.fills_armed.get() > 0
+                                && let Some(key) = take_fill(&link, seq)
+                                && let Some(cache) = &shared.cache
+                            {
+                                cache.abandon_fill(&key);
                             }
+                            let _ = shared.refresh.send(());
+                            let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
+                            let expect = base_expect + u32::from(ask);
+                            let pipe = pipe_for(&shared, &target, client_id, false);
+                            match queue_on(&pipe, &reply_q, seq, head, req, expect) {
+                                Ok(Some(cold)) => cold.flush().await,
+                                Ok(None) => {}
+                                Err(()) => {
+                                    let _ = reply_q
+                                        .send(Reply::At(seq, Bytes::from_static(ERR_BACKEND_LOST)));
+                                }
+                            }
+                            continue;
                         }
-                        continue;
+                        // clients believe the proxy owns every slot: never leak redirects
+                        frame = Bytes::from_static(ERR_TRYAGAIN);
+                    } else if frame.starts_with(b"-TRYAGAIN")
+                        && let Some(req) = take_degrade_frame(&link.inflight, seq)
+                        && let Some(plan) = multikey_plan(&req)
+                    {
+                        let (merge, nkeys, slot) = (plan.merge, plan.nkeys, plan.slot);
+                        link.mark_migrating(slot);
+                        // any later command already holds a sequence: a re-run would land
+                        // out of order, so the client retries and this slot takes the
+                        // gated path from now on
+                        if seq + 1 == link.next_seq.get() {
+                            let gate = Rc::new(Notify::new());
+                            link.fanouts.borrow_mut().insert(slot, gate.clone());
+                            let (shared, reply_q, link) =
+                                (shared.clone(), reply_q.clone(), link.clone());
+                            // detached deliberately: completion is bounded by backend replies
+                            tokio::task::spawn_local(async move {
+                                let mut singles = Singles::new(merge);
+                                resend_singles(
+                                    &shared,
+                                    client_id,
+                                    &req,
+                                    nkeys,
+                                    0..nkeys,
+                                    &mut singles,
+                                )
+                                .await;
+                                // a fill raced by the late writes goes before the gate lets the
+                                // client read again
+                                if plan.spec.is_write()
+                                    && let Some(cache) = &shared.cache
+                                {
+                                    write_keys(plan.spec, &req, plan.argc, |k| cache.invalidate(k));
+                                }
+                                release_gates(&link.fanouts, &[slot]);
+                                gate.notify_waiters();
+                                let _ = reply_q.send(Reply::At(seq, singles.merge(nkeys, &[])));
+                            });
+                            continue;
+                        }
                     }
-                    // clients believe the proxy owns every slot: never leak redirects
-                    frame = Bytes::from_static(ERR_TRYAGAIN);
                 }
                 if link.fills_armed.get() > 0
                     && let Some(key) = take_fill(&link, seq)
@@ -2528,6 +2787,20 @@ fn take_retry_frame(inflight: &InflightRing, seq: u64, ask: bool) -> Option<(Byt
     Some((entry.frame.clone(), entry.expect))
 }
 
+// one key-by-key resend per request, whether or not a redirect retry preceded it
+fn take_degrade_frame(inflight: &InflightRing, seq: u64) -> Option<Bytes> {
+    let mut inf = inflight.borrow_mut();
+    let idx = inf.binary_search_by_key(&seq, |e| e.seq).ok()?;
+    let entry = &mut inf[idx];
+    if entry.degraded || entry.expect > 1 {
+        return None;
+    }
+    // a redirect merged out of the resend must not re-run the whole request
+    entry.degraded = true;
+    entry.retried = true;
+    Some(entry.frame.clone())
+}
+
 // true for publications; every other pubsub frame consumes a promised sequence
 fn is_publication(frame: &[u8]) -> bool {
     if frame.first() != Some(&b'*') {
@@ -2584,6 +2857,42 @@ mod tests {
 
     fn spec(name: &str) -> &'static Spec {
         command::lookup(name.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn singles_fold_sums_and_oks_and_keep_mget_items() {
+        let mut s = Singles::new(Merge::Sum);
+        s.push(0, Bytes::from_static(b":2\r\n"));
+        s.push(1, Bytes::from_static(b":3\r\n"));
+        assert_eq!(s.merge(2, &[]).as_ref(), b":5\r\n");
+        let mut s = Singles::new(Merge::Ok);
+        s.push(0, Bytes::from_static(b"+OK\r\n"));
+        s.push(1, Bytes::from_static(b"-ERR x\r\n"));
+        assert_eq!(s.merge(2, &[]).as_ref(), b"-ERR x\r\n");
+        let mut s = Singles::new(Merge::Mget);
+        s.push(1, Bytes::from_static(b"*1\r\n$1\r\nb\r\n"));
+        s.push(0, Bytes::from_static(b"*1\r\n$1\r\na\r\n"));
+        assert_eq!(s.merge(2, &[]).as_ref(), b"*2\r\n$1\r\na\r\n$1\r\nb\r\n");
+    }
+
+    #[test]
+    fn multikey_plan_covers_the_fanned_out_kinds() {
+        let frame = |args: &[&[u8]]| {
+            let mut f = Vec::new();
+            resp::write_command(&mut f, args);
+            Bytes::from(f)
+        };
+        let slot = crc16::slot(b"a");
+        let plan = |args: &[&[u8]]| multikey_plan(&frame(args)).map(|p| (p.merge, p.nkeys, p.slot));
+        assert!(matches!(plan(&[b"MGET", b"a", b"b"]), Some((Merge::Mget, 2, s)) if s == slot));
+        assert!(matches!(
+            plan(&[b"mset", b"a", b"1", b"b", b"2"]),
+            Some((Merge::Ok, 2, s)) if s == slot
+        ));
+        assert!(matches!(plan(&[b"DEL", b"a", b"b", b"c"]), Some((Merge::Sum, 3, s)) if s == slot));
+        assert!(multikey_plan(&frame(&[b"GET", b"a"])).is_none());
+        assert!(multikey_plan(&frame(&[b"PFCOUNT", b"a", b"b"])).is_none());
+        assert!(multikey_plan(&frame(&[b"SINTER", b"a", b"b"])).is_none());
     }
 
     #[test]

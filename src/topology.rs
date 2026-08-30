@@ -103,6 +103,11 @@ impl Topology {
             idx => Some(idx),
         }
     }
+
+    pub fn owner_addr(&self, slot: u16) -> Option<&str> {
+        self.owner(slot)
+            .map(|i| self.nodes[i as usize].addr.as_str())
+    }
 }
 
 fn parse_slot_range(field: &str) -> Option<(u16, u16)> {

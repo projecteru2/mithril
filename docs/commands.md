@@ -20,6 +20,16 @@ would. EVAL routes by its first key (or any master when it has none).
 MGET, MSET, DEL, UNLINK, EXISTS, TOUCH and PFCOUNT split per slot, execute
 in parallel, and merge: MGET order-preserving, MSET all-OK, the rest summed.
 A redirected part is retried once against its new owner before merging.
+A part answered `TRYAGAIN` (its keys split across a migrating slot) is
+re-issued key by key so each request follows `ASK`; a single-slot multi-key
+command degrades the same way when nothing is queued behind it, otherwise
+the `TRYAGAIN` reaches the client and the session routes that slot's
+multi-key commands through the ordered fan-out path until the topology
+changes. During a migration a same-slot MSET or DEL therefore executes as
+independent single-key commands rather than one atomic command. PFCOUNT is
+the exception: over several keys it counts one union, so it is not
+re-issued key by key and the `TRYAGAIN` reaches the client. Cluster-wide
+commands (DBSIZE, FLUSHALL, SCAN) wait for every pending fan-out first.
 Keys that all hash to one slot (hash tags) skip the split: the command
 routes as a single request with no merge step.
 
