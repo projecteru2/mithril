@@ -41,8 +41,7 @@ const INVAL_KEYS_MAX: i64 = 1024;
 const INVAL_BYTES_MAX: usize = 64 * 1024;
 // a push that cannot complete within this many buffered bytes restarts the tracker
 const TRACKER_FRAME_MAX: usize = 1024 * 1024;
-// shared coverage packs the armed flag above the flush generation so one
-// load yields a consistent snapshot
+// the armed flag rides above the flush generation: one load is a consistent snapshot
 const ARMED_BIT: u64 = 1 << 63;
 
 /// Per-node `CLIENT TRACKING` frames, shared with the dialers on this worker.
@@ -99,9 +98,7 @@ enum Scope {
     Shared(Arc<Coverage>),
 }
 
-/// Process-wide tracking coverage; owner workers report, everyone reads.
-/// Every flush bumps the generation; a worker whose cache lags a generation
-/// clears itself on its next touch, so no flush waits on a channel.
+/// Process-wide tracking coverage; a flush bumps the generation every worker syncs to.
 pub struct Coverage {
     sets: Mutex<Sets>,
     state: AtomicU64,
@@ -198,8 +195,7 @@ impl ReplyCache {
         Some(frame)
     }
 
-    /// Arms a fill for `key`; false while coverage is incomplete or the key
-    /// already has a ticket or a write in flight.
+    /// Arms a fill for `key`; false when uncovered or the key is already in flight.
     pub fn begin_fill(&self, key: &Bytes) -> bool {
         if !self.sync() {
             return false;
@@ -227,8 +223,7 @@ impl ReplyCache {
         {
             return;
         }
-        // both copies unpin the socket buffers the slices point into: a small
-        // entry must not hold a whole read chunk for its cache lifetime
+        // both copies unpin the socket read chunks the slices point into
         self.insert_hot(
             Box::from(&key[..]),
             Entry {
@@ -254,8 +249,7 @@ impl ReplyCache {
         }
     }
 
-    /// Invalidates `key` and blocks fills until [`ReplyCache::end_write`]:
-    /// a detached write may still be retrying while later reads complete.
+    /// Invalidates `key` and blocks fills until [`ReplyCache::end_write`].
     pub fn begin_write(&self, key: &Bytes) {
         self.invalidate(key);
         let mut fills = self.fills.borrow_mut();
@@ -396,9 +390,7 @@ impl ReplyCache {
         }
     }
 
-    // a gone tracker means missed invalidations: nothing cached survives, and
-    // a new connection must not redirect to the dead client id; a departed
-    // master leaves the remaining coverage intact
+    // missed invalidations: nothing cached survives, and no dial may redirect at the dead id
     fn tracker_down(&self, addr: &str) {
         self.frames.borrow_mut().remove(addr);
         let armed = match &self.scope {
@@ -482,8 +474,7 @@ impl Wiring {
         }
     }
 
-    // a worker too slow to take its invalidations loses its whole cache instead;
-    // keys crossing workers are compacted so they never pin the read buffer
+    // compacted so the batch never pins the read buffer; a worker that cannot take it flushes
     fn invalidate(&self, keys: &[Bytes]) {
         match &self.fabric {
             Some(f) => {
@@ -609,8 +600,7 @@ async fn track_once(addr: &str, w: &Rc<Wiring>) -> Result<(), String> {
         ],
     );
     let frame = Bytes::from(frame);
-    // every connection, live or dialed meanwhile, redirects before fills arm;
-    // the guard forgets the frame if this task ends anywhere past here
+    // frame first, so a dial racing the rearm redirects too; the guard forgets it on any exit
     w.cache.install_frame(addr, frame.clone());
     let _up = UpGuard {
         w: w.clone(),

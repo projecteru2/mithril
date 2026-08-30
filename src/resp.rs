@@ -146,7 +146,6 @@ pub fn write_command(out: &mut Vec<u8>, args: &[&[u8]]) {
     }
 }
 
-/// Appends a RESP array header.
 pub const OK: &[u8] = b"+OK\r\n";
 pub const PONG: &[u8] = b"+PONG\r\n";
 
@@ -166,6 +165,7 @@ pub fn integer(out: &mut Vec<u8>, n: i64) {
     out.extend_from_slice(b"\r\n");
 }
 
+/// Appends a RESP array header.
 pub(crate) fn array_header(out: &mut Vec<u8>, n: usize) {
     out.push(b'*');
     push_usize(out, n);

@@ -116,9 +116,7 @@ impl Backends {
         })
     }
 
-    /// Redirects every live shared connection to `addr` at a new tracker;
-    /// a connection that dies meanwhile is replaced by one that dials with
-    /// the frame, any other refusal fails the tracker.
+    /// Redirects every live shared connection to `addr` at a new tracker; a refusal fails it.
     pub async fn rearm(&self, addr: &str, frame: &Bytes) -> Result<(), String> {
         let conns: Vec<Rc<Conn>> = match self.pools.borrow().get(addr) {
             Some([Some(pool), _]) => pool.shared.borrow().clone(),
@@ -322,8 +320,7 @@ pub(crate) fn pair_replies<S>(
                     }
                     _ => {
                         if let Some(d) = pending.pop_front() {
-                            // a failed head (ASKING, CACHING, a queued MULTI
-                            // command) is the reply: its request never ran as sent
+                            // a failed head frame is the reply: the request never ran as sent
                             deliver(d.sink, front_err.take().unwrap_or(frame));
                         }
                     }

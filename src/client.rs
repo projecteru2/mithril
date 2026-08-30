@@ -61,8 +61,7 @@ pub enum Reply {
     Close,
 }
 
-/// The session's reply queue: worker-local sessions use plain RefCell ops;
-/// sharded sessions share a mutex so owner workers deliver replies directly.
+/// The session's reply queue: a RefCell locally, a mutex when owner workers deliver.
 pub struct ReplyQueue {
     inner: QueueInner,
 }
@@ -543,7 +542,6 @@ impl Session {
         out
     }
 
-    // resolves a slot's master route, emitting ERR_NO_OWNER at seq if unowned
     fn owner_pipe(&self, seq: u64, slot: Option<u16>) -> Option<Pipe> {
         let topo = self.topo();
         let Some(idx) = slot.and_then(|sl| topo.owner(sl)) else {
@@ -720,8 +718,7 @@ impl Session {
         !self.fanouts.borrow().is_empty()
     }
 
-    // cold: only sessions with a fan-out in flight get here; false once the
-    // session is closed, so the caller drops the command instead of sending it
+    // false once the session closed: the caller drops the command instead of sending it
     async fn wait_fanouts(&self, slots: &[u16]) -> bool {
         for slot in slots {
             loop {
@@ -854,7 +851,7 @@ impl Session {
         let shared = self.shared.clone();
         let reply_q = self.reply_q.clone();
         let id = self.id;
-        // detached deliberately: completion is bounded by backend replies.
+        // detached deliberately: completion is bounded by backend replies
         tokio::task::spawn_local(async move {
             let _marks = marks;
             let mut results: Vec<(Vec<usize>, Bytes)> = Vec::with_capacity(parts.len());
@@ -901,7 +898,7 @@ impl Session {
         let shared = self.shared.clone();
         let reply_q = self.reply_q.clone();
         let id = self.id;
-        // detached deliberately: completion is bounded by backend replies.
+        // detached deliberately: completion is bounded by backend replies
         tokio::task::spawn_local(async move {
             let topo = shared.topo.load_full();
             if master_idx >= topo.masters.len() {
@@ -949,7 +946,7 @@ impl Session {
             let addr = &topo.nodes[midx as usize].addr;
             receivers.push(scatter_one(&shared, addr, self.id, false, None, frame.clone()).await);
         }
-        // detached deliberately: completion is bounded by backend replies.
+        // detached deliberately: completion is bounded by backend replies
         tokio::task::spawn_local(async move {
             let mut replies: Vec<Bytes> = Vec::with_capacity(receivers.len());
             for rx in receivers {
@@ -1532,9 +1529,7 @@ impl ColdSend {
     }
 }
 
-// a fan-out's redirect retries are queued by a detached task: same-slot
-// commands wait for its first round so their own retries cannot overtake it.
-// a slot holds at most one pending gate: a new fan-out waits before inserting
+// same-slot commands wait for a fan-out's first round so no retry overtakes its retries
 type FanoutGates = HashMap<u16, Rc<tokio::sync::Notify>, BuildHasherDefault<multikey::SlotHasher>>;
 
 // holds a fan-out write's keys against cache fills until the operation ends
@@ -1768,8 +1763,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
             break;
         }
         ensure_read_room(&mut buf);
-        // only a relay can close the session while the read is parked; a dead
-        // writer without one implies a dead socket the read observes itself
+        // only a relay can close the session while the read is parked
         let read = if link.has_relay.get() {
             tokio::select! {
                 _ = link.closed_notify.notified() => break,
@@ -1853,8 +1847,7 @@ fn key_indices(spec: &Spec, argc: usize) -> impl Iterator<Item = usize> {
     (first..end).step_by((spec.step as usize).max(1))
 }
 
-// the caller checked has_room: a full queue here drops the oneshot, and the
-// receiver reads that as LOST rather than hanging
+// the caller checked has_room; a full queue drops the oneshot, which reads as LOST
 fn try_scatter(pipe: &Pipe, frame: Bytes) -> oneshot::Receiver<Bytes> {
     let (tx, rx) = oneshot::channel();
     match pipe {
@@ -2127,8 +2120,7 @@ fn backfill_acks(link: &Rc<WriterLink>, reply_q: &Rc<ReplyQueue>) {
     link.acks_drained.notify_one();
 }
 
-// out-of-order replies indexed by sequence distance; O(1) park and drain
-// (the back slot is always Some, so emptiness needs no live counter)
+// out-of-order replies by sequence distance; the back slot is always Some
 #[derive(Default)]
 struct ParkedRing {
     base: u64,
@@ -2242,8 +2234,7 @@ async fn write_loop(
                 }
             }
         }
-        // pass 1 processes the woken batch; one yield lets already-delivered
-        // replies join the same flush
+        // one yield lets already-delivered replies join the same flush
         for pass in 0..2 {
             for reply in batch.drain(..) {
                 let (seq, mut frame) = match reply {

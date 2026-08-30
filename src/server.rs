@@ -449,8 +449,7 @@ fn refresher_thread(
             };
             match fetch_topology(&cfg, seeds.iter().map(String::as_str)).await {
                 Ok(mut new_topo) => {
-                    // the pointer lands before the epoch: a reader that sees the
-                    // new epoch always reloads at least this topology
+                    // the pointer lands before the epoch: a reader of the epoch sees this topology
                     let epoch = topo_epoch() + 1;
                     new_topo.epoch = epoch;
                     topo.store(Arc::new(new_topo));

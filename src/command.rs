@@ -25,9 +25,9 @@ const S: u8 = FLAG_STORE;
 const N: u8 = FLAG_NO_AUTH;
 const T: u8 = FLAG_TXN_CTRL;
 
-// sorted for browsing; a test enforces lookup-key order and uniqueness
 static LUT: [u16; LUT_LEN] = build_lut();
 
+// sorted for browsing; a test enforces lookup-key order and uniqueness
 static TABLE: &[Spec] = &[
     c("acl", -2, 0, 0, 0, 0, Kind::Local),
     c("append", 3, W, 1, 1, 1, Kind::Single),

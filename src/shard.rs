@@ -93,8 +93,7 @@ impl Fabric {
         fnv(addr.as_bytes()) as usize % self.controls.len()
     }
 
-    /// Redirects the node's live pipe at a new tracker; a pipe dialed later
-    /// learns it from the handshake.
+    /// Redirects the node's live pipe at a new tracker; later dials learn it at handshake.
     pub async fn rearm(&self, addr: &str, frame: Bytes) -> Result<(), String> {
         let tx = self
             .conns
@@ -143,8 +142,7 @@ impl Fabric {
     }
 }
 
-/// Worker control loop: runs the pipes the fabric assigns here and applies
-/// the invalidations trackers broadcast.
+/// Worker control loop: runs the pipes assigned here, applies broadcast invalidations.
 pub async fn control_loop(
     mut ctl: mpsc::UnboundedReceiver<NewConn>,
     mut invals: mpsc::Receiver<Invalidations>,
