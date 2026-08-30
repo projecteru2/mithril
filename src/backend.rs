@@ -22,11 +22,10 @@ pub const OUTBOUND_QUEUE: usize = 8192;
 pub const READ_CHUNK: usize = 64 * 1024;
 pub const READ_INIT: usize = 8 * 1024;
 pub const BATCH: usize = 256;
-const IOV_STACK: usize = 16;
-const MAX_EXCLUSIVE_PER_NODE: usize = 512;
-
 pub const ASKING_FRAME: &[u8] = b"*1\r\n$6\r\nASKING\r\n";
 pub const ERR_BACKEND_LOST: &[u8] = b"-ERR mithril: backend connection lost\r\n";
+const IOV_STACK: usize = 16;
+const MAX_EXCLUSIVE_PER_NODE: usize = 512;
 
 /// Where a backend reply is delivered.
 pub enum Sink {
@@ -259,6 +258,11 @@ impl Drop for ExclusiveLease {
     }
 }
 
+pub(crate) struct Pending<S> {
+    pub(crate) expect: u32,
+    pub(crate) sink: S,
+}
+
 type PoolPair = [Option<Rc<Pool>>; 2];
 
 struct Pool {
@@ -272,11 +276,6 @@ impl Pool {
         self.exclusive_count
             .set(self.exclusive_count.get().saturating_sub(1));
     }
-}
-
-pub(crate) struct Pending<S> {
-    pub(crate) expect: u32,
-    pub(crate) sink: S,
 }
 
 /// Dials a raw authenticated backend connection for relays and the refresher.
@@ -307,21 +306,6 @@ pub async fn write_frames<W: tokio::io::AsyncWrite + Unpin>(
     }
     let mut iov: Vec<IoSlice<'_>> = frames.iter().map(|f| IoSlice::new(f)).collect();
     write_slices(w, &mut iov).await
-}
-
-async fn write_slices<W: tokio::io::AsyncWrite + Unpin>(
-    w: &mut W,
-    slices: &mut [IoSlice<'_>],
-) -> std::io::Result<()> {
-    let mut rest = &mut slices[..];
-    while !rest.is_empty() {
-        let n = w.write_vectored(rest).await?;
-        if n == 0 {
-            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
-        }
-        IoSlice::advance_slices(&mut rest, n);
-    }
-    Ok(())
 }
 
 /// Grows a read buffer geometrically to READ_CHUNK; idle sessions stay small.
@@ -361,28 +345,6 @@ pub(crate) fn pair_replies<S>(
             }
             resp::Scan::Invalid(e) => return Err(e),
             resp::Scan::Incomplete => return Ok(()),
-        }
-    }
-}
-
-async fn run_conn(
-    addr: &str,
-    mut rx: mpsc::Receiver<Outbound>,
-    role: Role,
-    tracking: Option<Bytes>,
-    cfg: &Config,
-    conn: &Conn,
-) {
-    let abort = (role == Role::Exclusive).then_some(&conn.abort);
-    let halves = tokio::select! {
-        _ = abort_signal(abort) => Err("aborted".to_string()),
-        r = open(addr, role == Role::Replica, cfg, tracking.as_deref()) => r,
-    };
-    match halves {
-        Ok(halves) => pump(addr, &mut rx, halves, abort, deliver).await,
-        Err(e) => {
-            log_debug!("connect {addr}: {e}");
-            drain_channel(&mut rx, deliver);
         }
     }
 }
@@ -454,24 +416,6 @@ pub(crate) async fn pump<S, D: Fn(S, Bytes) + Copy>(
         deliver(p.sink, Bytes::from_static(ERR_BACKEND_LOST));
     }
     drain_channel(rx, deliver);
-}
-
-async fn abort_signal(abort: Option<&tokio::sync::Notify>) {
-    match abort {
-        Some(n) => n.notified().await,
-        None => std::future::pending().await,
-    }
-}
-
-fn deliver(sink: Sink, frame: Bytes) {
-    match sink {
-        Sink::Client(tx, seq) => {
-            let _ = tx.send(Reply::At(seq, frame));
-        }
-        Sink::One(tx) => {
-            let _ = tx.send(frame);
-        }
-    }
 }
 
 /// Fails every request still queued on a connection that is gone.
@@ -577,6 +521,61 @@ pub(crate) async fn read_reply<R: AsyncRead + Unpin>(
         let n = reader.read_buf(buf).await.map_err(|e| e.to_string())?;
         if n == 0 {
             return Err("closed before reply".to_string());
+        }
+    }
+}
+
+async fn write_slices<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    slices: &mut [IoSlice<'_>],
+) -> std::io::Result<()> {
+    let mut rest = &mut slices[..];
+    while !rest.is_empty() {
+        let n = w.write_vectored(rest).await?;
+        if n == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+        }
+        IoSlice::advance_slices(&mut rest, n);
+    }
+    Ok(())
+}
+
+async fn run_conn(
+    addr: &str,
+    mut rx: mpsc::Receiver<Outbound>,
+    role: Role,
+    tracking: Option<Bytes>,
+    cfg: &Config,
+    conn: &Conn,
+) {
+    let abort = (role == Role::Exclusive).then_some(&conn.abort);
+    let halves = tokio::select! {
+        _ = abort_signal(abort) => Err("aborted".to_string()),
+        r = open(addr, role == Role::Replica, cfg, tracking.as_deref()) => r,
+    };
+    match halves {
+        Ok(halves) => pump(addr, &mut rx, halves, abort, deliver).await,
+        Err(e) => {
+            log_debug!("connect {addr}: {e}");
+            drain_channel(&mut rx, deliver);
+        }
+    }
+}
+
+async fn abort_signal(abort: Option<&tokio::sync::Notify>) {
+    match abort {
+        Some(n) => n.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn deliver(sink: Sink, frame: Bytes) {
+    match sink {
+        Sink::Client(tx, seq) => {
+            let _ = tx.send(Reply::At(seq, frame));
+        }
+        Sink::One(tx) => {
+            let _ = tx.send(frame);
         }
     }
 }

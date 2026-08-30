@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::backend::{OUTBOUND_QUEUE, Outbound, check_rearm, drain_channel, open, pump};
 use crate::cache::{ReplyCache, TrackingFrames};
+use crate::client::{Reply, SharedQueue};
 use crate::config::Config;
 use crate::log_debug;
 
@@ -19,10 +20,7 @@ pub type RemoteOutbound = Outbound<RemoteSink>;
 /// Where a sharded reply is delivered.
 pub enum RemoteSink {
     /// Ordered client reply pushed straight into the session's shared queue.
-    Session {
-        queue: std::sync::Arc<crate::client::SharedQueue>,
-        seq: u64,
-    },
+    Session { queue: Arc<SharedQueue>, seq: u64 },
     /// Single reply for mergers and broadcasts.
     One(oneshot::Sender<Bytes>),
 }
@@ -169,6 +167,15 @@ pub async fn control_loop(
     }
 }
 
+pub(crate) fn fnv(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 async fn run_shard_conn(
     addr: &str,
     readonly: bool,
@@ -188,21 +195,12 @@ async fn run_shard_conn(
 fn deliver(sink: RemoteSink, frame: Bytes) {
     match sink {
         RemoteSink::Session { queue, seq } => {
-            let _ = queue.send(crate::client::Reply::At(seq, frame));
+            let _ = queue.send(Reply::At(seq, frame));
         }
         RemoteSink::One(tx) => {
             let _ = tx.send(frame);
         }
     }
-}
-
-pub(crate) fn fnv(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in data {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
 }
 
 #[cfg(test)]

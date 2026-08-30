@@ -1,15 +1,16 @@
 //! RESP frame scanning: byte-range boundaries, nothing materialized.
 
+pub const DEC_BUF: usize = 20;
+pub const OK: &[u8] = b"+OK\r\n";
+pub const PONG: &[u8] = b"+PONG\r\n";
+pub const NIL_BULK: &[u8] = b"$-1\r\n";
+pub const NIL_ARRAY: &[u8] = b"*-1\r\n";
+pub const NIL_RESP3: &[u8] = b"_\r\n";
 const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
 const MAX_INLINE_LEN: usize = 64 * 1024;
 const MAX_DEPTH: usize = 32;
 const MAX_ARGC: usize = 1024 * 1024;
 const MAX_INT_DIGITS: usize = 18;
-pub const DEC_BUF: usize = 20;
-
-pub const NIL_BULK: &[u8] = b"$-1\r\n";
-pub const NIL_ARRAY: &[u8] = b"*-1\r\n";
-pub const NIL_RESP3: &[u8] = b"_\r\n";
 
 /// Outcome of scanning one RESP value.
 #[derive(Debug, PartialEq, Eq)]
@@ -68,10 +69,6 @@ impl<'a> Args<'a> {
 impl<'a> Iterator for Args<'a> {
     type Item = &'a [u8];
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
-    }
-
     fn next(&mut self) -> Option<&'a [u8]> {
         if self.remaining == 0 {
             return None;
@@ -84,6 +81,10 @@ impl<'a> Iterator for Args<'a> {
             }
             Err(_) => None,
         }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
     }
 }
 
@@ -201,9 +202,6 @@ pub fn write_command(out: &mut Vec<u8>, args: &[&[u8]]) {
         bulk(out, a);
     }
 }
-
-pub const OK: &[u8] = b"+OK\r\n";
-pub const PONG: &[u8] = b"+PONG\r\n";
 
 /// Appends one bulk string frame.
 pub fn bulk(out: &mut Vec<u8>, payload: &[u8]) {

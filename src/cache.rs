@@ -51,98 +51,6 @@ const ARMED_BIT: u64 = 1 << 63;
 /// Per-node `CLIENT TRACKING` frames, shared with the dialers on this worker.
 pub type TrackingFrames = Rc<RefCell<HashMap<Box<str>, Bytes>>>;
 
-type Map = HashMap<Box<[u8]>, Entry, BuildHasherDefault<KeyHasher>>;
-type Fills = HashMap<Bytes, Fill, BuildHasherDefault<KeyHasher>>;
-
-/// Word-at-a-time multiply-fold; the length binds in the tail, not a prefix.
-#[derive(Default)]
-struct KeyHasher(u64);
-
-impl Hasher for KeyHasher {
-    // hashbrown indexes buckets by the low bits: fold the mixed high half down
-    fn finish(&self) -> u64 {
-        let h = (self.0 ^ (self.0 >> 32)).wrapping_mul(MIX);
-        h ^ (h >> 29)
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        let mut h = self.0;
-        let (words, rest) = bytes.as_chunks::<8>();
-        for w in words {
-            h = (h ^ u64::from_le_bytes(*w)).wrapping_mul(MIX);
-        }
-        let mut word = [0u8; 8];
-        word[..rest.len()].copy_from_slice(rest);
-        h = (h ^ u64::from_le_bytes(word)).wrapping_mul(MIX);
-        self.0 = (h ^ bytes.len() as u64).wrapping_mul(MIX);
-    }
-
-    fn write_usize(&mut self, _: usize) {}
-}
-
-struct Entry {
-    frame: Bytes,
-    at: u32,
-}
-
-#[derive(Default)]
-struct Gen {
-    map: RefCell<Map>,
-    bytes: Cell<usize>,
-}
-
-impl Gen {
-    fn take(&self, key: &[u8]) -> Option<(Box<[u8]>, Entry)> {
-        let mut map = self.map.borrow_mut();
-        if map.is_empty() {
-            return None;
-        }
-        let (k, e) = map.remove_entry(key)?;
-        self.bytes
-            .set(self.bytes.get() - entry_size(k.len(), e.frame.len()));
-        Some((k, e))
-    }
-
-    fn reset(&self) {
-        retire(std::mem::take(&mut *self.map.borrow_mut()));
-        self.bytes.set(0);
-    }
-}
-
-#[derive(Default)]
-struct Sets {
-    wanted: HashSet<Box<str>>,
-    ready: HashSet<Box<str>>,
-}
-
-impl Sets {
-    fn covered(&self) -> bool {
-        !self.wanted.is_empty() && self.wanted.iter().all(|a| self.ready.contains(a))
-    }
-}
-
-struct Fill {
-    ticket: bool,
-    writes: u32,
-    poisoned: bool,
-}
-
-// what an invalidation push asks for; Keys carries the payload byte total
-#[derive(Debug, PartialEq, Eq)]
-enum Push {
-    Flush,
-    Keys(usize),
-}
-
-/// Which masters are tracked: per worker, or process-wide under sharding.
-enum Scope {
-    Local {
-        sets: RefCell<Sets>,
-        armed: Cell<bool>,
-    },
-    Shared(Arc<Coverage>),
-}
-
 /// Process-wide tracking coverage; a flush bumps the generation every worker syncs to.
 pub struct Coverage {
     sets: Mutex<Sets>,
@@ -504,6 +412,99 @@ impl Wiring {
     }
 }
 
+type Map = HashMap<Box<[u8]>, Entry, BuildHasherDefault<KeyHasher>>;
+
+type Fills = HashMap<Bytes, Fill, BuildHasherDefault<KeyHasher>>;
+
+/// Word-at-a-time multiply-fold; the length binds in the tail, not a prefix.
+#[derive(Default)]
+struct KeyHasher(u64);
+
+impl Hasher for KeyHasher {
+    // hashbrown indexes buckets by the low bits: fold the mixed high half down
+    fn finish(&self) -> u64 {
+        let h = (self.0 ^ (self.0 >> 32)).wrapping_mul(MIX);
+        h ^ (h >> 29)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        let (words, rest) = bytes.as_chunks::<8>();
+        for w in words {
+            h = (h ^ u64::from_le_bytes(*w)).wrapping_mul(MIX);
+        }
+        let mut word = [0u8; 8];
+        word[..rest.len()].copy_from_slice(rest);
+        h = (h ^ u64::from_le_bytes(word)).wrapping_mul(MIX);
+        self.0 = (h ^ bytes.len() as u64).wrapping_mul(MIX);
+    }
+
+    fn write_usize(&mut self, _: usize) {}
+}
+
+struct Entry {
+    frame: Bytes,
+    at: u32,
+}
+
+#[derive(Default)]
+struct Gen {
+    map: RefCell<Map>,
+    bytes: Cell<usize>,
+}
+
+impl Gen {
+    fn take(&self, key: &[u8]) -> Option<(Box<[u8]>, Entry)> {
+        let mut map = self.map.borrow_mut();
+        if map.is_empty() {
+            return None;
+        }
+        let (k, e) = map.remove_entry(key)?;
+        self.bytes
+            .set(self.bytes.get() - entry_size(k.len(), e.frame.len()));
+        Some((k, e))
+    }
+
+    fn reset(&self) {
+        retire(std::mem::take(&mut *self.map.borrow_mut()));
+        self.bytes.set(0);
+    }
+}
+
+#[derive(Default)]
+struct Sets {
+    wanted: HashSet<Box<str>>,
+    ready: HashSet<Box<str>>,
+}
+
+impl Sets {
+    fn covered(&self) -> bool {
+        !self.wanted.is_empty() && self.wanted.iter().all(|a| self.ready.contains(a))
+    }
+}
+
+struct Fill {
+    ticket: bool,
+    writes: u32,
+    poisoned: bool,
+}
+
+// what an invalidation push asks for; Keys carries the payload byte total
+#[derive(Debug, PartialEq, Eq)]
+enum Push {
+    Flush,
+    Keys(usize),
+}
+
+/// Which masters are tracked: per worker, or process-wide under sharding.
+enum Scope {
+    Local {
+        sets: RefCell<Sets>,
+        armed: Cell<bool>,
+    },
+    Shared(Arc<Coverage>),
+}
+
 // coverage accounting survives task aborts
 struct UpGuard {
     w: Rc<Wiring>,
@@ -514,31 +515,6 @@ impl Drop for UpGuard {
     fn drop(&mut self) {
         self.w.cache.tracker_down(&self.addr);
     }
-}
-
-fn entry_size(key_len: usize, frame_len: usize) -> usize {
-    key_len + frame_len + ENTRY_OVERHEAD
-}
-
-// frees a large generation a chunk at a time so no request waits on the whole drop
-fn retire(mut map: Map) {
-    if map.len() <= DROP_CHUNK || tokio::runtime::Handle::try_current().is_err() {
-        return;
-    }
-    tokio::task::spawn_local(async move {
-        let mut drain = map.drain();
-        while drain.by_ref().take(DROP_CHUNK).count() == DROP_CHUNK {
-            tokio::task::yield_now().await;
-        }
-    });
-}
-
-fn replace_set(cur: &mut HashSet<Box<str>>, want: &HashSet<&str>) -> bool {
-    if cur.len() == want.len() && want.iter().all(|a| cur.contains(*a)) {
-        return false;
-    }
-    *cur = want.iter().map(|&a| Box::from(a)).collect();
-    true
 }
 
 /// Keeps this worker's tracking connections alive; spawned once per worker.
@@ -574,6 +550,31 @@ pub async fn run_trackers(w: Rc<Wiring>, topo: Arc<ArcSwap<Topology>>) {
         }
         tokio::time::sleep(TRACKER_POLL).await;
     }
+}
+
+fn entry_size(key_len: usize, frame_len: usize) -> usize {
+    key_len + frame_len + ENTRY_OVERHEAD
+}
+
+// frees a large generation a chunk at a time so no request waits on the whole drop
+fn retire(mut map: Map) {
+    if map.len() <= DROP_CHUNK || tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    tokio::task::spawn_local(async move {
+        let mut drain = map.drain();
+        while drain.by_ref().take(DROP_CHUNK).count() == DROP_CHUNK {
+            tokio::task::yield_now().await;
+        }
+    });
+}
+
+fn replace_set(cur: &mut HashSet<Box<str>>, want: &HashSet<&str>) -> bool {
+    if cur.len() == want.len() && want.iter().all(|a| cur.contains(*a)) {
+        return false;
+    }
+    *cur = want.iter().map(|&a| Box::from(a)).collect();
+    true
 }
 
 async fn run_tracker(addr: Box<str>, w: Rc<Wiring>) {

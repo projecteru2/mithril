@@ -4,22 +4,32 @@ use std::cell::{Cell, Ref, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::hash::BuildHasherDefault;
+use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedWriteHalf;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
-use crate::backend::{ASKING_FRAME, Backends, ERR_BACKEND_LOST, Outbound, Sink, ensure_read_room};
+use crate::backend::{
+    ASKING_FRAME, BATCH, Backends, Conn, ERR_BACKEND_LOST, Outbound, Sink, ensure_read_room,
+    write_frames,
+};
+use crate::cache::{CACHING_FRAME, ReplyCache};
 use crate::command::{self, Kind, Spec};
+use crate::config::Config;
 use crate::log_debug;
 use crate::multikey;
 use crate::resp::{self, ReqScan};
+use crate::server::topo_epoch;
+use crate::shard::{Fabric, RemoteOutbound, RemoteSink};
 use crate::stats::{self, Stats};
 use crate::topology::Topology;
 use crate::{admin, crc16, route};
@@ -28,8 +38,7 @@ const MAX_INFLIGHT: usize = 65536;
 const SUBS_LIMIT: usize = 32768;
 const PUBSUB_FORWARD_QUEUE: usize = 64;
 const PUBSUB_PUSH_WINDOW: usize = 4096;
-const GATE_PROBE: std::time::Duration = std::time::Duration::from_millis(100);
-
+const GATE_PROBE: Duration = Duration::from_millis(100);
 const ERR_NOAUTH: &[u8] = b"-NOAUTH Authentication required.\r\n";
 const ERR_CROSSSLOT: &[u8] = b"-CROSSSLOT Keys in request don't hash to the same slot\r\n";
 const ERR_NO_OWNER: &[u8] = b"-CLUSTERDOWN Hash slot not served\r\n";
@@ -37,15 +46,15 @@ const ERR_TRYAGAIN: &[u8] = b"-TRYAGAIN slot is migrating, retry later\r\n";
 
 /// Everything a session needs from its worker.
 pub struct Shared {
-    pub cfg: Rc<crate::config::Config>,
-    pub topo: std::sync::Arc<ArcSwap<Topology>>,
+    pub cfg: Rc<Config>,
+    pub topo: Arc<ArcSwap<Topology>>,
     pub backends: Rc<Backends>,
-    pub wstats: std::sync::Arc<stats::WorkerStats>,
-    pub stats: std::sync::Arc<Stats>,
+    pub wstats: Arc<stats::WorkerStats>,
+    pub stats: Arc<Stats>,
     pub refresh: mpsc::UnboundedSender<()>,
     pub started: u64,
-    pub fabric: Option<std::sync::Arc<crate::shard::Fabric>>,
-    pub cache: Option<Rc<crate::cache::ReplyCache>>,
+    pub fabric: Option<Arc<Fabric>>,
+    pub cache: Option<Rc<ReplyCache>>,
 }
 
 /// One frame travelling to the client writer.
@@ -68,24 +77,24 @@ pub struct ReplyQueue {
 impl ReplyQueue {
     fn new(shared: bool) -> Rc<ReplyQueue> {
         let inner = if shared {
-            QueueInner::Shared(std::sync::Arc::new(SharedQueue {
-                state: std::sync::Mutex::new(SharedState {
+            QueueInner::Shared(Arc::new(SharedQueue {
+                state: Mutex::new(SharedState {
                     closed: false,
                     q: VecDeque::new(),
                 }),
-                bell: tokio::sync::Notify::new(),
+                bell: Notify::new(),
             }))
         } else {
             QueueInner::Local {
                 q: RefCell::new(VecDeque::new()),
-                bell: tokio::sync::Notify::new(),
+                bell: Notify::new(),
                 closed: Cell::new(false),
             }
         };
         Rc::new(ReplyQueue { inner })
     }
 
-    fn shard_handle(&self) -> Option<std::sync::Arc<SharedQueue>> {
+    fn shard_handle(&self) -> Option<Arc<SharedQueue>> {
         match &self.inner {
             QueueInner::Local { .. } => None,
             QueueInner::Shared(sq) => Some(sq.clone()),
@@ -167,24 +176,10 @@ impl ReplyQueue {
     }
 }
 
-enum QueueInner {
-    Local {
-        q: RefCell<VecDeque<Reply>>,
-        bell: tokio::sync::Notify,
-        closed: Cell<bool>,
-    },
-    Shared(std::sync::Arc<SharedQueue>),
-}
-
-struct SharedState {
-    closed: bool,
-    q: VecDeque<Reply>,
-}
-
 /// Cross-worker reply queue for sharded sessions.
 pub struct SharedQueue {
-    state: std::sync::Mutex<SharedState>,
-    bell: tokio::sync::Notify,
+    state: Mutex<SharedState>,
+    bell: Notify,
 }
 
 impl SharedQueue {
@@ -205,6 +200,20 @@ impl SharedQueue {
     }
 }
 
+enum QueueInner {
+    Local {
+        q: RefCell<VecDeque<Reply>>,
+        bell: Notify,
+        closed: Cell<bool>,
+    },
+    Shared(Arc<SharedQueue>),
+}
+
+struct SharedState {
+    closed: bool,
+    q: VecDeque<Reply>,
+}
+
 struct InFlight {
     seq: u64,
     frame: Bytes,
@@ -223,16 +232,17 @@ struct WriterLink {
     emitted: Cell<u64>,
     // set when no reply can ever be written again; reader must stop dispatching
     closed: Cell<bool>,
-    closed_notify: tokio::sync::Notify,
+    closed_notify: Notify,
     proto_switches: ProtoSwitchQueue,
     oob_budget: Cell<usize>,
-    oob_notify: tokio::sync::Notify,
+    oob_notify: Notify,
     // pre-allocated sequences for pending pubsub confirmations, in order
     ack_seqs: RefCell<VecDeque<u64>>,
-    acks_drained: tokio::sync::Notify,
+    acks_drained: Notify,
     // in-flight fills; the reply path skips the ring search at zero
     fills_armed: Cell<usize>,
 }
+
 // pending protocol flips; `armed` keeps the hot path off the RefCell
 #[derive(Default)]
 struct ProtoSwitchQueue {
@@ -280,7 +290,7 @@ struct Session {
     // a live relay can close the session while the reader is parked reading
     has_relay: Cell<bool>,
     conns: RefCell<ConnCache>,
-    topo_cache: RefCell<std::sync::Arc<Topology>>,
+    topo_cache: RefCell<Arc<Topology>>,
     fanouts: Rc<RefCell<FanoutGates>>,
 }
 
@@ -429,9 +439,9 @@ impl Session {
     }
 
     // one relaxed epoch load replaces the arc-swap hazard load on the hot path
-    fn topo(&self) -> Ref<'_, std::sync::Arc<Topology>> {
+    fn topo(&self) -> Ref<'_, Arc<Topology>> {
         let cached = self.topo_cache.borrow();
-        if crate::server::topo_epoch() == cached.epoch {
+        if topo_epoch() == cached.epoch {
             return cached;
         }
         drop(cached);
@@ -568,9 +578,7 @@ impl Session {
         {
             cache.abandon_fill(&key);
         }
-        let head = fill
-            .is_some()
-            .then(|| Bytes::from_static(crate::cache::CACHING_FRAME));
+        let head = fill.is_some().then(|| Bytes::from_static(CACHING_FRAME));
         let expect = 1 + u32::from(head.is_some());
         self.track_inflight(seq, &frame, 1, fill);
         self.queue_at(&pipe, seq, head, frame, expect)
@@ -702,7 +710,7 @@ impl Session {
         true
     }
 
-    async fn notified_or_closed(&self, n: &tokio::sync::Notify) -> bool {
+    async fn notified_or_closed(&self, n: &Notify) -> bool {
         tokio::select! {
             _ = n.notified() => true,
             _ = self.link.closed_notify.notified() => false,
@@ -873,7 +881,7 @@ impl Session {
             marks,
             slots,
         } = plan;
-        let gate = Rc::new(tokio::sync::Notify::new());
+        let gate = Rc::new(Notify::new());
         {
             let mut gates = self.fanouts.borrow_mut();
             for &slot in &slots {
@@ -1528,8 +1536,8 @@ impl ConnCache {
 /// A route to one backend node: worker-local conn or the process-wide shard.
 #[derive(Clone)]
 enum Pipe {
-    Local(Rc<crate::backend::Conn>),
-    Shard(tokio::sync::mpsc::Sender<crate::shard::RemoteOutbound>),
+    Local(Rc<Conn>),
+    Shard(mpsc::Sender<RemoteOutbound>),
 }
 
 impl Pipe {
@@ -1571,12 +1579,8 @@ struct FanoutPlan {
 
 // the rare full-queue leftover; flushed with an awaited send
 enum ColdSend {
-    Local(Rc<crate::backend::Conn>, Outbound),
-    Shard(
-        tokio::sync::mpsc::Sender<crate::shard::RemoteOutbound>,
-        crate::shard::RemoteOutbound,
-        Rc<ReplyQueue>,
-    ),
+    Local(Rc<Conn>, Outbound),
+    Shard(mpsc::Sender<RemoteOutbound>, RemoteOutbound, Rc<ReplyQueue>),
 }
 
 impl ColdSend {
@@ -1585,7 +1589,7 @@ impl ColdSend {
             ColdSend::Local(conn, out) => conn.send_wait(out).await,
             ColdSend::Shard(tx, out, q) => {
                 if let Err(e) = Box::pin(tx.send(out)).await
-                    && let crate::shard::RemoteSink::Session { seq, .. } = e.0.sink
+                    && let RemoteSink::Session { seq, .. } = e.0.sink
                 {
                     let _ = q.send(Reply::At(seq, Bytes::from_static(ERR_BACKEND_LOST)));
                 }
@@ -1594,17 +1598,49 @@ impl ColdSend {
     }
 }
 
+// a request with a oneshot sink, built for either pipe flavor
+enum Staged {
+    Local(Rc<Conn>, Outbound),
+    Shard(mpsc::Sender<RemoteOutbound>, RemoteOutbound),
+}
+
+impl Staged {
+    // a closed queue drops the oneshot, which the receiver reads as LOST; a
+    // full one hands the request back to be awaited
+    fn try_send(self) -> Result<(), Staged> {
+        match self {
+            Staged::Local(conn, out) => match conn.try_send(out) {
+                Ok(()) => Ok(()),
+                Err(out) => Err(Staged::Local(conn, out)),
+            },
+            Staged::Shard(tx, out) => match tx.try_send(out) {
+                Err(mpsc::error::TrySendError::Full(out)) => Err(Staged::Shard(tx, out)),
+                _ => Ok(()),
+            },
+        }
+    }
+
+    async fn send(self) {
+        match self {
+            Staged::Local(conn, out) => conn.send(out).await,
+            Staged::Shard(tx, out) => {
+                let _ = tx.send(out).await;
+            }
+        }
+    }
+}
+
 // same-slot commands wait for a fan-out's first round so no retry overtakes its retries
-type FanoutGates = HashMap<u16, Rc<tokio::sync::Notify>, BuildHasherDefault<multikey::SlotHasher>>;
+type FanoutGates = HashMap<u16, Rc<Notify>, BuildHasherDefault<multikey::SlotHasher>>;
 
 // holds a fan-out write's keys against cache fills until the operation ends
 struct WriteMarks {
-    cache: Rc<crate::cache::ReplyCache>,
+    cache: Rc<ReplyCache>,
     keys: Vec<Bytes>,
 }
 
 impl WriteMarks {
-    fn new(cache: &Rc<crate::cache::ReplyCache>, keys: Vec<Bytes>) -> WriteMarks {
+    fn new(cache: &Rc<ReplyCache>, keys: Vec<Bytes>) -> WriteMarks {
         for k in &keys {
             cache.begin_write(k);
         }
@@ -1698,14 +1734,14 @@ struct Listed<'a> {
 }
 
 impl<'a> Listed<'a> {
-    fn new(stats: &'a Stats, id: u64, addr: std::net::SocketAddr, fd: i32) -> Listed<'a> {
+    fn new(stats: &'a Stats, id: u64, addr: SocketAddr, fd: i32) -> Listed<'a> {
         stats.registry().insert(
             id,
             stats::ClientInfo {
                 addr,
                 fd,
                 name: Box::from(""),
-                since: std::time::Instant::now(),
+                since: Instant::now(),
             },
         );
         Listed { stats, id }
@@ -1767,7 +1803,38 @@ impl ParkedRing {
 }
 
 /// Serves one client connection to completion.
-pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: std::net::SocketAddr, id: u64) {
+// an aborted relay must not detach a child blocked in write_all
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct ExitBump<'a> {
+    shared: &'a Shared,
+    link: &'a WriterLink,
+    reply: &'a ReplyQueue,
+}
+
+impl Drop for ExitBump<'_> {
+    fn drop(&mut self) {
+        self.reply.close();
+        mark_closed(self.link);
+        if let Some(cache) = &self.shared.cache {
+            for e in self.link.inflight.borrow_mut().iter_mut() {
+                if let Some(key) = e.fill_key.take() {
+                    cache.abandon_fill(&key);
+                }
+            }
+        }
+        stats::bump(&self.shared.wstats.writers_exited);
+        self.link.oob_notify.notify_waiters();
+    }
+}
+
+pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: SocketAddr, id: u64) {
     if stream.set_nodelay(true).is_err() {
         return;
     }
@@ -1986,18 +2053,20 @@ fn queue_on(
         }
         Pipe::Shard(tx) => {
             let queue = reply_q.shard_handle().ok_or(())?;
-            let out = crate::shard::RemoteOutbound {
+            let out = RemoteOutbound {
                 head,
                 frame,
                 expect,
-                sink: crate::shard::RemoteSink::Session { queue, seq },
+                sink: RemoteSink::Session { queue, seq },
             };
             match tx.try_send(out) {
                 Ok(()) => Ok(None),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(out)) => Ok(Some(Box::new(
-                    ColdSend::Shard(tx.clone(), out, reply_q.clone()),
-                ))),
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(()),
+                Err(mpsc::error::TrySendError::Full(out)) => Ok(Some(Box::new(ColdSend::Shard(
+                    tx.clone(),
+                    out,
+                    reply_q.clone(),
+                )))),
+                Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
             }
         }
     }
@@ -2027,43 +2096,6 @@ fn xread_slot(frame: &Bytes, argc: usize) -> Option<(u16, bool)> {
     None
 }
 
-// a request with a oneshot sink, built for either pipe flavor
-enum Staged {
-    Local(Rc<crate::backend::Conn>, Outbound),
-    Shard(
-        tokio::sync::mpsc::Sender<crate::shard::RemoteOutbound>,
-        crate::shard::RemoteOutbound,
-    ),
-}
-
-impl Staged {
-    // a closed queue drops the oneshot, which the receiver reads as LOST; a
-    // full one hands the request back to be awaited
-    fn try_send(self) -> Result<(), Staged> {
-        match self {
-            Staged::Local(conn, out) => match conn.try_send(out) {
-                Ok(()) => Ok(()),
-                Err(out) => Err(Staged::Local(conn, out)),
-            },
-            Staged::Shard(tx, out) => match tx.try_send(out) {
-                Err(tokio::sync::mpsc::error::TrySendError::Full(out)) => {
-                    Err(Staged::Shard(tx, out))
-                }
-                _ => Ok(()),
-            },
-        }
-    }
-
-    async fn send(self) {
-        match self {
-            Staged::Local(conn, out) => conn.send(out).await,
-            Staged::Shard(tx, out) => {
-                let _ = tx.send(out).await;
-            }
-        }
-    }
-}
-
 fn stage_one(pipe: &Pipe, head: Option<Bytes>, frame: Bytes) -> (Staged, oneshot::Receiver<Bytes>) {
     let (tx, rx) = oneshot::channel();
     let expect = 1 + u32::from(head.is_some());
@@ -2083,7 +2115,7 @@ fn stage_one(pipe: &Pipe, head: Option<Bytes>, frame: Bytes) -> (Staged, oneshot
                 head,
                 frame,
                 expect,
-                sink: crate::shard::RemoteSink::One(tx),
+                sink: RemoteSink::One(tx),
             },
         ),
     };
@@ -2212,15 +2244,7 @@ async fn pubsub_relay(
         }
     };
     let (mut read_half, mut write_half) = stream.into_split();
-    // an aborted relay must not detach a child blocked in write_all
-    struct AbortOnDrop(tokio::task::JoinHandle<()>);
-    impl Drop for AbortOnDrop {
-        fn drop(&mut self) {
-            self.0.abort();
-        }
-    }
     let _writer = AbortOnDrop(tokio::task::spawn_local(async move {
-        use tokio::io::AsyncWriteExt;
         while let Some(frame) = rx.recv().await {
             if write_half.write_all(&frame).await.is_err() {
                 return;
@@ -2306,26 +2330,6 @@ async fn write_loop(
     link: Rc<WriterLink>,
     client_id: u64,
 ) {
-    struct ExitBump<'a> {
-        shared: &'a Shared,
-        link: &'a WriterLink,
-        reply: &'a ReplyQueue,
-    }
-    impl Drop for ExitBump<'_> {
-        fn drop(&mut self) {
-            self.reply.close();
-            mark_closed(self.link);
-            if let Some(cache) = &self.shared.cache {
-                for e in self.link.inflight.borrow_mut().iter_mut() {
-                    if let Some(key) = e.fill_key.take() {
-                        cache.abandon_fill(&key);
-                    }
-                }
-            }
-            stats::bump(&self.shared.wstats.writers_exited);
-            self.link.oob_notify.notify_waiters();
-        }
-    }
     let _exit = ExitBump {
         shared: &shared,
         link: &link,
@@ -2341,8 +2345,8 @@ async fn write_loop(
     let mut parked = ParkedRing::default();
     let mut parked_acks = ParkedRing::default();
     let mut held_pushes: VecDeque<(u64, Bytes)> = VecDeque::new();
-    let mut batch: Vec<Reply> = Vec::with_capacity(crate::backend::BATCH);
-    let mut ready: Vec<Bytes> = Vec::with_capacity(crate::backend::BATCH);
+    let mut batch: Vec<Reply> = Vec::with_capacity(BATCH);
+    let mut ready: Vec<Bytes> = Vec::with_capacity(BATCH);
     loop {
         if let Some(n) = close_at
             && next_emit >= n
@@ -2353,7 +2357,7 @@ async fn write_loop(
             return;
         }
         tokio::select! {
-            _ = reply_q.recv_batch(&mut batch, crate::backend::BATCH) => {}
+            _ = reply_q.recv_batch(&mut batch, BATCH) => {}
             r = &mut close_rx, if close_at.is_none() => {
                 match r {
                     Ok(n) => {
@@ -2460,7 +2464,7 @@ async fn write_loop(
                     break;
                 }
                 tokio::task::yield_now().await;
-                reply_q.pop_into(&mut batch, crate::backend::BATCH);
+                reply_q.pop_into(&mut batch, BATCH);
                 if batch.is_empty() {
                     break;
                 }
@@ -2480,10 +2484,7 @@ async fn write_loop(
         }
         if !ready.is_empty() {
             let total: usize = ready.iter().map(Bytes::len).sum();
-            if crate::backend::write_frames(&mut write_half, &ready)
-                .await
-                .is_err()
-            {
+            if write_frames(&mut write_half, &ready).await.is_err() {
                 return;
             }
             stats::add(&shared.wstats.bytes_out, total as u64);
