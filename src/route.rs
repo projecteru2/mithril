@@ -37,11 +37,11 @@ pub fn any_master(topo: &Topology, rng: &mut u64) -> Option<u16> {
 }
 
 // multiply-shift keeps the uniform draw and avoids a runtime-divisor divide
-fn bounded(x: u64, n: usize) -> usize {
+pub(crate) fn bounded(x: u64, n: usize) -> usize {
     ((u128::from(x) * n as u128) >> 64) as usize
 }
 
-fn next_rand(state: &mut u64) -> u64 {
+pub(crate) fn next_rand(state: &mut u64) -> u64 {
     let mut x = *state;
     x ^= x << 13;
     x ^= x >> 7;

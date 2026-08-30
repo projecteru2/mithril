@@ -430,12 +430,14 @@ impl Session {
                         } else if spec.flags & command::FLAG_CACHE != 0 {
                             if let Some(hit) = cache.lookup(key) {
                                 stats::bump(&self.shared.wstats.cache_hits);
+                                cache.note(1, true);
                                 self.emit_at(seq, hit);
                                 return;
                             }
                             stats::bump(&self.shared.wstats.cache_misses);
+                            cache.note(1, false);
                             let key = frame.slice_ref(key);
-                            if self.may_fill() && cache.begin_fill(&key) {
+                            if self.may_fill() && cache.admit_fill(1) && cache.begin_fill(&key) {
                                 fill = Some(Fill::One(key));
                             }
                         }
@@ -2499,6 +2501,7 @@ fn mget_cache(cache: &ReplyCache, frame: &Bytes, may_fill: bool) -> PartCache {
         bytes += item.len();
         items.push(item);
     }
+    cache.note(nkeys as u32, items.len() == nkeys);
     if items.len() == nkeys {
         let mut out = Vec::with_capacity(bytes + 16);
         resp::array_header(&mut out, nkeys);
@@ -2507,7 +2510,7 @@ fn mget_cache(cache: &ReplyCache, frame: &Bytes, may_fill: bool) -> PartCache {
         }
         return PartCache::Hit(Bytes::from(out));
     }
-    if !may_fill {
+    if !may_fill || !cache.admit_fill(nkeys as u32) {
         return PartCache::Backend;
     }
     let armed: Vec<Bytes> = keys()

@@ -51,6 +51,26 @@ Without the cache, mithril's default mode is the tail-latency choice in the
 pipelined cells and mt-proxy's single-connection-per-node design wins the
 unpipelined saturation cells — which `backend-sharding` recovers.
 
+### backend-sharding auto (same rig, commit 627b196 lineage)
+
+`auto` scores each session's pipelining and routes it to whichever path
+above is faster for it, so one proxy serves both client populations
+without a knob:
+
+| cell | default | shard | auto |
+|---|---|---|---|
+| memtier P1, 400 conns | 474-480k / p99 1.09-1.10 | 540k / 1.25-1.26 | **537-543k / 1.25-1.26** |
+| memtier P16, 200 conns | **2.21M / p99 1.99-2.01** | 2.03-2.04M / 2.61-2.62 | 2.16-2.19M / 2.00-2.05 |
+| redis-benchmark GET, P1, 400 conns | 410-417k | 500-505k | **500-505k** |
+
+An unpipelined session lands on the shard ceiling, a pipelining one keeps
+the default path within 1-2%. The trade-off appears when both classes hit
+the same proxy at once: the pipelined side gets the best cell of the
+three modes and the highest combined throughput, while the unpipelined
+side queues behind the flood's cross-worker reply hop — if unpipelined
+latency under mixed saturation is the priority, pick `yes` or `no`
+explicitly.
+
 ## Bare-metal reference (2026-08, 4-worker proxies, 6-node cluster)
 
 Method: memtier_benchmark on a 16-core bare-metal Linux host, cpuset-pinned

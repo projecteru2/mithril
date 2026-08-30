@@ -53,3 +53,10 @@ retry.
   six-node cluster on commodity hardware before the proxy does.
 - The proxy converts backend redirects it cannot retry into `-TRYAGAIN`:
   clients built for real clusters already handle it.
+
+With `reply-cache yes` every server tracks the keys the proxy caches, and a
+server whose tracking table is full (`tracking-table-max-keys`, 1M by
+default) spends its CPU evicting entries on every tracked command. Keep
+that limit above the keys the proxy can hold per node — roughly
+`reply-cache-max-bytes × workers ÷ masters ÷ entry size` — or lower the
+cache budget; `INFO` on the server reports `tracking_total_keys`.

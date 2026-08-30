@@ -112,7 +112,17 @@ pipelining and ordering are untouched; a miss arms a fill ticket that the
 writer completes when the backend reply passes through. An MGET is served
 from the cache when every key it names hits (per slot part for a
 cross-slot MGET); otherwise the fetch fills all of its keys — one opt-in
-covers the whole command — up to 64 keys per MGET.
+covers the whole command — up to 64 keys per MGET. Every fill makes the
+server track the keys the command read, which costs it about as much as
+the command itself, so a worker admits fills in proportion to the hit
+ratio of its recent lookups (counted per key count, so one shape cannot
+starve another): full admission while one lookup in eight hits, scaled
+down with the ratio below that, floored at one key in eight — one GET in
+eight, one eight-key MGET in sixty-four. A workload without locality runs
+near the uncached rate instead of paying tracking for nothing, the
+sampled fills still find a hot set when one appears, and a cache
+rebuilding after a generation flip climbs back instead of sticking under
+the threshold
 
 Coherence is the cluster's job, not a timer's. Each worker keeps one RESP3
 tracking connection per master and learns its client id; every shared

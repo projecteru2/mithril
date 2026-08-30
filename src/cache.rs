@@ -19,6 +19,7 @@ use crate::config::Config;
 use crate::log_debug;
 use crate::multikey;
 use crate::resp;
+use crate::route;
 use crate::shard::Fabric;
 use crate::stats::{self, Stats};
 use crate::topology::Topology;
@@ -32,6 +33,11 @@ const TRACKER_POLL: Duration = Duration::from_millis(100);
 const TICKS_PER_SEC: u32 = 10;
 // a generation this large is freed in chunks off the request path
 const DROP_CHUNK: usize = 4096;
+// fills stop paying for their tracking below one hit in FILL_SAMPLE lookups,
+// judged per exact key count so shapes without locality cannot starve the rest
+const FILL_WINDOW: u32 = 8192;
+const FILL_SAMPLE: u32 = 8;
+const FILL_SHAPES: usize = 64;
 const TRACKER_RETRY: Duration = Duration::from_secs(1);
 const TRACKER_PING: Duration = Duration::from_secs(2);
 // a tracker this many pings behind is dead
@@ -88,6 +94,9 @@ pub struct ReplyCache {
     hot: Gen,
     prev: Gen,
     fills: RefCell<Fills>,
+    lookups: [Cell<u32>; FILL_SHAPES],
+    hits: [Cell<u32>; FILL_SHAPES],
+    rng: Cell<u64>,
     scope: Scope,
     seen_flushes: Cell<u64>,
     frames: TrackingFrames,
@@ -116,6 +125,9 @@ impl ReplyCache {
             hot: Gen::default(),
             prev: Gen::default(),
             fills: RefCell::new(Fills::default()),
+            lookups: [const { Cell::new(0) }; FILL_SHAPES],
+            hits: [const { Cell::new(0) }; FILL_SHAPES],
+            rng: Cell::new((worker as u64) << 32 | 0x9E37_79B9),
             scope,
             seen_flushes: Cell::new(0),
             frames: Rc::new(RefCell::new(HashMap::new())),
@@ -151,6 +163,37 @@ impl ReplyCache {
         let frame = e.frame.clone();
         self.insert_hot(k, e);
         Some(frame)
+    }
+
+    /// Records whether a `keys`-wide command (one part of a cross-slot MGET)
+    /// was served from the cache.
+    pub fn note(&self, keys: u32, hit: bool) {
+        let b = shape(keys);
+        let lookups = self.lookups[b].get() + 1;
+        let hits = self.hits[b].get() + u32::from(hit);
+        let halve = u32::from(lookups == FILL_WINDOW);
+        self.lookups[b].set(lookups >> halve);
+        self.hits[b].set(hits >> halve);
+    }
+
+    /// Whether a miss may arm fills for `keys`: always until half a window of
+    /// same-shape decisions settles the hit ratio, then in proportion to it
+    /// (FILL_SAMPLE times the ratio, so admission is full once hits pay for
+    /// the tracking), floored at one key in FILL_SAMPLE to keep finding hot
+    /// keys — proportional so a cache rebuilding after a generation flip can
+    /// climb back instead of sticking under the threshold.
+    pub fn admit_fill(&self, keys: u32) -> bool {
+        let b = shape(keys);
+        let lookups = self.lookups[b].get();
+        let hits = self.hits[b].get();
+        if lookups < FILL_WINDOW / 2 || hits * FILL_SAMPLE >= lookups {
+            return true;
+        }
+        let mut state = self.rng.get();
+        let pick = route::next_rand(&mut state);
+        self.rng.set(state);
+        route::bounded(pick, lookups as usize) < (hits * FILL_SAMPLE) as usize
+            || route::bounded(pick, (FILL_SAMPLE * keys) as usize) == 0
     }
 
     /// Arms a fill for `key`; false when uncovered or the key is already in flight.
@@ -571,6 +614,10 @@ pub async fn run_trackers(w: Rc<Wiring>, topo: Arc<ArcSwap<Topology>>) {
     }
 }
 
+fn shape(keys: u32) -> usize {
+    (keys as usize - 1).min(FILL_SHAPES - 1)
+}
+
 fn entry_size(key_len: usize, frame_len: usize) -> usize {
     key_len + frame_len + ENTRY_OVERHEAD
 }
@@ -794,6 +841,49 @@ mod tests {
             low.insert(h.hash_one(format!("k{i}").as_bytes()) & 0xfff);
         }
         assert!(low.len() > 2300, "low bits collapse: {}", low.len());
+    }
+
+    #[test]
+    fn fills_are_sampled_once_hits_stop_paying_for_tracking() {
+        let c = cache(1 << 20);
+        for _ in 0..FILL_WINDOW / 2 - 1 {
+            c.note(8, false);
+            assert!(c.admit_fill(8));
+        }
+        c.note(8, false);
+        assert!(c.admit_fill(1), "cold shapes stay in warm-up");
+        let eights = (0..8000).filter(|_| c.admit_fill(8)).count();
+        assert!((80..170).contains(&eights), "{eights}");
+        for _ in 0..FILL_WINDOW / 2 {
+            c.note(1, false);
+        }
+        let singles = (0..8000).filter(|_| c.admit_fill(1)).count();
+        assert!((800..1200).contains(&singles), "{singles}");
+        for _ in 0..FILL_WINDOW / 2 {
+            c.note(2, false);
+            c.note(3, true);
+        }
+        assert!(
+            c.admit_fill(3),
+            "a shape with hits is not starved by a cold neighbor"
+        );
+        let twos = (0..8000).filter(|_| c.admit_fill(2)).count();
+        assert!((350..700).contains(&twos), "{twos}");
+        for _ in 0..FILL_WINDOW / 2 {
+            c.note(5, c.lookups[4].get().is_multiple_of(16));
+        }
+        let fives = (0..8000).filter(|_| c.admit_fill(5)).count();
+        assert!(
+            (3000..5000).contains(&fives),
+            "proportional admission: {fives}"
+        );
+        c.hits[7].set(c.lookups[7].get());
+        assert!(c.admit_fill(8));
+        c.lookups[0].set(FILL_WINDOW - 1);
+        c.hits[0].set(FILL_WINDOW - 1);
+        c.note(1, false);
+        assert_eq!(c.lookups[0].get(), FILL_WINDOW / 2);
+        assert_eq!(c.hits[0].get(), (FILL_WINDOW - 1) / 2);
     }
 
     #[test]
