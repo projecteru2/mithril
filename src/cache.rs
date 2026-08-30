@@ -5,7 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, hash_map};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,11 @@ const CLIENT_ID_FRAME: &[u8] = b"*2\r\n$6\r\nCLIENT\r\n$2\r\nID\r\n";
 /// Marks the next command on a tracking connection as cached.
 pub const CACHING_FRAME: &[u8] = b"*3\r\n$6\r\nCLIENT\r\n$7\r\nCACHING\r\n$3\r\nYES\r\n";
 const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+// a larger invalidation push flushes the scope instead of pinning its frame
+const INVAL_KEYS_MAX: i64 = 1024;
+// shared coverage packs the armed flag above the flush generation so one
+// load yields a consistent snapshot
+const ARMED_BIT: u64 = 1 << 63;
 
 /// Per-node `CLIENT TRACKING` frames, shared with the dialers on this worker.
 pub type TrackingFrames = Rc<RefCell<HashMap<Box<str>, Bytes>>>;
@@ -92,20 +97,18 @@ enum Scope {
 }
 
 /// Process-wide tracking coverage; owner workers report, everyone reads.
-/// Every flush bumps `flushes`; a worker whose cache lags a generation clears
-/// itself on its next touch, so no flush waits on a channel.
+/// Every flush bumps the generation; a worker whose cache lags a generation
+/// clears itself on its next touch, so no flush waits on a channel.
 pub struct Coverage {
     sets: Mutex<Sets>,
-    armed: AtomicBool,
-    flushes: AtomicU64,
+    state: AtomicU64,
 }
 
 impl Coverage {
     pub fn new() -> Arc<Coverage> {
         Arc::new(Coverage {
             sets: Mutex::new((HashSet::new(), HashSet::new())),
-            armed: AtomicBool::new(false),
-            flushes: AtomicU64::new(0),
+            state: AtomicU64::new(0),
         })
     }
 
@@ -113,6 +116,13 @@ impl Coverage {
         self.sets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // callers hold the sets lock, which serializes every writer
+    fn publish(&self, armed: bool, flush: bool) {
+        let generation = (self.state.load(Ordering::Relaxed) & !ARMED_BIT) + u64::from(flush);
+        let armed = if armed { ARMED_BIT } else { 0 };
+        self.state.store(generation | armed, Ordering::Relaxed);
     }
 }
 
@@ -188,8 +198,7 @@ impl ReplyCache {
     /// Arms a fill for `key`; false while coverage is incomplete or the key
     /// already has a ticket or a write in flight.
     pub fn begin_fill(&self, key: &Bytes) -> bool {
-        self.sync();
-        if !self.armed() {
+        if !self.sync() {
             return false;
         }
         match self.fills.borrow_mut().entry(key.clone()) {
@@ -281,25 +290,26 @@ impl ReplyCache {
         match &self.scope {
             Scope::Local { .. } => self.clear(),
             Scope::Shared(c) => {
-                c.flushes.fetch_add(1, Ordering::Relaxed);
+                let sets = c.lock();
+                c.publish(covered(&sets), true);
+                drop(sets);
                 self.sync();
             }
         }
     }
 
-    fn armed(&self) -> bool {
+    // catches up with the scope's flush generation; returns whether fills may arm
+    fn sync(&self) -> bool {
         match &self.scope {
             Scope::Local { armed, .. } => armed.get(),
-            Scope::Shared(c) => c.armed.load(Ordering::Relaxed),
-        }
-    }
-
-    fn sync(&self) {
-        if let Scope::Shared(c) = &self.scope {
-            let g = c.flushes.load(Ordering::Relaxed);
-            if g != self.seen_flushes.get() {
-                self.seen_flushes.set(g);
-                self.clear();
+            Scope::Shared(c) => {
+                let state = c.state.load(Ordering::Relaxed);
+                let generation = state & !ARMED_BIT;
+                if generation != self.seen_flushes.get() {
+                    self.seen_flushes.set(generation);
+                    self.clear();
+                }
+                state & ARMED_BIT != 0
             }
         }
     }
@@ -351,11 +361,9 @@ impl ReplyCache {
                 let mut sets = c.lock();
                 let changed = replace_set(&mut sets.0, want);
                 let armed = covered(&sets);
-                c.armed.store(armed, Ordering::Relaxed);
+                c.publish(armed, changed);
                 drop(sets);
-                if changed {
-                    self.flush();
-                }
+                self.sync();
                 self.publish(armed);
             }
         }
@@ -364,10 +372,6 @@ impl ReplyCache {
     // a dialer that races the rearm picks the frame up from here
     fn install_frame(&self, addr: &str, frame: Bytes) {
         self.frames.borrow_mut().insert(Box::from(addr), frame);
-    }
-
-    fn forget_frame(&self, addr: &str) {
-        self.frames.borrow_mut().remove(addr);
     }
 
     fn tracker_up(&self, addr: &str) {
@@ -382,7 +386,7 @@ impl ReplyCache {
                 let mut sets = c.lock();
                 sets.1.insert(Box::from(addr));
                 let armed = covered(&sets);
-                c.armed.store(armed, Ordering::Relaxed);
+                c.publish(armed, false);
                 self.publish(armed);
             }
         }
@@ -392,7 +396,7 @@ impl ReplyCache {
     // a new connection must not redirect to the dead client id; a departed
     // master leaves the remaining coverage intact
     fn tracker_down(&self, addr: &str) {
-        self.forget_frame(addr);
+        self.frames.borrow_mut().remove(addr);
         let armed = match &self.scope {
             Scope::Local { sets, armed } => {
                 let mut sets = sets.borrow_mut();
@@ -405,9 +409,9 @@ impl ReplyCache {
                 let mut sets = c.lock();
                 sets.1.remove(addr);
                 let armed = covered(&sets);
-                c.armed.store(armed, Ordering::Relaxed);
+                c.publish(armed, true);
                 drop(sets);
-                self.flush();
+                self.sync();
                 armed
             }
         };
@@ -586,17 +590,15 @@ async fn track_once(addr: &str, w: &Rc<Wiring>) -> Result<(), String> {
         ],
     );
     let frame = Bytes::from(frame);
-    // every connection, live or dialed meanwhile, redirects before fills arm
+    // every connection, live or dialed meanwhile, redirects before fills arm;
+    // the guard forgets the frame if this task ends anywhere past here
     w.cache.install_frame(addr, frame.clone());
-    if let Err(e) = w.rearm(addr, &frame).await {
-        w.cache.forget_frame(addr);
-        return Err(e);
-    }
-    w.cache.tracker_up(addr);
     let _up = UpGuard {
         w: w.clone(),
         addr: Box::from(addr),
     };
+    w.rearm(addr, &frame).await?;
+    w.cache.tracker_up(addr);
 
     let mut ping = tokio::time::interval(TRACKER_PING);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -662,7 +664,7 @@ fn collect_push(frame: &Bytes, keys: &mut Vec<Bytes>) -> Option<bool> {
     match frame.get(pos)? {
         b'*' => {
             let (n, mut cur) = resp::scan_int_line(frame, pos + 1)?;
-            if n < 0 {
+            if !(0..=INVAL_KEYS_MAX).contains(&n) {
                 return Some(true);
             }
             for _ in 0..n {
@@ -810,9 +812,11 @@ mod tests {
         assert_eq!(stats.workers[0].cache_armed.load(Ordering::Relaxed), 1);
         let pending = Bytes::from_static(b"p");
         assert!(b.begin_fill(&pending));
-        let flushes_before = cov.flushes.load(Ordering::Relaxed);
+        let before = cov.state.load(Ordering::Relaxed);
         a.tracker_down("m1");
-        assert!(cov.flushes.load(Ordering::Relaxed) > flushes_before);
+        let after = cov.state.load(Ordering::Relaxed);
+        assert_eq!(after & !ARMED_BIT, (before & !ARMED_BIT) + 1);
+        assert_eq!(after & ARMED_BIT, 0);
         assert_eq!(b.lookup(&key), None, "b clears itself on its next touch");
         b.complete_fill(&pending, &Bytes::from_static(b"$1\r\nx\r\n"));
         a.tracker_up("m1");
@@ -933,6 +937,13 @@ mod tests {
         assert_eq!(collect_push(&nil_array, &mut keys), Some(true));
         let other = Bytes::from_static(b">2\r\n$7\r\nmessage\r\n$1\r\nx\r\n");
         assert_eq!(collect_push(&other, &mut keys), None);
+        assert!(keys.is_empty());
+        let mut huge =
+            format!(">2\r\n$10\r\ninvalidate\r\n*{}\r\n", INVAL_KEYS_MAX + 1).into_bytes();
+        for _ in 0..=INVAL_KEYS_MAX {
+            huge.extend_from_slice(b"$1\r\nk\r\n");
+        }
+        assert_eq!(collect_push(&Bytes::from(huge), &mut keys), Some(true));
         assert!(keys.is_empty());
     }
 }
