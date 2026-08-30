@@ -12,6 +12,7 @@ homepage = "https://projecteru2.github.io/mithril/"
 [dependencies]
 arc-swap = "1"
 bytes = "1"
+libc = "0.2"
 socket2 = { version = "0.6", features = ["all"] }
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "macros", "signal"] }
 

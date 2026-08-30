@@ -310,19 +310,19 @@ fn shard_node(out: &mut Vec<u8>, cfg: &Config, proto: u8) {
     resp::bulk(out, b"online");
 }
 
-// (system, user) seconds from /proc/self/stat at the usual 100 Hz; zero elsewhere
+// (system, user) seconds of CPU this process has used
 fn cpu_seconds() -> (f64, f64) {
-    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
-        return (0.0, 0.0);
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: RUSAGE_SELF with a pointer to writable rusage-sized storage;
+    // the struct is read only after getrusage reported success
+    let usage = unsafe {
+        if libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) != 0 {
+            return (0.0, 0.0);
+        }
+        usage.assume_init()
     };
-    let Some(after) = stat.rfind(')') else {
-        return (0.0, 0.0);
-    };
-    let mut fields = stat[after + 1..].split_whitespace().skip(11);
-    let ticks = |f: Option<&str>| f.and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) / 100.0;
-    let user = ticks(fields.next());
-    let sys = ticks(fields.next());
-    (sys, user)
+    let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    (secs(usage.ru_stime), secs(usage.ru_utime))
 }
 
 fn split_announce(announce: &str) -> (&str, u16) {
