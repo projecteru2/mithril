@@ -38,6 +38,7 @@ pub const CACHING_FRAME: &[u8] = b"*3\r\n$6\r\nCLIENT\r\n$7\r\nCACHING\r\n$3\r\n
 const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 // a larger invalidation push flushes the scope instead of pinning its frame
 const INVAL_KEYS_MAX: i64 = 1024;
+const INVAL_BYTES_MAX: usize = 64 * 1024;
 // shared coverage packs the armed flag above the flush generation so one
 // load yields a consistent snapshot
 const ARMED_BIT: u64 = 1 << 63;
@@ -667,10 +668,17 @@ fn collect_push(frame: &Bytes, keys: &mut Vec<Bytes>) -> Option<bool> {
             if !(0..=INVAL_KEYS_MAX).contains(&n) {
                 return Some(true);
             }
+            let mut bytes = 0;
             for _ in 0..n {
                 let Some(Ok(b)) = resp::scan_bulk(frame, cur) else {
+                    keys.clear();
                     return None;
                 };
+                bytes += b.payload_end - b.payload_start;
+                if bytes > INVAL_BYTES_MAX {
+                    keys.clear();
+                    return Some(true);
+                }
                 keys.push(frame.slice(b.payload_start..b.payload_end));
                 cur = b.next;
             }
@@ -944,6 +952,14 @@ mod tests {
             huge.extend_from_slice(b"$1\r\nk\r\n");
         }
         assert_eq!(collect_push(&Bytes::from(huge), &mut keys), Some(true));
+        assert!(keys.is_empty());
+        let wide_key = "k".repeat(INVAL_BYTES_MAX / 2 + 1);
+        let wide = format!(
+            ">2\r\n$10\r\ninvalidate\r\n*2\r\n${0}\r\n{1}\r\n${0}\r\n{1}\r\n",
+            wide_key.len(),
+            wide_key
+        );
+        assert_eq!(collect_push(&Bytes::from(wide), &mut keys), Some(true));
         assert!(keys.is_empty());
     }
 }
