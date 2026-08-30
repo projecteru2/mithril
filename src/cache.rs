@@ -39,6 +39,8 @@ const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 // a larger invalidation push flushes the scope instead of pinning its frame
 const INVAL_KEYS_MAX: i64 = 1024;
 const INVAL_BYTES_MAX: usize = 64 * 1024;
+// a push that cannot complete within this many buffered bytes restarts the tracker
+const TRACKER_FRAME_MAX: usize = 1024 * 1024;
 // shared coverage packs the armed flag above the flush generation so one
 // load yields a consistent snapshot
 const ARMED_BIT: u64 = 1 << 63;
@@ -479,11 +481,26 @@ impl Wiring {
         }
     }
 
-    // a worker too slow to take its invalidations loses its whole cache instead
+    // a worker too slow to take its invalidations loses its whole cache instead;
+    // keys crossing workers are compacted so they never pin the read buffer
     fn invalidate(&self, keys: &[Bytes]) {
         match &self.fabric {
             Some(f) => {
-                if !f.invalidate(Arc::from(keys)) {
+                let mut compact = BytesMut::with_capacity(keys.iter().map(Bytes::len).sum());
+                for k in keys {
+                    compact.extend_from_slice(k);
+                }
+                let compact = compact.freeze();
+                let mut at = 0;
+                let batch: Arc<[Bytes]> = keys
+                    .iter()
+                    .map(|k| {
+                        let s = compact.slice(at..at + k.len());
+                        at += k.len();
+                        s
+                    })
+                    .collect();
+                if !f.invalidate(batch) {
                     self.cache.flush();
                 }
             }
@@ -627,6 +644,12 @@ async fn track_once(addr: &str, w: &Rc<Wiring>) -> Result<(), String> {
                 resp::Scan::Invalid(e) => return Err(e.to_string()),
                 resp::Scan::Incomplete => break,
             }
+        }
+        if buf.len() > TRACKER_FRAME_MAX {
+            return Err("tracking push exceeds the frame bound".to_string());
+        }
+        if buf.is_empty() && buf.capacity() > backend::READ_CHUNK {
+            buf = BytesMut::with_capacity(backend::READ_INIT);
         }
         backend::ensure_read_room(&mut buf);
         tokio::select! {
