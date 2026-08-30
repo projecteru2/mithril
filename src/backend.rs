@@ -7,7 +7,7 @@ use std::io::IoSlice;
 use std::rc::Rc;
 
 use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
@@ -457,23 +457,32 @@ pub(crate) async fn handshake(
     }
     writer.write_all(&cmds).await.map_err(|e| e.to_string())?;
     let mut buf = BytesMut::with_capacity(1024);
-    while expected > 0 {
-        match resp::scan_value(&buf) {
+    for _ in 0..expected {
+        read_reply(reader, &mut buf).await?;
+    }
+    Ok(())
+}
+
+/// Reads one complete reply; an error reply or a closed stream is an Err.
+pub(crate) async fn read_reply<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut BytesMut,
+) -> Result<Bytes, String> {
+    loop {
+        match resp::scan_value(buf) {
             resp::Scan::Complete(len) => {
-                let frame = buf.split_to(len);
+                let frame = buf.split_to(len).freeze();
                 if frame.first() == Some(&b'-') {
                     return Err(String::from_utf8_lossy(&frame).trim_end().to_string());
                 }
-                expected -= 1;
-                continue;
+                return Ok(frame);
             }
             resp::Scan::Invalid(e) => return Err(e.to_string()),
             resp::Scan::Incomplete => {}
         }
-        let n = reader.read_buf(&mut buf).await.map_err(|e| e.to_string())?;
+        let n = reader.read_buf(buf).await.map_err(|e| e.to_string())?;
         if n == 0 {
-            return Err("closed during handshake".to_string());
+            return Err("closed before reply".to_string());
         }
     }
-    Ok(())
 }

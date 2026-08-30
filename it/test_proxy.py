@@ -496,3 +496,29 @@ def test_cache_nil_entries_invalidate(cache_proxy, cluster_direct, key_prefix):
             break
         time.sleep(0.05)
     assert r.get(key) is None
+
+
+def test_pipelined_write_fanout_orders_before_following_get(r, key_prefix):
+    key = f"{key_prefix}:ord"
+    assert r.set(key, "v1")
+    for _ in range(50):
+        pipe = r.pipeline(transaction=False)
+        pipe.set(key, "v1")
+        pipe.delete(key)
+        pipe.get(key)
+        assert pipe.execute() == [True, 1, None]
+
+
+def test_cache_store_option_targets_read_their_writes(cache_proxy, key_prefix):
+    r = cache_proxy
+    src, dst = f"{key_prefix}:{{s}}:src", f"{key_prefix}:{{s}}:dst"
+    r.rpush(src, "b", "a")
+    assert r.set(dst, "stale")
+    assert r.get(dst) == "stale"
+    assert r.get(dst) == "stale"
+    r.execute_command("SORT", src, "ALPHA", "STORE", dst)
+    assert r.type(dst) == "list"
+    pipe = r.pipeline(transaction=False)
+    pipe.set(dst, "v2")
+    pipe.get(dst)
+    assert pipe.execute() == [True, "v2"]

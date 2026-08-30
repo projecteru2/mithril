@@ -23,7 +23,8 @@ use crate::topology::Topology;
 const ENTRY_MAX_BYTES: usize = 64 * 1024;
 // per-entry map slot, key box, and refcount bookkeeping
 const ENTRY_OVERHEAD: usize = 64;
-const TRACKER_POLL: Duration = Duration::from_secs(1);
+// routing follows a new epoch per request; trackers follow within one poll
+const TRACKER_POLL: Duration = Duration::from_millis(100);
 const TRACKER_RETRY: Duration = Duration::from_secs(1);
 const TRACKER_PING: Duration = Duration::from_secs(2);
 // unanswered pings before a silent tracker is declared dead
@@ -31,31 +32,36 @@ const PING_DEBT_MAX: u32 = 3;
 const PING_FRAME: &[u8] = b"*1\r\n$4\r\nPING\r\n";
 const TRACKING_FRAME: &[u8] =
     b"*4\r\n$6\r\nCLIENT\r\n$8\r\nTRACKING\r\n$2\r\nON\r\n$5\r\nBCAST\r\n";
-
-/// FNV-1a; integer keys route here through their native-bytes default.
-#[derive(Default)]
-pub struct KeyHasher(u64);
-
-impl Hasher for KeyHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        let mut h = if self.0 == 0 {
-            0xcbf2_9ce4_8422_2325
-        } else {
-            self.0
-        };
-        for &b in bytes {
-            h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
-        }
-        self.0 = h;
-    }
-}
+const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 
 type Map = HashMap<Box<[u8]>, Entry, BuildHasherDefault<KeyHasher>>;
 type Fills = HashMap<Bytes, bool, BuildHasherDefault<KeyHasher>>;
+
+/// Word-at-a-time multiply-fold; the length binds in the tail, not a prefix.
+#[derive(Default)]
+struct KeyHasher(u64);
+
+impl Hasher for KeyHasher {
+    // hashbrown indexes buckets by the low bits: fold the mixed high half down
+    fn finish(&self) -> u64 {
+        let h = (self.0 ^ (self.0 >> 32)).wrapping_mul(MIX);
+        h ^ (h >> 29)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        let (words, rest) = bytes.as_chunks::<8>();
+        for w in words {
+            h = (h ^ u64::from_le_bytes(*w)).wrapping_mul(MIX);
+        }
+        let mut word = [0u8; 8];
+        word[..rest.len()].copy_from_slice(rest);
+        h = (h ^ u64::from_le_bytes(word)).wrapping_mul(MIX);
+        self.0 = (h ^ bytes.len() as u64).wrapping_mul(MIX);
+    }
+
+    fn write_usize(&mut self, _: usize) {}
+}
 
 struct Entry {
     frame: Bytes,
@@ -72,8 +78,9 @@ pub struct ReplyCache {
     prev_bytes: Cell<usize>,
     // in-flight fills by key; true = an invalidation raced the reply
     fills: RefCell<Fills>,
-    ready: Cell<usize>,
-    masters: Cell<usize>,
+    wanted: RefCell<HashSet<Box<str>>>,
+    ready: RefCell<HashSet<Box<str>>>,
+    armed: Cell<bool>,
     stats: Arc<Stats>,
     worker: usize,
 }
@@ -88,8 +95,9 @@ impl ReplyCache {
             hot_bytes: Cell::new(0),
             prev_bytes: Cell::new(0),
             fills: RefCell::new(Fills::default()),
-            ready: Cell::new(0),
-            masters: Cell::new(0),
+            wanted: RefCell::new(HashSet::new()),
+            ready: RefCell::new(HashSet::new()),
+            armed: Cell::new(false),
             stats,
             worker,
         })
@@ -97,18 +105,14 @@ impl ReplyCache {
 
     /// Returns the cached reply for `key` if fresh.
     pub fn lookup(&self, key: &[u8]) -> Option<Bytes> {
-        let now = Instant::now();
         if let Some(e) = self.hot.borrow().get(key) {
-            if now.duration_since(e.at) <= self.max_age {
+            if e.at.elapsed() <= self.max_age {
                 return Some(e.frame.clone());
             }
             return None;
         }
-        let promoted = self.prev.borrow_mut().remove_entry(key);
-        let (k, e) = promoted?;
-        self.prev_bytes
-            .set(self.prev_bytes.get() - entry_size(&k, &e.frame));
-        if now.duration_since(e.at) > self.max_age {
+        let (k, e) = take_entry(&self.prev, &self.prev_bytes, key)?;
+        if e.at.elapsed() > self.max_age {
             return None;
         }
         let frame = e.frame.clone();
@@ -118,10 +122,11 @@ impl ReplyCache {
 
     /// Arms a fill for `key`; false while tracking coverage is incomplete.
     pub fn begin_fill(&self, key: &Bytes) -> bool {
-        if !self.armed() {
+        if !self.armed.get() {
             return false;
         }
-        self.fills.borrow_mut().insert(key.clone(), false);
+        // a poisoned entry stays poisoned: the first reply may predate the write
+        self.fills.borrow_mut().entry(key.clone()).or_insert(false);
         true
     }
 
@@ -130,7 +135,11 @@ impl ReplyCache {
         let Some(poisoned) = self.fills.borrow_mut().remove(key) else {
             return;
         };
-        if poisoned || frame.first() != Some(&b'$') || frame.len() > ENTRY_MAX_BYTES {
+        if poisoned
+            || frame.first() != Some(&b'$')
+            || frame.len() > ENTRY_MAX_BYTES
+            || entry_size(key, frame) > self.max_bytes / 2
+        {
             return;
         }
         // the copy unpins the request read buffer the key slice points into
@@ -151,14 +160,8 @@ impl ReplyCache {
     /// Drops `key` from both generations and poisons its in-flight fill.
     pub fn invalidate(&self, key: &[u8]) {
         stats::bump(&self.stats.workers[self.worker].cache_invalidations);
-        if let Some((k, e)) = self.hot.borrow_mut().remove_entry(key) {
-            self.hot_bytes
-                .set(self.hot_bytes.get() - entry_size(&k, &e.frame));
-        }
-        if let Some((k, e)) = self.prev.borrow_mut().remove_entry(key) {
-            self.prev_bytes
-                .set(self.prev_bytes.get() - entry_size(&k, &e.frame));
-        }
+        take_entry(&self.hot, &self.hot_bytes, key);
+        take_entry(&self.prev, &self.prev_bytes, key);
         if let Some(p) = self.fills.borrow_mut().get_mut(key) {
             *p = true;
         }
@@ -166,8 +169,8 @@ impl ReplyCache {
 
     /// Empties both generations and poisons every in-flight fill.
     pub fn clear(&self) {
-        drop(std::mem::take(&mut *self.hot.borrow_mut()));
-        drop(std::mem::take(&mut *self.prev.borrow_mut()));
+        *self.hot.borrow_mut() = Map::default();
+        *self.prev.borrow_mut() = Map::default();
         self.hot_bytes.set(0);
         self.prev_bytes.set(0);
         for p in self.fills.borrow_mut().values_mut() {
@@ -175,51 +178,56 @@ impl ReplyCache {
         }
     }
 
-    fn armed(&self) -> bool {
-        self.masters.get() > 0 && self.ready.get() == self.masters.get()
-    }
-
     fn insert_hot(&self, k: Box<[u8]>, e: Entry) {
         let size = entry_size(&k, &e.frame);
         if self.hot_bytes.get() + size > self.max_bytes / 2 {
-            let dropped = std::mem::take(&mut *self.prev.borrow_mut());
-            *self.prev.borrow_mut() = std::mem::take(&mut *self.hot.borrow_mut());
+            let flipped = std::mem::take(&mut *self.hot.borrow_mut());
+            *self.prev.borrow_mut() = flipped;
             self.prev_bytes.set(self.hot_bytes.get());
             self.hot_bytes.set(0);
-            drop(dropped);
         }
         let mut hot = self.hot.borrow_mut();
-        let mut grown = size;
-        if let Some(old) = hot.insert(k, e) {
-            grown -= old.frame.len();
-        }
-        self.hot_bytes.set(self.hot_bytes.get() + grown);
+        let klen = k.len();
+        let replaced = match hot.insert(k, e) {
+            Some(old) => klen + old.frame.len() + ENTRY_OVERHEAD,
+            None => 0,
+        };
+        self.hot_bytes.set(self.hot_bytes.get() + size - replaced);
     }
 
-    fn set_masters(&self, n: usize) {
-        if self.masters.get() != n {
-            self.masters.set(n);
+    // any master-set change disarms immediately, before old trackers unwind
+    fn set_coverage(&self, want: &HashSet<&str>) {
+        let same = {
+            let cur = self.wanted.borrow();
+            cur.len() == want.len() && want.iter().all(|a| cur.contains(*a))
+        };
+        if !same {
+            *self.wanted.borrow_mut() = want.iter().map(|&a| Box::from(a)).collect();
             self.clear();
         }
-        self.publish_armed();
+        self.recompute_armed();
     }
 
-    fn tracker_up(&self) {
-        self.ready.set(self.ready.get() + 1);
-        self.publish_armed();
+    fn tracker_up(&self, addr: &str) {
+        self.ready.borrow_mut().insert(Box::from(addr));
+        self.recompute_armed();
     }
 
     // a gone tracker means missed invalidations: nothing cached survives
-    fn tracker_down(&self) {
-        self.ready.set(self.ready.get().saturating_sub(1));
+    fn tracker_down(&self, addr: &str) {
+        self.ready.borrow_mut().remove(addr);
         self.clear();
-        self.publish_armed();
+        self.recompute_armed();
     }
 
-    fn publish_armed(&self) {
+    fn recompute_armed(&self) {
+        let wanted = self.wanted.borrow();
+        let ready = self.ready.borrow();
+        let armed = !wanted.is_empty() && wanted.iter().all(|a| ready.contains(a));
+        self.armed.set(armed);
         self.stats.workers[self.worker]
             .cache_armed
-            .store(u64::from(self.armed()), Ordering::Relaxed);
+            .store(u64::from(armed), Ordering::Relaxed);
     }
 }
 
@@ -227,19 +235,26 @@ fn entry_size(key: &[u8], frame: &Bytes) -> usize {
     key.len() + frame.len() + ENTRY_OVERHEAD
 }
 
+fn take_entry(map: &RefCell<Map>, bytes: &Cell<usize>, key: &[u8]) -> Option<(Box<[u8]>, Entry)> {
+    let (k, e) = map.borrow_mut().remove_entry(key)?;
+    bytes.set(bytes.get() - entry_size(&k, &e.frame));
+    Some((k, e))
+}
+
 /// Keeps one tracking connection per master alive; spawned once per worker.
 pub async fn run_trackers(cache: Rc<ReplyCache>, topo: Arc<ArcSwap<Topology>>, cfg: Rc<Config>) {
     let mut running: HashMap<Box<str>, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut seen_epoch = 0u64;
     loop {
-        let t = topo.load_full();
-        if t.epoch != seen_epoch {
+        if crate::server::topo_epoch() != seen_epoch {
+            let t = topo.load_full();
             seen_epoch = t.epoch;
             let want: HashSet<&str> = t
                 .masters
                 .iter()
                 .map(|&i| t.nodes[i as usize].addr.as_str())
                 .collect();
+            cache.set_coverage(&want);
             running.retain(|addr, task| {
                 want.contains(&**addr) || {
                     task.abort();
@@ -256,7 +271,6 @@ pub async fn run_trackers(cache: Rc<ReplyCache>, topo: Arc<ArcSwap<Topology>>, c
                     running.insert(Box::from(addr), task);
                 }
             }
-            cache.set_masters(want.len());
         }
         tokio::time::sleep(TRACKER_POLL).await;
     }
@@ -272,18 +286,24 @@ async fn run_tracker(addr: Box<str>, cache: Rc<ReplyCache>, cfg: Rc<Config>) {
 }
 
 // coverage accounting survives task aborts through this guard
-struct UpGuard(Rc<ReplyCache>);
+struct UpGuard {
+    cache: Rc<ReplyCache>,
+    addr: Box<str>,
+}
 
 impl UpGuard {
-    fn new(cache: &Rc<ReplyCache>) -> UpGuard {
-        cache.tracker_up();
-        UpGuard(cache.clone())
+    fn new(cache: &Rc<ReplyCache>, addr: &str) -> UpGuard {
+        cache.tracker_up(addr);
+        UpGuard {
+            cache: cache.clone(),
+            addr: Box::from(addr),
+        }
     }
 }
 
 impl Drop for UpGuard {
     fn drop(&mut self) {
-        self.0.tracker_down();
+        self.cache.tracker_down(&self.addr);
     }
 }
 
@@ -311,32 +331,12 @@ async fn track_once(addr: &str, cache: &Rc<ReplyCache>, cfg: &Config) -> Result<
         .write_all(&setup)
         .await
         .map_err(|e| e.to_string())?;
-
     let mut buf = BytesMut::with_capacity(backend::READ_INIT);
-    let mut expected = 2u32;
-    while expected > 0 {
-        match resp::scan_value(&buf) {
-            resp::Scan::Complete(len) => {
-                let frame = buf.split_to(len);
-                if frame.first() == Some(&b'-') {
-                    return Err(String::from_utf8_lossy(&frame).trim_end().to_string());
-                }
-                expected -= 1;
-                continue;
-            }
-            resp::Scan::Invalid(e) => return Err(e.to_string()),
-            resp::Scan::Incomplete => {}
-        }
-        let n = read_half
-            .read_buf(&mut buf)
-            .await
-            .map_err(|e| e.to_string())?;
-        if n == 0 {
-            return Err("closed during tracking handshake".to_string());
-        }
+    for _ in 0..2 {
+        backend::read_reply(&mut read_half, &mut buf).await?;
     }
 
-    let _up = UpGuard::new(cache);
+    let _up = UpGuard::new(cache, addr);
     let mut ping = tokio::time::interval(TRACKER_PING);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut debt = 0u32;
@@ -416,6 +416,8 @@ fn apply_push(frame: &[u8], cache: &ReplyCache) {
 
 #[cfg(test)]
 mod tests {
+    use std::hash::BuildHasher;
+
     use super::*;
 
     fn cache(max_bytes: usize) -> Rc<ReplyCache> {
@@ -424,8 +426,8 @@ mod tests {
             ..Config::default()
         };
         let c = ReplyCache::new(&cfg, Stats::new(1), 0);
-        c.set_masters(1);
-        c.tracker_up();
+        c.set_coverage(&HashSet::from(["m1"]));
+        c.tracker_up("m1");
         c
     }
 
@@ -435,6 +437,22 @@ mod tests {
         assert!(c.begin_fill(&key));
         c.complete_fill(&key, &frame);
         (key, frame)
+    }
+
+    #[test]
+    fn hasher_separates_lengths_and_agrees_across_key_types() {
+        let h = BuildHasherDefault::<KeyHasher>::default();
+        assert_ne!(h.hash_one(b"ab".as_slice()), h.hash_one(b"ab\0".as_slice()));
+        assert_ne!(h.hash_one(b"".as_slice()), h.hash_one(b"\0".as_slice()));
+        assert_eq!(
+            h.hash_one(Bytes::from_static(b"key-1234567890")),
+            h.hash_one(Box::<[u8]>::from(&b"key-1234567890"[..]))
+        );
+        let mut low = HashSet::new();
+        for i in 0..4096u32 {
+            low.insert(h.hash_one(format!("k{i}").as_bytes()) & 0xfff);
+        }
+        assert!(low.len() > 2300, "low bits collapse: {}", low.len());
     }
 
     #[test]
@@ -471,16 +489,39 @@ mod tests {
     fn incomplete_coverage_blocks_fills_and_loss_clears() {
         let c = cache(1 << 20);
         let (key, frame) = fill(&c, "k1", "v1");
-        c.set_masters(2);
+        c.set_coverage(&HashSet::from(["m1", "m2"]));
         assert_eq!(c.lookup(&key), None);
         assert!(!c.begin_fill(&key));
-        c.tracker_up();
+        c.tracker_up("m2");
         let (key, frame2) = fill(&c, "k1", "v2");
         assert_eq!(c.lookup(&key), Some(frame2));
         drop(frame);
-        c.tracker_down();
+        c.tracker_down("m1");
         assert_eq!(c.lookup(&key), None);
         assert!(!c.begin_fill(&key));
+    }
+
+    #[test]
+    fn replaced_master_disarms_before_old_tracker_unwinds() {
+        let c = cache(1 << 20);
+        let (key, _) = fill(&c, "k1", "v1");
+        c.set_coverage(&HashSet::from(["m3"]));
+        assert_eq!(c.lookup(&key), None);
+        assert!(!c.begin_fill(&key));
+        c.tracker_down("m1");
+        c.tracker_up("m3");
+        assert!(c.begin_fill(&key));
+    }
+
+    #[test]
+    fn repeated_miss_keeps_the_poison() {
+        let c = cache(1 << 20);
+        let key = Bytes::from_static(b"k1");
+        assert!(c.begin_fill(&key));
+        c.invalidate(&key);
+        assert!(c.begin_fill(&key));
+        c.complete_fill(&key, &Bytes::from_static(b"$2\r\nv1\r\n"));
+        assert_eq!(c.lookup(&key), None);
     }
 
     #[test]
@@ -498,6 +539,15 @@ mod tests {
     }
 
     #[test]
+    fn overwrite_debits_the_replaced_entry() {
+        let c = cache(1 << 20);
+        let (_, f1) = fill(&c, "k", "short");
+        let before = c.hot_bytes.get();
+        let (_, f2) = fill(&c, "k", "a much longer value");
+        assert_eq!(c.hot_bytes.get(), before + f2.len() - f1.len());
+    }
+
+    #[test]
     fn non_bulk_and_oversized_replies_stay_out() {
         let c = cache(1 << 20);
         let key = Bytes::from_static(b"k1");
@@ -512,6 +562,11 @@ mod tests {
         assert!(c.begin_fill(&key));
         c.complete_fill(&key, &Bytes::from(big));
         assert_eq!(c.lookup(&key), None);
+        let huge_key = Bytes::from(vec![b'k'; (1 << 20) + 1]);
+        assert!(c.begin_fill(&huge_key));
+        c.complete_fill(&huge_key, &Bytes::from_static(b"$1\r\nv\r\n"));
+        assert_eq!(c.lookup(&huge_key), None);
+        assert_eq!(c.hot_bytes.get(), 0);
     }
 
     #[test]

@@ -1,8 +1,7 @@
 //! Client sessions: dispatch, ordered replies, MULTI, pubsub, redirects.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::BuildHasherDefault;
+use std::collections::{HashSet, VecDeque};
 use std::io::IoSlice;
 use std::rc::Rc;
 
@@ -209,6 +208,8 @@ struct InFlight {
     frame: Bytes,
     expect: u32,
     retried: bool,
+    // key of a cache fill this reply completes
+    fill: Option<Bytes>,
 }
 
 // sequences are allocated monotonically, so the ring stays sorted
@@ -230,7 +231,8 @@ struct WriterLink {
     // pre-allocated sequences for pending pubsub confirmations, in order
     ack_seqs: RefCell<VecDeque<u64>>,
     acks_drained: tokio::sync::Notify,
-    fills: FillTickets,
+    // in-flight fills; the reply path skips the ring search at zero
+    fills_armed: Cell<usize>,
 }
 // pending protocol flips; `armed` keeps the hot path off the RefCell
 #[derive(Default)]
@@ -258,29 +260,6 @@ impl ProtoSwitchQueue {
             q.pop_front();
             self.armed.set(self.armed.get() - 1);
         }
-    }
-}
-
-// cache fills awaiting their reply; `armed` keeps the reply path off the map
-#[derive(Default)]
-struct FillTickets {
-    armed: Cell<usize>,
-    map: RefCell<HashMap<u64, Bytes, BuildHasherDefault<crate::cache::KeyHasher>>>,
-}
-
-impl FillTickets {
-    fn arm(&self, seq: u64, key: Bytes) {
-        self.map.borrow_mut().insert(seq, key);
-        self.armed.set(self.armed.get() + 1);
-    }
-
-    fn take(&self, seq: u64) -> Option<Bytes> {
-        if self.armed.get() == 0 {
-            return None;
-        }
-        let key = self.map.borrow_mut().remove(&seq)?;
-        self.armed.set(self.armed.get() - 1);
-        Some(key)
     }
 }
 
@@ -359,12 +338,14 @@ impl Session {
             self.queue_multi(spec, frame, argc);
             return;
         }
+        // writes drop their keys before they are queued: read-your-writes
         if let Some(cache) = &self.shared.cache
             && spec.is_write()
+            && spec.kind != Kind::Single
         {
             match spec.kind {
                 Kind::Flushall => cache.clear(),
-                _ => invalidate_keys(cache, spec, &frame, argc),
+                _ => write_keys(spec, &frame, argc, |k| cache.invalidate(k)),
             }
         }
         match spec.kind {
@@ -372,21 +353,37 @@ impl Session {
                 Some(key) => {
                     let slot = crc16::slot(key);
                     let seq = self.alloc_seq();
-                    if let Some(cache) = &self.shared.cache
-                        && spec.flags & command::FLAG_CACHE != 0
-                    {
-                        if let Some(hit) = cache.lookup(key) {
-                            stats::bump(&self.shared.stats.workers[self.shared.worker].cache_hits);
-                            self.emit_at(seq, hit);
-                            return;
-                        }
-                        stats::bump(&self.shared.stats.workers[self.shared.worker].cache_misses);
-                        let key = frame.slice_ref(key);
-                        if cache.begin_fill(&key) {
-                            self.link.fills.arm(seq, key);
+                    let mut fill = None;
+                    if let Some(cache) = &self.shared.cache {
+                        if spec.is_write() {
+                            if spec.first_key == 1
+                                && spec.last_key == 1
+                                && spec.flags & command::FLAG_STORE == 0
+                            {
+                                cache.invalidate(key);
+                            } else {
+                                write_keys(spec, &frame, argc, |k| cache.invalidate(k));
+                            }
+                        } else if spec.flags & command::FLAG_CACHE != 0 {
+                            if let Some(hit) = cache.lookup(key) {
+                                stats::bump(
+                                    &self.shared.stats.workers[self.shared.worker].cache_hits,
+                                );
+                                self.emit_at(seq, hit);
+                                return;
+                            }
+                            stats::bump(
+                                &self.shared.stats.workers[self.shared.worker].cache_misses,
+                            );
+                            let key = frame.slice_ref(key);
+                            if cache.begin_fill(&key) {
+                                fill = Some(key);
+                            }
                         }
                     }
-                    if let Some(cold) = self.route_single(seq, slot, spec.is_readonly(), frame) {
+                    if let Some(cold) =
+                        self.route_single(seq, slot, spec.is_readonly(), frame, fill)
+                    {
                         cold.flush().await;
                     }
                 }
@@ -395,14 +392,16 @@ impl Session {
             Kind::Local => self.handle_local(spec, frame, argc),
             Kind::Exec => Box::pin(self.handle_exec()).await,
             Kind::AnyMaster => self.forward_any_master(frame).await,
-            Kind::MultiSum | Kind::Mget | Kind::Mset => self.fan_out(spec, &frame, argc),
+            Kind::MultiSum | Kind::Mget | Kind::Mset => {
+                Box::pin(self.fan_out(spec, &frame, argc)).await
+            }
             Kind::Blocking => self.forward_blocking(spec, frame, argc),
             Kind::Eval => Box::pin(self.forward_eval(frame, argc)).await,
             Kind::Xread => Box::pin(self.forward_xread(spec, frame, argc)).await,
             Kind::Subscribe => self.enter_pubsub(spec, frame, argc),
             Kind::Scan => self.run_scan(frame, argc),
-            Kind::Dbsize => self.run_broadcast(frame, true),
-            Kind::Flushall => self.run_broadcast(frame, false),
+            Kind::Dbsize => Box::pin(self.run_broadcast(frame, true)).await,
+            Kind::Flushall => Box::pin(self.run_broadcast(frame, false)).await,
         }
     }
 
@@ -535,6 +534,7 @@ impl Session {
         slot: u16,
         readonly: bool,
         frame: Bytes,
+        fill: Option<Bytes>,
     ) -> Option<Box<ColdSend>> {
         let pipe = {
             let topo = self.topo();
@@ -546,7 +546,7 @@ impl Session {
             };
             self.cached_pipe(&topo, idx, is_replica)
         };
-        self.track_inflight(seq, &frame, 1);
+        self.track_inflight(seq, &frame, 1, fill);
         self.queue_at(&pipe, seq, frame, 1)
     }
 
@@ -556,12 +556,16 @@ impl Session {
         }
     }
 
-    fn track_inflight(&self, seq: u64, frame: &Bytes, expect: u32) {
+    fn track_inflight(&self, seq: u64, frame: &Bytes, expect: u32, fill: Option<Bytes>) {
+        if fill.is_some() {
+            self.link.fills_armed.set(self.link.fills_armed.get() + 1);
+        }
         self.link.inflight.borrow_mut().push_back(InFlight {
             seq,
             frame: frame.clone(),
             expect,
             retried: false,
+            fill,
         });
     }
 
@@ -577,14 +581,6 @@ impl Session {
             } else {
                 None
             };
-            if let Some(cache) = &self.shared.cache
-                && numkeys >= 1
-                && 3 + numkeys as usize <= argc
-            {
-                for key in &args[3..3 + numkeys as usize] {
-                    cache.invalidate(key);
-                }
-            }
             (numkeys, slot)
         };
         if numkeys < 0 || 3 + numkeys as usize > argc {
@@ -599,7 +595,7 @@ impl Session {
         let Some(pipe) = self.owner_pipe(seq, slot) else {
             return;
         };
-        self.track_inflight(seq, &frame, 1);
+        self.track_inflight(seq, &frame, 1, None);
         self.send_at(&pipe, seq, frame, 1).await;
     }
 
@@ -632,7 +628,7 @@ impl Session {
             return;
         }
         let seq = self.alloc_seq();
-        if let Some(cold) = self.route_single(seq, slot, spec.is_readonly(), frame) {
+        if let Some(cold) = self.route_single(seq, slot, spec.is_readonly(), frame, None) {
             cold.flush().await;
         }
     }
@@ -658,7 +654,7 @@ impl Session {
         blocking.push((seq, task));
     }
 
-    fn fan_out(&self, spec: &Spec, frame: &Bytes, argc: usize) {
+    async fn fan_out(&self, spec: &Spec, frame: &Bytes, argc: usize) {
         let seq = self.alloc_seq();
         let readonly = spec.is_readonly();
         let mode = self.shared.cfg.slave_mode;
@@ -710,14 +706,14 @@ impl Session {
             Kind::Mset => Merge::Ok,
             _ => Merge::Sum,
         };
+        // every part is queued before this returns, so later commands stay behind it
+        let mut receivers = Vec::with_capacity(parts.len());
+        for (part, pipe) in parts.iter().zip(pipes) {
+            // the clone retains the frame for a possible redirect resend
+            receivers.push(scatter_pipe(pipe, part.frame.clone()).await);
+        }
         // detached deliberately: completion is bounded by backend replies.
         tokio::task::spawn_local(async move {
-            let mut receivers = Vec::with_capacity(parts.len());
-            for (part, pipe) in parts.iter().zip(pipes) {
-                // the clone retains the frame for a possible redirect resend
-                let rx = scatter_pipe(pipe, part.frame.clone()).await;
-                receivers.push(rx);
-            }
             let mut results: Vec<(Vec<usize>, Bytes)> = Vec::with_capacity(parts.len());
             let mut redirected: Vec<(multikey::Part, bool, String)> = Vec::new();
             for (part, rx) in parts.into_iter().zip(receivers) {
@@ -803,20 +799,18 @@ impl Session {
         });
     }
 
-    fn run_broadcast(&self, frame: Bytes, sum: bool) {
+    async fn run_broadcast(&self, frame: Bytes, sum: bool) {
         let seq = self.alloc_seq();
         let shared = self.shared.clone();
         let reply_q = self.reply_q.clone();
-        let id = self.id;
+        let topo = shared.topo.load_full();
+        let mut receivers = Vec::with_capacity(topo.masters.len());
+        for &midx in &topo.masters {
+            let addr = &topo.nodes[midx as usize].addr;
+            receivers.push(scatter_one(&shared, addr, self.id, false, None, frame.clone()).await);
+        }
         // detached deliberately: completion is bounded by backend replies.
         tokio::task::spawn_local(async move {
-            let topo = shared.topo.load_full();
-            let mut receivers = Vec::with_capacity(topo.masters.len());
-            for &midx in &topo.masters {
-                let addr = &topo.nodes[midx as usize].addr;
-                let rx = scatter_one(&shared, addr, id, false, None, frame.clone()).await;
-                receivers.push(rx);
-            }
             let mut replies: Vec<Bytes> = Vec::with_capacity(receivers.len());
             for rx in receivers {
                 replies.push(recv_or_lost(rx).await);
@@ -878,6 +872,11 @@ impl Session {
             Some(slot) => {
                 state.slot = Some(slot);
                 state.bytes += frame.len();
+                if self.shared.cache.is_some() && spec.is_write() {
+                    write_keys(spec, &frame, argc, |k| {
+                        state.write_keys.push(frame.slice_ref(k))
+                    });
+                }
                 state.frames.push(frame);
                 drop(guard);
                 self.emit_local(Bytes::from_static(b"+QUEUED\r\n"));
@@ -944,6 +943,7 @@ impl Session {
                         *self.multi.borrow_mut() = Some(MultiState {
                             slot: None,
                             frames: Vec::new(),
+                            write_keys: Vec::new(),
                             bytes: 0,
                             aborted: false,
                         });
@@ -980,17 +980,8 @@ impl Session {
             return;
         }
         if let Some(cache) = &self.shared.cache {
-            for f in &state.frames {
-                let argc = match resp::scan_int_line(f, 1) {
-                    Some((n, _)) if n > 0 => n as usize,
-                    _ => continue,
-                };
-                let spec = resp::Args::new(f, argc).next().and_then(command::lookup);
-                if let Some(spec) = spec
-                    && spec.is_write()
-                {
-                    invalidate_keys(cache, spec, f, argc);
-                }
+            for k in &state.write_keys {
+                cache.invalidate(k);
             }
         }
         let seq = self.alloc_seq();
@@ -1006,7 +997,7 @@ impl Session {
         blob.extend_from_slice(b"*1\r\n$4\r\nEXEC\r\n");
         let expect = state.frames.len() as u32 + 2;
         let blob = Bytes::from(blob);
-        self.track_inflight(seq, &blob, expect);
+        self.track_inflight(seq, &blob, expect, None);
         self.send_at(&pipe, seq, blob, expect).await;
     }
 
@@ -1363,6 +1354,7 @@ impl ColdSend {
 struct MultiState {
     slot: Option<u16>,
     frames: Vec<Bytes>,
+    write_keys: Vec<Bytes>,
     bytes: usize,
     aborted: bool,
 }
@@ -1568,16 +1560,36 @@ fn collect_args(frame: &Bytes, argc: usize) -> Vec<&[u8]> {
     resp::Args::new(frame, argc).collect()
 }
 
-// writes drop their declared keys from the cache for read-your-writes
-fn invalidate_keys(cache: &crate::cache::ReplyCache, spec: &Spec, frame: &Bytes, argc: usize) {
+// keys a write mutates: the declared range, STORE destinations, script keys
+fn write_keys(spec: &Spec, frame: &Bytes, argc: usize, mut f: impl FnMut(&[u8])) {
     let mut args = resp::Args::new(frame, argc);
+    if spec.kind == Kind::Eval {
+        let numkeys: usize = args
+            .nth(2)
+            .and_then(|a| std::str::from_utf8(a).ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        for key in args.take(numkeys) {
+            f(key);
+        }
+        return;
+    }
     let mut cur = 0;
     for want in key_indices(spec, argc) {
         let Some(key) = args.nth(want - cur) else {
             return;
         };
-        cache.invalidate(key);
+        f(key);
         cur = want + 1;
+    }
+    if spec.flags & command::FLAG_STORE != 0 {
+        let mut dest_next = false;
+        for a in args {
+            if dest_next {
+                f(a);
+            }
+            dest_next = a.eq_ignore_ascii_case(b"store") || a.eq_ignore_ascii_case(b"storedist");
+        }
     }
 }
 
@@ -1914,8 +1926,10 @@ async fn write_loop(
             self.reply.close();
             mark_closed(self.link);
             if let Some(cache) = &self.shared.cache {
-                for (_, key) in self.link.fills.map.borrow_mut().drain() {
-                    cache.abandon_fill(&key);
+                for e in self.link.inflight.borrow_mut().iter_mut() {
+                    if let Some(key) = e.fill.take() {
+                        cache.abandon_fill(&key);
+                    }
                 }
             }
             stats::bump(&self.shared.stats.workers[self.shared.worker].writers_exited);
@@ -1988,11 +2002,6 @@ async fn write_loop(
                 if seq < next_emit {
                     continue;
                 }
-                if let Some(key) = link.fills.take(seq)
-                    && let Some(cache) = &shared.cache
-                {
-                    cache.complete_fill(&key, &frame);
-                }
                 if frame.first() == Some(&b'-')
                     && (frame.starts_with(b"-MOVED ") || frame.starts_with(b"-ASK "))
                 {
@@ -2037,6 +2046,12 @@ async fn write_loop(
                     // clients believe the proxy owns every slot: never leak redirects
                     frame = Bytes::from_static(ERR_TRYAGAIN);
                 }
+                if link.fills_armed.get() > 0
+                    && let Some(key) = take_fill(&link, seq)
+                    && let Some(cache) = &shared.cache
+                {
+                    cache.complete_fill(&key, &frame);
+                }
                 if seq == next_emit {
                     link.proto_switches.apply(next_emit, &mut cur_proto);
                     ready.push(convert_nil(frame, cur_proto));
@@ -2080,7 +2095,12 @@ async fn write_loop(
         if next_emit > swept_to {
             let mut inf = link.inflight.borrow_mut();
             while inf.front().is_some_and(|e| e.seq < next_emit) {
-                inf.pop_front();
+                if let Some(key) = inf.pop_front().and_then(|e| e.fill)
+                    && let Some(cache) = &shared.cache
+                {
+                    link.fills_armed.set(link.fills_armed.get() - 1);
+                    cache.abandon_fill(&key);
+                }
             }
             swept_to = next_emit;
         }
@@ -2106,6 +2126,15 @@ async fn write_loop(
             return;
         }
     }
+}
+
+// a redirect retry leaves the fill in place for the retried reply
+fn take_fill(link: &WriterLink, seq: u64) -> Option<Bytes> {
+    let mut inf = link.inflight.borrow_mut();
+    let idx = inf.binary_search_by_key(&seq, |e| e.seq).ok()?;
+    let key = inf[idx].fill.take()?;
+    link.fills_armed.set(link.fills_armed.get() - 1);
+    Some(key)
 }
 
 // retryable redirects: single-reply requests always, multi-reply blobs only for MOVED
@@ -2189,6 +2218,35 @@ mod tests {
         assert_eq!(rename, vec![1, 2]);
         let ping: Vec<usize> = key_indices(spec("ping"), 1).collect();
         assert!(ping.is_empty());
+    }
+
+    #[test]
+    fn write_keys_cover_ranges_store_targets_and_scripts() {
+        let keys = |cmd: &[&str]| {
+            let args: Vec<&[u8]> = cmd.iter().map(|a| a.as_bytes()).collect();
+            let mut raw = Vec::new();
+            resp::write_command(&mut raw, &args);
+            let frame = Bytes::from(raw);
+            let mut out: Vec<String> = Vec::new();
+            write_keys(spec(cmd[0]), &frame, cmd.len(), |k| {
+                out.push(String::from_utf8_lossy(k).into_owned())
+            });
+            out
+        };
+        assert_eq!(keys(&["set", "k", "v"]), ["k"]);
+        assert_eq!(keys(&["mset", "a", "1", "b", "2"]), ["a", "b"]);
+        assert_eq!(keys(&["rename", "a", "b"]), ["a", "b"]);
+        assert_eq!(
+            keys(&["sort", "src", "alpha", "STORE", "dst"]),
+            ["src", "dst"]
+        );
+        assert_eq!(
+            keys(&["georadius", "g", "0", "0", "1", "km", "storedist", "d"]),
+            ["g", "d"]
+        );
+        assert_eq!(keys(&["eval", "return 1", "2", "a", "b", "c"]), ["a", "b"]);
+        assert_eq!(keys(&["eval", "return 1", "0"]), Vec::<String>::new());
+        assert_eq!(keys(&["eval", "return 1", "9", "a"]), ["a"]);
     }
 
     #[test]

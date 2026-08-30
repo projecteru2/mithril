@@ -305,6 +305,15 @@ fn config_pairs(cfg: &Config) -> Vec<(&'static str, String)> {
         ("bootstrap", cfg.bootstrap.join(",")),
         ("backend-conns", cfg.backend_conns.to_string()),
         ("backend-sharding", yesno(cfg.backend_sharding).to_string()),
+        ("reply-cache", yesno(cfg.reply_cache).to_string()),
+        (
+            "reply-cache-max-bytes",
+            cfg.reply_cache_max_bytes.to_string(),
+        ),
+        (
+            "reply-cache-max-age-secs",
+            cfg.reply_cache_max_age_secs.to_string(),
+        ),
         (
             "requirepass",
             if cfg.requirepass.is_empty() {

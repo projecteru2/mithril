@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use bytes::BytesMut;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
@@ -474,24 +474,9 @@ async fn fetch_from(cfg: &Config, addr: &str) -> Result<Topology, String> {
         .await
         .map_err(|e| e.to_string())?;
     let mut buf = BytesMut::with_capacity(crate::backend::READ_CHUNK);
-    loop {
-        match resp::scan_value(&buf) {
-            resp::Scan::Complete(len) => {
-                let frame = buf.split_to(len);
-                if frame.first() == Some(&b'-') {
-                    return Err(String::from_utf8_lossy(&frame).trim_end().to_string());
-                }
-                let text = bulk_text(&frame).ok_or("unexpected CLUSTER NODES reply")?;
-                return Topology::parse(text);
-            }
-            resp::Scan::Invalid(e) => return Err(e.to_string()),
-            resp::Scan::Incomplete => {}
-        }
-        let n = stream.read_buf(&mut buf).await.map_err(|e| e.to_string())?;
-        if n == 0 {
-            return Err("closed while reading CLUSTER NODES".to_string());
-        }
-    }
+    let frame = crate::backend::read_reply(&mut stream, &mut buf).await?;
+    let text = bulk_text(&frame).ok_or("unexpected CLUSTER NODES reply")?;
+    Topology::parse(text)
 }
 
 fn bulk_text(frame: &[u8]) -> Option<&str> {
