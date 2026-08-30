@@ -18,7 +18,7 @@ pub struct Part {
 
 /// Multiply-fold hasher for u16 slot keys.
 #[derive(Default)]
-struct SlotHasher(u64);
+pub(crate) struct SlotHasher(u64);
 
 impl std::hash::Hasher for SlotHasher {
     fn finish(&self) -> u64 {

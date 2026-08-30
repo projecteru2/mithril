@@ -1,7 +1,8 @@
 //! Client sessions: dispatch, ordered replies, MULTI, pubsub, redirects.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::BuildHasherDefault;
 use std::io::IoSlice;
 use std::rc::Rc;
 
@@ -279,7 +280,7 @@ struct Session {
     closing: Cell<bool>,
     conns: RefCell<ConnCache>,
     topo_cache: RefCell<std::sync::Arc<Topology>>,
-    fanouts: RefCell<Vec<Rc<FanoutGate>>>,
+    fanouts: Rc<RefCell<FanoutGates>>,
 }
 
 impl Session {
@@ -352,8 +353,9 @@ impl Session {
             Kind::Single => match it.nth(spec.first_key as usize - 1) {
                 Some(key) => {
                     let slot = crc16::slot(key);
-                    if self.fanouts_pending() {
-                        Box::pin(self.wait_fanouts(&[slot])).await;
+                    if self.fanouts_pending() && !Box::pin(self.wait_fanouts(&[slot])).await {
+                        self.closing.set(true);
+                        return;
                     }
                     let seq = self.alloc_seq();
                     let mut fill = None;
@@ -601,8 +603,10 @@ impl Session {
         }
         if let Some(slot) = slot
             && self.fanouts_pending()
+            && !self.wait_fanouts(&[slot]).await
         {
-            self.wait_fanouts(&[slot]).await;
+            self.closing.set(true);
+            return;
         }
         let seq = self.alloc_seq();
         let Some(pipe) = self.owner_pipe(seq, slot) else {
@@ -636,8 +640,9 @@ impl Session {
             self.emit_error("ERR Unbalanced XREAD list of streams");
             return;
         };
-        if self.fanouts_pending() {
-            self.wait_fanouts(&[slot]).await;
+        if self.fanouts_pending() && !self.wait_fanouts(&[slot]).await {
+            self.closing.set(true);
+            return;
         }
         if blocking {
             self.spawn_blocking(slot, frame);
@@ -654,8 +659,9 @@ impl Session {
             self.emit_error("ERR missing key");
             return;
         };
-        if self.fanouts_pending() {
-            self.wait_fanouts(&[slot]).await;
+        if self.fanouts_pending() && !self.wait_fanouts(&[slot]).await {
+            self.closing.set(true);
+            return;
         }
         self.spawn_blocking(slot, frame);
     }
@@ -677,22 +683,24 @@ impl Session {
         !self.fanouts.borrow().is_empty()
     }
 
-    // cold: only sessions with a fan-out in flight get here
-    async fn wait_fanouts(&self, slots: &[u16]) {
-        loop {
-            let gate = {
-                let mut gates = self.fanouts.borrow_mut();
-                gates.retain(|g| !g.done.get());
-                gates
-                    .iter()
-                    .find(|g| slots.iter().any(|s| g.slots.contains(s)))
-                    .cloned()
-            };
-            let Some(gate) = gate else {
-                return;
-            };
-            gate.notify.notified().await;
+    // cold: only sessions with a fan-out in flight get here; false once the
+    // session is closed, so the caller drops the command instead of sending it
+    async fn wait_fanouts(&self, slots: &[u16]) -> bool {
+        for slot in slots {
+            loop {
+                if self.link.closed.get() {
+                    return false;
+                }
+                let Some(gate) = self.fanouts.borrow().get(slot).cloned() else {
+                    break;
+                };
+                tokio::select! {
+                    _ = gate.notified() => {}
+                    _ = self.link.closed_notify.notified() => return false,
+                }
+            }
         }
+        true
     }
 
     async fn fan_out(&self, spec: &Spec, frame: &Bytes, argc: usize) {
@@ -748,15 +756,18 @@ impl Session {
                 return;
             }
         };
-        if self.fanouts_pending() {
-            self.wait_fanouts(&slots).await;
+        if self.fanouts_pending() && !self.wait_fanouts(&slots).await {
+            self.closing.set(true);
+            return;
         }
-        let gate = Rc::new(FanoutGate {
-            slots,
-            done: Cell::new(false),
-            notify: tokio::sync::Notify::new(),
-        });
-        self.fanouts.borrow_mut().push(gate.clone());
+        let gate = Rc::new(tokio::sync::Notify::new());
+        {
+            let mut gates = self.fanouts.borrow_mut();
+            for &slot in &slots {
+                gates.insert(slot, gate.clone());
+            }
+        }
+        let gates = self.fanouts.clone();
         let shared = self.shared.clone();
         let reply_q = self.reply_q.clone();
         let id = self.id;
@@ -790,8 +801,8 @@ impl Session {
                     None => results.push((part.positions, reply)),
                 }
             }
-            gate.done.set(true);
-            gate.notify.notify_waiters();
+            release_gates(&gates, &slots);
+            gate.notify_waiters();
             for (positions, rx) in retries {
                 results.push((positions, recv_or_lost(rx).await));
             }
@@ -1043,8 +1054,10 @@ impl Session {
         }
         if let Some(slot) = state.slot
             && self.fanouts_pending()
+            && !self.wait_fanouts(&[slot]).await
         {
-            self.wait_fanouts(&[slot]).await;
+            self.closing.set(true);
+            return;
         }
         let seq = self.alloc_seq();
         let Some(pipe) = self.owner_pipe(seq, state.slot) else {
@@ -1414,12 +1427,9 @@ impl ColdSend {
 }
 
 // a fan-out's redirect retries are queued by a detached task: same-slot
-// commands wait for its first round so their own retries cannot overtake it
-struct FanoutGate {
-    slots: Vec<u16>,
-    done: Cell<bool>,
-    notify: tokio::sync::Notify,
-}
+// commands wait for its first round so their own retries cannot overtake it.
+// a slot holds at most one pending gate: a new fan-out waits before inserting
+type FanoutGates = HashMap<u16, Rc<tokio::sync::Notify>, BuildHasherDefault<multikey::SlotHasher>>;
 
 // holds a fan-out write's keys against cache fills until the operation ends
 struct WriteMarks {
@@ -1544,7 +1554,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
             by_node: Vec::new(),
         }),
         topo_cache: RefCell::new(shared.topo.load_full()),
-        fanouts: RefCell::new(Vec::new()),
+        fanouts: Rc::new(RefCell::new(FanoutGates::default())),
     };
 
     let (close_tx, close_rx) = oneshot::channel::<u64>();
@@ -2222,6 +2232,17 @@ async fn write_loop(
         if close_now {
             return;
         }
+    }
+}
+
+// a drained registry gives back a burst's capacity, like ParkedRing
+fn release_gates(gates: &RefCell<FanoutGates>, slots: &[u16]) {
+    let mut g = gates.borrow_mut();
+    for slot in slots {
+        g.remove(slot);
+    }
+    if g.is_empty() && g.capacity() > 256 {
+        *g = FanoutGates::default();
     }
 }
 
