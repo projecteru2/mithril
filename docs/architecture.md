@@ -74,3 +74,36 @@ a dedicated connection (up to 512 per node) through an RAII lease whose drop
 either returns the connection to the idle pool or — if the command was
 abandoned mid-flight — closes it, so the backend cancels the block. Each
 subscribing client gets its own pubsub connection with its own relay task.
+
+## Reply cache
+
+`reply-cache yes` gives each worker a GET cache: two generations of
+`key -> reply frame` flipped under a byte budget, with a max-age backstop.
+A hit is emitted at the command's sequence like any other reply, so
+pipelining and ordering are untouched; a miss arms a fill ticket that the
+writer completes when the backend reply passes through.
+
+Coherence is the cluster's job, not a timer's. Each worker keeps one RESP3
+tracking connection per master and learns its client id; every shared
+backend connection on that worker enables `CLIENT TRACKING ON REDIRECT <id>
+OPTIN`, and a fill-armed GET is preceded by `CLIENT CACHING YES`, so a server
+tracks exactly the keys this proxy cached and sends one invalidation when
+such a key changes. Writes through the proxy invalidate their keys
+synchronously at dispatch (including STORE destinations, script keys and
+queued transaction keys), so a session always reads its own writes. A fill
+that races an invalidation is poisoned rather than cached; a key carries at
+most one fill ticket, and a fan-out write holds its keys until its detached
+task — redirect retries included — has finished.
+
+Losing a tracker, or a change in the master set, flushes the cache and
+pauses fills until every master is tracked again; a dead tracker's id is
+forgotten first so no new connection redirects at it. Under
+`backend-sharding` a node's tracker lives with its pipe on the owner worker,
+invalidations are broadcast to every worker through the fabric, and
+coverage is process-wide. Replica reads and redirect retries carry no
+opt-in and therefore never fill.
+
+A fan-out (MGET/MSET/DEL...) also gates its slots on the session until its
+first-round replies are in, so a later same-slot command cannot have its
+own redirect retry land before the fan-out's. Other slots and other
+sessions are unaffected; the hot path pays one emptiness check.

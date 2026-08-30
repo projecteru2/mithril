@@ -18,7 +18,7 @@ backend-conns 1
 # one process-wide pipe per node (deeper backend batches for unpipelined load)
 # backend-sharding no
 
-# worker-local GET reply cache, invalidated by RESP3 BCAST client tracking
+# worker-local GET reply cache, kept coherent by server-side key tracking
 # reply-cache no
 # reply-cache-max-bytes 64mb
 # reply-cache-max-age-secs 10

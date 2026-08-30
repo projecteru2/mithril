@@ -26,6 +26,11 @@ thread-per-core runtime and zero-copy frame forwarding.
   transparent MOVED/ASK retry verified against live slot migrations, and
   single-virtual-node cluster emulation so cluster-aware clients work
   unchanged against one endpoint
+- **Reply cache** — optional worker-local GET cache kept coherent by the
+  cluster itself: every backend connection redirects RESP3 key tracking to
+  a per-worker tracker and opts each cached read in, so the servers
+  invalidate exactly the keys the proxy holds; writes through the proxy
+  invalidate synchronously (read-your-writes), and coverage loss flushes
 - **RESP2 + RESP3** — per-client `HELLO` negotiation, push-type pubsub frames,
   null conversion; backends stay RESP2
 - **The hard paths done right** — MULTI/EXEC as native transactions,
@@ -64,9 +69,10 @@ See [`mithril.conf.sample`](mithril.conf.sample) and the
 make test lint fmt-check   # the CI gate
 ```
 
-The integration suite lives in [`it/`](it/): 37 dockerized tests driving a
+The integration suite lives in [`it/`](it/): 43 dockerized tests driving a
 real 3-master/3-replica cluster through the proxy with redis-py, run against
-redis 6.2 through 8.2 and valkey 9.1.
+redis 6.2 through 8.2 and valkey 9.1 in every mode combination
+(`backend-sharding`, `reply-cache`).
 
 ## License
 
