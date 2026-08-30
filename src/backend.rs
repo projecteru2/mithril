@@ -309,12 +309,13 @@ pub(crate) struct Pending<S> {
 // pairs buffered replies against the pipeline; Err is a protocol error
 pub(crate) fn pair_replies<S>(
     buf: &mut BytesMut,
+    cur: &mut resp::Cursor,
     pending: &mut VecDeque<Pending<S>>,
     front_err: &mut Option<Bytes>,
     deliver: impl Fn(S, Bytes),
 ) -> Result<(), &'static str> {
     loop {
-        match resp::scan_value(buf) {
+        match resp::scan_value_at(buf, cur) {
             resp::Scan::Complete(len) => {
                 let frame = buf.split_to(len).freeze();
                 match pending.front_mut() {
@@ -381,9 +382,10 @@ async fn run_conn(
     let mut batch: Vec<Outbound> = Vec::with_capacity(BATCH);
     let mut frames: Vec<Bytes> = Vec::with_capacity(BATCH * 2);
     let mut buf = BytesMut::with_capacity(READ_INIT);
+    let mut cur = resp::Cursor::default();
     let mut tx_open = true;
     'io: loop {
-        if let Err(e) = pair_replies(&mut buf, &mut pending, &mut front_err, deliver) {
+        if let Err(e) = pair_replies(&mut buf, &mut cur, &mut pending, &mut front_err, deliver) {
             log_debug!("backend {addr} protocol error: {e}");
             break 'io;
         }

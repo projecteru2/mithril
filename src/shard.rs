@@ -202,9 +202,10 @@ async fn run_shard_conn(
     let mut batch: Vec<RemoteOutbound> = Vec::with_capacity(BATCH);
     let mut frames: Vec<Bytes> = Vec::with_capacity(BATCH * 2);
     let mut buf = bytes::BytesMut::with_capacity(crate::backend::READ_INIT);
+    let mut cur = crate::resp::Cursor::default();
     'io: loop {
         if let Err(e) =
-            crate::backend::pair_replies(&mut buf, &mut pending, &mut front_err, deliver)
+            crate::backend::pair_replies(&mut buf, &mut cur, &mut pending, &mut front_err, deliver)
         {
             log_debug!("shard backend {addr} protocol error: {e}");
             break 'io;

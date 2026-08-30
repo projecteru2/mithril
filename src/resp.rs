@@ -35,6 +35,15 @@ pub enum ReqScan {
     Invalid(&'static str),
 }
 
+/// Resume point inside a top-level aggregate that is still arriving: a
+/// rescan after the next read starts at the first unverified element.
+#[derive(Default)]
+pub struct Cursor {
+    pos: usize,
+    left: usize,
+    total: usize,
+}
+
 /// Iterator over argument payload slices of a scanned array-form request.
 pub struct Args<'a> {
     buf: &'a [u8],
@@ -90,47 +99,119 @@ type BulkScan = Option<Result<Bulk, &'static str>>;
 
 /// Scans one complete RESP value of any protocol version at `buf[0..]`.
 pub fn scan_value(buf: &[u8]) -> Scan {
-    scan_at(buf, 0, 0).unwrap_or(Scan::Incomplete)
+    scan_value_at(buf, &mut Cursor::default())
+}
+
+/// [`scan_value`] resuming from `cur`, which must belong to this buffer start.
+pub fn scan_value_at(buf: &[u8], cur: &mut Cursor) -> Scan {
+    let (mut pos, mut left) = if cur.left > 0 {
+        (cur.pos, cur.left)
+    } else {
+        let Some(&kind) = buf.first() else {
+            return Scan::Incomplete;
+        };
+        if !matches!(kind, b'*' | b'~' | b'>' | b'%') {
+            return scan_at(buf, 0, 0).unwrap_or(Scan::Incomplete);
+        }
+        let Some((n, after)) = scan_int_line(buf, 1) else {
+            return Scan::Incomplete;
+        };
+        if n < -1 {
+            return Scan::Invalid("bad aggregate length");
+        }
+        let items = if n <= 0 {
+            0
+        } else if kind == b'%' {
+            match (n as usize).checked_mul(2) {
+                Some(v) => v,
+                None => return Scan::Incomplete,
+            }
+        } else {
+            n as usize
+        };
+        if items == 0 {
+            return Scan::Complete(after);
+        }
+        (after, items)
+    };
+    while left > 0 {
+        match scan_at(buf, pos, 1) {
+            Some(Scan::Complete(len)) => {
+                pos += len;
+                left -= 1;
+            }
+            Some(other) => {
+                *cur = Cursor::default();
+                return other;
+            }
+            None => {
+                cur.pos = pos;
+                cur.left = left;
+                return Scan::Incomplete;
+            }
+        }
+    }
+    *cur = Cursor::default();
+    Scan::Complete(pos)
 }
 
 /// Scans one client request at `buf[0..]` (array of bulk strings, or inline).
 pub fn scan_request(buf: &[u8]) -> ReqScan {
-    let Some(&first) = buf.first() else {
-        return ReqScan::Incomplete;
-    };
-    if first != b'*' {
-        return scan_inline(buf);
-    }
-    let Some((argc, mut pos)) = scan_int_line(buf, 1) else {
-        return if buf.len() > MAX_INLINE_LEN {
-            ReqScan::Invalid("request header too long")
-        } else {
-            ReqScan::Incomplete
+    scan_request_at(buf, &mut Cursor::default())
+}
+
+/// [`scan_request`] resuming from `cur`, which must belong to this buffer start.
+pub fn scan_request_at(buf: &[u8], cur: &mut Cursor) -> ReqScan {
+    let (mut pos, mut left, argc) = if cur.left > 0 {
+        (cur.pos, cur.left, cur.total)
+    } else {
+        let Some(&first) = buf.first() else {
+            return ReqScan::Incomplete;
         };
+        if first != b'*' {
+            return scan_inline(buf);
+        }
+        let Some((argc, pos)) = scan_int_line(buf, 1) else {
+            return if buf.len() > MAX_INLINE_LEN {
+                ReqScan::Invalid("request header too long")
+            } else {
+                ReqScan::Incomplete
+            };
+        };
+        if argc < 0 || argc as usize > MAX_ARGC {
+            return ReqScan::Invalid("bad argument count");
+        }
+        (pos, argc as usize, argc as usize)
     };
-    if argc < 0 || argc as usize > MAX_ARGC {
-        return ReqScan::Invalid("bad argument count");
-    }
-    for _ in 0..argc {
+    while left > 0 {
         // '=' verbatim bulks are reply-only; forwarding one breaks RESP2 backends
         if buf.get(pos) == Some(&b'=') {
+            *cur = Cursor::default();
             return ReqScan::Invalid("verbatim string in request");
         }
         match scan_bulk(buf, pos) {
             Some(Ok(b)) => {
                 if b.payload_end == b.next {
+                    *cur = Cursor::default();
                     return ReqScan::Invalid("null argument in request");
                 }
                 pos = b.next;
+                left -= 1;
             }
-            Some(Err(e)) => return ReqScan::Invalid(e),
-            None => return ReqScan::Incomplete,
+            Some(Err(e)) => {
+                *cur = Cursor::default();
+                return ReqScan::Invalid(e);
+            }
+            None => {
+                cur.pos = pos;
+                cur.left = left;
+                cur.total = argc;
+                return ReqScan::Incomplete;
+            }
         }
     }
-    ReqScan::Complete {
-        len: pos,
-        argc: argc as usize,
-    }
+    *cur = Cursor::default();
+    ReqScan::Complete { len: pos, argc }
 }
 
 /// Serializes argument slices as a RESP array of bulk strings into `out`.
@@ -532,6 +613,49 @@ mod tests {
             b"xZZ".to_vec()
         );
         assert_eq!(scan_request(b"PIN"), ReqScan::Incomplete);
+    }
+
+    #[test]
+    fn cursors_resume_partial_aggregates_and_requests() {
+        let reply = b"*3\r\n$2\r\nab\r\n:7\r\n*2\r\n+x\r\n$1\r\ny\r\n";
+        let mut cur = Cursor::default();
+        for end in 1..reply.len() {
+            assert_eq!(
+                scan_value_at(&reply[..end], &mut cur),
+                Scan::Incomplete,
+                "{end}"
+            );
+        }
+        assert!(
+            cur.pos > 0 && cur.left < 3,
+            "cursor advanced past verified elements"
+        );
+        assert_eq!(scan_value_at(reply, &mut cur), Scan::Complete(reply.len()));
+        assert_eq!(cur.left, 0);
+        let req = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\nhello\r\n";
+        let mut cur = Cursor::default();
+        for end in 1..req.len() {
+            assert_eq!(
+                scan_request_at(&req[..end], &mut cur),
+                ReqScan::Incomplete,
+                "{end}"
+            );
+        }
+        assert_eq!(
+            scan_request_at(req, &mut cur),
+            ReqScan::Complete {
+                len: req.len(),
+                argc: 3
+            }
+        );
+        let bad = b"*2\r\n$1\r\na\r\n$-1\r\n";
+        let mut cur = Cursor::default();
+        assert_eq!(scan_request_at(&bad[..9], &mut cur), ReqScan::Incomplete);
+        assert!(matches!(
+            scan_request_at(bad, &mut cur),
+            ReqScan::Invalid(_)
+        ));
+        assert_eq!(cur.left, 0, "an invalid frame clears the cursor");
     }
 
     #[test]

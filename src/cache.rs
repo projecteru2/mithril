@@ -613,9 +613,10 @@ async fn track_once(addr: &str, w: &Rc<Wiring>) -> Result<(), String> {
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut debt = 0u32;
     let mut keys: Vec<Bytes> = Vec::new();
+    let mut cur = resp::Cursor::default();
     loop {
         loop {
-            match resp::scan_value(&buf) {
+            match resp::scan_value_at(&buf, &mut cur) {
                 resp::Scan::Complete(len) => {
                     let frame = buf.split_to(len).freeze();
                     match frame.first() {

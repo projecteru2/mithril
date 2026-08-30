@@ -1760,6 +1760,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
     ));
 
     let mut buf = BytesMut::with_capacity(crate::backend::READ_INIT);
+    let mut cur = resp::Cursor::default();
     'main: loop {
         // a closing session must not let a half-open client keep executing writes
         if link.closed.get() {
@@ -1769,7 +1770,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
             if session.window_full() {
                 break;
             }
-            match resp::scan_request(&buf) {
+            match resp::scan_request_at(&buf, &mut cur) {
                 ReqScan::Complete { len, argc } => {
                     let frame = buf.split_to(len).freeze();
                     session.dispatch(frame, argc).await;
@@ -2117,10 +2118,11 @@ async fn pubsub_relay(
         }
     }));
     let mut buf = BytesMut::with_capacity(crate::backend::READ_INIT);
+    let mut cur = resp::Cursor::default();
     let mut last_ack: Option<u64> = None;
     'io: loop {
         loop {
-            match resp::scan_value(&buf) {
+            match resp::scan_value_at(&buf, &mut cur) {
                 resp::Scan::Complete(len) => {
                     let frame = buf.split_to(len).freeze();
                     let popped = (!is_publication(&frame))
