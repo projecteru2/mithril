@@ -24,7 +24,7 @@ use crate::backend::{
 };
 use crate::cache::{CACHING_FRAME, ReplyCache};
 use crate::command::{self, Kind, Spec};
-use crate::config::Config;
+use crate::config::{Config, Sharding};
 use crate::log_debug;
 use crate::multikey;
 use crate::resp::{self, ReqScan};
@@ -35,6 +35,11 @@ use crate::topology::Topology;
 use crate::{admin, crc16, route};
 
 const MAX_INFLIGHT: usize = 65536;
+// pipelining score: a local session shares at 0, a shared one returns at PIPELINED_LOCAL
+const PIPELINED_LOCAL: u8 = 4;
+const PIPELINED_MAX: u8 = 8;
+// an MGET with more keys than this is never cached: it would arm one ticket per key
+const MGET_CACHE_KEYS: usize = 64;
 const SUBS_LIMIT: usize = 32768;
 const PUBSUB_FORWARD_QUEUE: usize = 64;
 const PUBSUB_PUSH_WINDOW: usize = 4096;
@@ -220,7 +225,7 @@ struct InFlight {
     expect: u32,
     retried: bool,
     degraded: bool,
-    fill_key: Option<Bytes>,
+    fill: Option<Fill>,
 }
 
 // sequences are allocated monotonically, so the ring stays sorted
@@ -243,6 +248,8 @@ struct WriterLink {
     // in-flight fills; the reply path skips the ring search at zero
     fills_armed: Cell<usize>,
     next_seq: Cell<u64>,
+    // the session sends through the process-wide shard pipes
+    sharded: Cell<bool>,
     fanouts: RefCell<FanoutGates>,
     // slots seen migrating: their same-slot multi-key commands take the gated path
     migrating: RefCell<Vec<u16>>,
@@ -317,6 +324,8 @@ struct Session {
     closing: Cell<bool>,
     // a live relay can close the session while the reader is parked reading
     has_relay: Cell<bool>,
+    auto: bool,
+    pipelined: Cell<u8>,
     conns: RefCell<ConnCache>,
     topo_cache: RefCell<Arc<Topology>>,
 }
@@ -358,6 +367,9 @@ impl Session {
         if !self.authed.get() && spec.flags & command::FLAG_NO_AUTH == 0 {
             self.emit_error_frame(Bytes::from_static(ERR_NOAUTH));
             return;
+        }
+        if self.auto {
+            self.adapt_pipes();
         }
         if self.has_relay.get() {
             if !self.exit_pubsub_if_done().await {
@@ -423,8 +435,8 @@ impl Session {
                             }
                             stats::bump(&self.shared.wstats.cache_misses);
                             let key = frame.slice_ref(key);
-                            if cache.begin_fill(&key) {
-                                fill = Some(key);
+                            if self.may_fill() && cache.begin_fill(&key) {
+                                fill = Some(Fill::One(key));
                             }
                         }
                     }
@@ -522,6 +534,7 @@ impl Session {
             &topo.nodes[i].addr,
             self.id,
             is_replica,
+            self.link.sharded.get(),
         ));
     }
 
@@ -592,7 +605,7 @@ impl Session {
         slot: u16,
         readonly: bool,
         frame: Bytes,
-        mut fill: Option<Bytes>,
+        mut fill: Option<Fill>,
     ) -> Option<Box<ColdSend>> {
         let (pipe, is_replica) = {
             let topo = self.topo();
@@ -600,10 +613,10 @@ impl Session {
                 .with_rng(|r| route::pick(&topo, slot, readonly, self.shared.cfg.slave_mode, r));
             let routed = picked.and_then(|(idx, ro)| Some((self.cached_pipe(&topo, idx, ro)?, ro)));
             let Some(routed) = routed else {
-                if let Some(key) = &fill
+                if let Some(fill) = &fill
                     && let Some(cache) = &self.shared.cache
                 {
-                    cache.abandon_fill(key);
+                    fill.abandon(cache);
                 }
                 let err = if picked.is_some() {
                     ERR_BACKEND_LOST
@@ -617,10 +630,10 @@ impl Session {
         };
         // replica connections are untracked: their replies never fill
         if is_replica
-            && let Some(key) = fill.take()
+            && let Some(fill) = fill.take()
             && let Some(cache) = &self.shared.cache
         {
-            cache.abandon_fill(&key);
+            fill.abandon(cache);
         }
         let head = fill.is_some().then(|| Bytes::from_static(CACHING_FRAME));
         let expect = 1 + u32::from(head.is_some());
@@ -634,7 +647,7 @@ impl Session {
         }
     }
 
-    fn track_inflight(&self, seq: u64, frame: &Bytes, expect: u32, fill: Option<Bytes>) {
+    fn track_inflight(&self, seq: u64, frame: &Bytes, expect: u32, fill: Option<Fill>) {
         if fill.is_some() {
             self.link.fills_armed.set(self.link.fills_armed.get() + 1);
         }
@@ -644,7 +657,7 @@ impl Session {
             expect,
             retried: false,
             degraded: false,
-            fill_key: fill,
+            fill,
         });
     }
 
@@ -733,6 +746,25 @@ impl Session {
         blocking.push((seq, task));
     }
 
+    // an unpipelined session gains from the deeper batches of the shared pipe, a
+    // pipelined one from its worker-local connection; switch only while nothing is in flight
+    fn adapt_pipes(&self) {
+        let depth = self.outstanding();
+        let score = self.pipelined.get();
+        self.pipelined.set(pipelining_score(score, depth));
+        let sharded = self.link.sharded.get();
+        if depth == 0 && switch_pipes(sharded, score) && !self.fanouts_pending() {
+            self.link.sharded.set(!sharded);
+            self.conns.borrow_mut().by_node.clear();
+        }
+    }
+
+    // under auto sharding only the shared pipes carry tracking: a session on its
+    // worker-local connections reads the cache but never fills it
+    fn may_fill(&self) -> bool {
+        !self.auto || self.link.sharded.get()
+    }
+
     fn fanouts_pending(&self) -> bool {
         !self.link.fanouts.borrow().is_empty()
     }
@@ -777,7 +809,7 @@ impl Session {
     }
 
     // fast path: no gate pending and every pipe has room, so nothing awaits
-    fn fan_out(&self, spec: &Spec, frame: Bytes, argc: usize) -> Option<Cold<'_>> {
+    fn fan_out(&self, spec: &'static Spec, frame: Bytes, argc: usize) -> Option<Cold<'_>> {
         let seq = self.alloc_seq();
         if spec.kind == Kind::Mset && !(argc - 1).is_multiple_of(2) {
             self.emit_at(
@@ -795,17 +827,43 @@ impl Session {
                 {
                     write_keys(spec, &frame, argc, |k| cache.invalidate(k));
                 }
-                return self.send_single(seq, slot, spec.is_readonly(), frame);
+                // the cache is consulted only once no gate is pending on the slot
+                if self.fanouts_pending() {
+                    return Some(Box::pin(async move {
+                        if !self.wait_fanouts(&[slot]).await {
+                            self.closing.set(true);
+                            return;
+                        }
+                        if let Some(cold) = self.serve_single(seq, slot, spec, frame) {
+                            cold.flush().await;
+                        }
+                    }));
+                }
+                let cold = self.serve_single(seq, slot, spec, frame)?;
+                return Some(Box::pin(cold.flush()));
             }
         };
+        let cacheable = spec.flags & command::FLAG_CACHE != 0;
         let n = plan.parts.len();
         if self.fanouts_pending() || !plan.pipes.iter().all(|p| p.has_room(n)) {
-            return Some(Box::pin(self.fan_out_slow(plan)));
+            return Some(Box::pin(self.fan_out_slow(plan, cacheable)));
+        }
+        let mut plan = plan;
+        if self.cache_parts(&mut plan, cacheable) {
+            return None;
         }
         // has_room is a snapshot; a queue another worker filled meanwhile is awaited
         let mut receivers = Vec::with_capacity(n);
         for (i, (part, pipe)) in plan.parts.iter().zip(&plan.pipes).enumerate() {
-            let (staged, rx) = stage_one(pipe, None, part.frame.clone());
+            let head = match plan.cached.get(i) {
+                Some(PartCache::Hit(reply)) => {
+                    receivers.push(resolved(reply.clone()));
+                    continue;
+                }
+                Some(PartCache::Fill(_)) => Some(Bytes::from_static(CACHING_FRAME)),
+                _ => None,
+            };
+            let (staged, rx) = stage_one(pipe, head, part.frame.clone());
             receivers.push(rx);
             if let Err(staged) = staged.try_send() {
                 return Some(Box::pin(self.fan_out_resume(plan, receivers, i, staged)));
@@ -900,6 +958,7 @@ impl Session {
             seq,
             merge: merge_for(spec.kind).unwrap_or(Merge::Sum),
             degradable: degradable(spec),
+            cached: Vec::new(),
             parts,
             pipes,
             total,
@@ -908,13 +967,78 @@ impl Session {
         })
     }
 
-    async fn fan_out_slow(&self, plan: FanoutPlan) {
+    async fn fan_out_slow(&self, mut plan: FanoutPlan, cacheable: bool) {
         if self.fanouts_pending() && !self.wait_fanouts(&plan.slots).await {
             self.closing.set(true);
             return;
         }
+        if self.cache_parts(&mut plan, cacheable) {
+            return;
+        }
         let receivers = Vec::with_capacity(plan.parts.len());
         self.scatter_rest(plan, receivers, 0).await;
+    }
+
+    // a same-slot multi-key command sent as one request; a cacheable one meets the cache here
+    fn serve_single(
+        &self,
+        seq: u64,
+        slot: u16,
+        spec: &'static Spec,
+        frame: Bytes,
+    ) -> Option<Box<ColdSend>> {
+        let mut fill = None;
+        if spec.flags & command::FLAG_CACHE != 0
+            && let Some(cache) = &self.shared.cache
+        {
+            match mget_cache(cache, &frame, self.may_fill()) {
+                PartCache::Hit(reply) => {
+                    stats::bump(&self.shared.wstats.cache_hits);
+                    self.emit_at(seq, reply);
+                    return None;
+                }
+                PartCache::Fill(keys) => fill = Some(Fill::Many(keys)),
+                PartCache::Backend => {}
+            }
+            stats::bump(&self.shared.wstats.cache_misses);
+        }
+        self.route_single(seq, slot, spec.is_readonly(), frame, fill)
+    }
+
+    // meets the cache per part once no gate is pending; true when every part hit and
+    // the merged reply went out. Replica-routed parts never fill: those connections
+    // carry no tracking
+    fn cache_parts(&self, plan: &mut FanoutPlan, cacheable: bool) -> bool {
+        let Some(cache) = &self.shared.cache else {
+            return false;
+        };
+        if !cacheable || plan.total > MGET_CACHE_KEYS {
+            return false;
+        }
+        let may_fill = self.may_fill();
+        plan.cached = plan
+            .parts
+            .iter()
+            .map(|p| mget_cache(cache, &p.frame, may_fill && !p.readonly))
+            .collect();
+        if !plan.cached.iter().all(|c| matches!(c, PartCache::Hit(_))) {
+            stats::bump(&self.shared.wstats.cache_misses);
+            return false;
+        }
+        stats::bump(&self.shared.wstats.cache_hits);
+        let parts = std::mem::take(&mut plan.parts);
+        let cached = std::mem::take(&mut plan.cached);
+        let hits: Vec<(Vec<usize>, Bytes)> = parts
+            .into_iter()
+            .zip(cached)
+            .map(|(part, c)| match c {
+                PartCache::Hit(reply) => (part.positions, reply),
+                _ => (part.positions, Bytes::new()),
+            })
+            .collect();
+        let merged = multikey::merge_mget(plan.total, &hits, &[]).unwrap_or_else(|e| e);
+        self.emit_at(plan.seq, merged);
+        true
     }
 
     async fn scatter_rest(
@@ -923,8 +1047,16 @@ impl Session {
         mut receivers: Vec<oneshot::Receiver<Bytes>>,
         from: usize,
     ) {
-        for (part, pipe) in plan.parts.iter().zip(&plan.pipes).skip(from) {
-            receivers.push(scatter_pipe(pipe, part.frame.clone()).await);
+        for (i, (part, pipe)) in plan.parts.iter().zip(&plan.pipes).enumerate().skip(from) {
+            let head = match plan.cached.get(i) {
+                Some(PartCache::Hit(reply)) => {
+                    receivers.push(resolved(reply.clone()));
+                    continue;
+                }
+                Some(PartCache::Fill(_)) => Some(Bytes::from_static(CACHING_FRAME)),
+                _ => None,
+            };
+            receivers.push(scatter_pipe(pipe, head, part.frame.clone()).await);
         }
         self.launch_fanout(plan, receivers);
     }
@@ -935,6 +1067,7 @@ impl Session {
             seq,
             merge,
             degradable,
+            cached,
             parts,
             pipes: _,
             total,
@@ -955,11 +1088,18 @@ impl Session {
         // detached deliberately: completion is bounded by backend replies
         tokio::task::spawn_local(async move {
             let _marks = marks;
+            let sharded = link.sharded.get();
             let mut results: Vec<(Vec<usize>, Bytes)> = Vec::with_capacity(parts.len());
             let mut retries: Vec<(multikey::Part, oneshot::Receiver<Bytes>)> = Vec::new();
             let mut singles = Singles::new(merge);
+            let mut cached = cached.into_iter();
             for (part, rx) in parts.into_iter().zip(receivers) {
                 let reply = recv_or_lost(rx).await;
+                if let Some(PartCache::Fill(keys)) = cached.next()
+                    && let Some(cache) = &shared.cache
+                {
+                    fill_from(cache, &keys, &reply);
+                }
                 if reply.first() != Some(&b'-') {
                     results.push((part.positions, reply));
                     continue;
@@ -971,7 +1111,7 @@ impl Session {
                         let _ = shared.refresh.send(());
                         let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
                         let frame = part.frame.clone();
-                        let rx = scatter_one(&shared, &target, id, false, head, frame).await;
+                        let rx = scatter_one(&shared, &target, id, sharded, head, frame).await;
                         retries.push((part, rx));
                     }
                     None if degradable && reply.starts_with(b"-TRYAGAIN") => {
@@ -979,6 +1119,7 @@ impl Session {
                         Box::pin(resend_singles(
                             &shared,
                             id,
+                            sharded,
                             &part.frame,
                             part.positions.len(),
                             part.positions.iter().copied(),
@@ -995,6 +1136,7 @@ impl Session {
                     Box::pin(resend_singles(
                         &shared,
                         id,
+                        sharded,
                         &part.frame,
                         part.positions.len(),
                         part.positions.iter().copied(),
@@ -1026,6 +1168,7 @@ impl Session {
         let reply_q = self.reply_q.clone();
         let id = self.id;
         // detached deliberately: completion is bounded by backend replies
+        let sharded = self.link.sharded.get();
         tokio::task::spawn_local(async move {
             let topo = shared.topo.load_full();
             if master_idx >= topo.masters.len() {
@@ -1041,7 +1184,7 @@ impl Session {
             sub_args.extend_from_slice(&args[2..]);
             let mut cmd = Vec::new();
             resp::write_command(&mut cmd, &sub_args);
-            let rx = scatter_one(&shared, addr, id, false, None, Bytes::from(cmd)).await;
+            let rx = scatter_one(&shared, addr, id, sharded, None, Bytes::from(cmd)).await;
             let reply = recv_or_lost(rx).await;
             let out = match multikey::parse_scan_reply(&reply) {
                 Some((next, keys)) => {
@@ -1071,7 +1214,8 @@ impl Session {
         let mut receivers = Vec::with_capacity(topo.masters.len());
         for &midx in &topo.masters {
             let addr = &topo.nodes[midx as usize].addr;
-            receivers.push(scatter_one(&shared, addr, self.id, false, None, frame.clone()).await);
+            let sharded = self.link.sharded.get();
+            receivers.push(scatter_one(&shared, addr, self.id, sharded, None, frame.clone()).await);
         }
         // detached deliberately: completion is bounded by backend replies
         tokio::task::spawn_local(async move {
@@ -1662,6 +1806,8 @@ struct FanoutPlan {
     seq: u64,
     merge: Merge,
     degradable: bool,
+    // per part, only for a cacheable MGET; empty otherwise
+    cached: Vec<PartCache>,
     parts: Vec<multikey::Part>,
     pipes: Vec<Pipe>,
     total: usize,
@@ -1820,6 +1966,35 @@ enum Merge {
     Ok,
 }
 
+// the keys a reply fills: one for GET, every key of an MGET
+enum Fill {
+    One(Bytes),
+    Many(Vec<Bytes>),
+}
+
+impl Fill {
+    fn complete(&self, cache: &ReplyCache, frame: &[u8]) {
+        match self {
+            Fill::One(key) => cache.complete_fill(key, frame),
+            Fill::Many(keys) => cache.complete_fills(keys, frame),
+        }
+    }
+
+    fn abandon(&self, cache: &ReplyCache) {
+        match self {
+            Fill::One(key) => cache.abandon_fill(key),
+            Fill::Many(keys) => cache.abandon_fills(keys),
+        }
+    }
+}
+
+// how one MGET-shaped frame meets the cache: served whole, filling, or neither
+enum PartCache {
+    Backend,
+    Hit(Bytes),
+    Fill(Vec<Bytes>),
+}
+
 // a whole multi-key request re-issued key by key from the writer loop
 #[derive(Clone, Copy)]
 struct DegradePlan {
@@ -1966,8 +2141,8 @@ impl Drop for ExitBump<'_> {
         mark_closed(self.link);
         if let Some(cache) = &self.shared.cache {
             for e in self.link.inflight.borrow_mut().iter_mut() {
-                if let Some(key) = e.fill_key.take() {
-                    cache.abandon_fill(&key);
+                if let Some(fill) = e.fill.take() {
+                    fill.abandon(cache);
                 }
             }
         }
@@ -1984,6 +2159,8 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: SocketAddr, id: 
     let (mut read_half, write_half) = stream.into_split();
     let reply_q = ReplyQueue::new(shared.fabric.is_some());
     let link: Rc<WriterLink> = Rc::new(WriterLink::default());
+    link.sharded
+        .set(shared.cfg.backend_sharding == Sharding::On);
 
     let session = Session {
         shared: shared.clone(),
@@ -2000,6 +2177,8 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: SocketAddr, id: 
         blocking: RefCell::new(Vec::new()),
         closing: Cell::new(false),
         has_relay: Cell::new(false),
+        auto: shared.cfg.backend_sharding == Sharding::Auto,
+        pipelined: Cell::new(PIPELINED_LOCAL),
         conns: RefCell::new(ConnCache {
             epoch: 0,
             by_node: Vec::new(),
@@ -2162,10 +2341,27 @@ fn key_indices(spec: &Spec, argc: usize) -> impl ExactSizeIterator<Item = usize>
     (first..end).step_by((spec.step as usize).max(1))
 }
 
-fn pipe_for(shared: &Shared, addr: &str, id: u64, readonly: bool) -> Pipe {
+fn pipe_for(shared: &Shared, addr: &str, id: u64, readonly: bool, sharded: bool) -> Pipe {
     match &shared.fabric {
-        Some(f) => Pipe::Shard(f.pipe(addr, readonly)),
-        None => Pipe::Local(shared.backends.shared(addr, id, readonly)),
+        Some(f) if sharded => Pipe::Shard(f.pipe(addr, readonly)),
+        _ => Pipe::Local(shared.backends.shared(addr, id, readonly)),
+    }
+}
+
+// decided on an idle dispatch from the score before that dispatch counts
+fn switch_pipes(sharded: bool, score: u8) -> bool {
+    if sharded {
+        score >= PIPELINED_LOCAL
+    } else {
+        score <= 1
+    }
+}
+
+fn pipelining_score(score: u8, depth: u64) -> u8 {
+    if depth > 0 {
+        (score + 1).min(PIPELINED_MAX)
+    } else {
+        score.saturating_sub(1)
     }
 }
 
@@ -2262,21 +2458,78 @@ fn stage_one(pipe: &Pipe, head: Option<Bytes>, frame: Bytes) -> (Staged, oneshot
     (staged, rx)
 }
 
-async fn scatter_pipe(pipe: &Pipe, frame: Bytes) -> oneshot::Receiver<Bytes> {
-    let (staged, rx) = stage_one(pipe, None, frame);
+async fn scatter_pipe(pipe: &Pipe, head: Option<Bytes>, frame: Bytes) -> oneshot::Receiver<Bytes> {
+    let (staged, rx) = stage_one(pipe, head, frame);
     staged.send().await;
     rx
+}
+
+// a fetched part fills its keys; an error, redirect or TRYAGAIN part forgets them
+fn fill_from(cache: &ReplyCache, keys: &[Bytes], reply: &Bytes) {
+    if reply.first() == Some(&b'*') {
+        cache.complete_fills(keys, reply);
+    } else {
+        cache.abandon_fills(keys);
+    }
+}
+
+// a part served from the cache answers through the same channel as a fetched one
+fn resolved(reply: Bytes) -> oneshot::Receiver<Bytes> {
+    let (tx, rx) = oneshot::channel();
+    let _ = tx.send(reply);
+    rx
+}
+
+// serves an MGET-shaped frame whole when every key hits, else arms fills for its keys
+fn mget_cache(cache: &ReplyCache, frame: &Bytes, may_fill: bool) -> PartCache {
+    let Some((argc, _)) = resp::scan_int_line(frame, 1) else {
+        return PartCache::Backend;
+    };
+    let nkeys = argc.max(1) as usize - 1;
+    if nkeys == 0 || nkeys > MGET_CACHE_KEYS {
+        return PartCache::Backend;
+    }
+    let keys = || resp::Args::new(frame, argc as usize).skip(1);
+    let mut items = Vec::with_capacity(nkeys);
+    let mut bytes = 0;
+    for key in keys() {
+        let Some(item) = cache.lookup(key) else {
+            break;
+        };
+        bytes += item.len();
+        items.push(item);
+    }
+    if items.len() == nkeys {
+        let mut out = Vec::with_capacity(bytes + 16);
+        resp::array_header(&mut out, nkeys);
+        for item in &items {
+            out.extend_from_slice(item);
+        }
+        return PartCache::Hit(Bytes::from(out));
+    }
+    if !may_fill {
+        return PartCache::Backend;
+    }
+    let armed: Vec<Bytes> = keys()
+        .map(|k| frame.slice_ref(k))
+        .filter(|k| cache.begin_fill(k))
+        .collect();
+    if armed.is_empty() {
+        PartCache::Backend
+    } else {
+        PartCache::Fill(armed)
+    }
 }
 
 async fn scatter_one(
     shared: &Rc<Shared>,
     addr: &str,
     id: u64,
-    readonly: bool,
+    sharded: bool,
     head: Option<Bytes>,
     frame: Bytes,
 ) -> oneshot::Receiver<Bytes> {
-    let (staged, rx) = stage_one(&pipe_for(shared, addr, id, readonly), head, frame);
+    let (staged, rx) = stage_one(&pipe_for(shared, addr, id, false, sharded), head, frame);
     staged.send().await;
     rx
 }
@@ -2290,6 +2543,7 @@ async fn recv_or_lost(rx: oneshot::Receiver<Bytes>) -> Bytes {
 async fn resend_singles(
     shared: &Rc<Shared>,
     id: u64,
+    sharded: bool,
     frame: &[u8],
     count: usize,
     positions: impl Iterator<Item = usize>,
@@ -2308,7 +2562,7 @@ async fn resend_singles(
                 out.push(pos, Bytes::from_static(ERR_NO_OWNER));
                 continue;
             };
-            let rx = scatter_one(shared, addr, id, false, None, frame.clone()).await;
+            let rx = scatter_one(shared, addr, id, sharded, None, frame.clone()).await;
             pending.push((pos, frame, rx));
         }
         for (pos, frame, rx) in pending.drain(..) {
@@ -2320,7 +2574,7 @@ async fn resend_singles(
                         let _ = shared.refresh.send(());
                     }
                     let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
-                    let rx = scatter_one(shared, &target, id, false, head, frame).await;
+                    let rx = scatter_one(shared, &target, id, sharded, head, frame).await;
                     followed.push((pos, rx));
                 }
                 None => out.push(pos, reply),
@@ -2621,15 +2875,16 @@ async fn write_loop(
                             stats::bump(&shared.wstats.redirects);
                             // the retry carries no CACHING opt-in: it cannot fill
                             if link.fills_armed.get() > 0
-                                && let Some(key) = take_fill(&link, seq)
+                                && let Some(fill) = take_fill(&link, seq)
                                 && let Some(cache) = &shared.cache
                             {
-                                cache.abandon_fill(&key);
+                                fill.abandon(cache);
                             }
                             let _ = shared.refresh.send(());
                             let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
                             let expect = base_expect + u32::from(ask);
-                            let pipe = pipe_for(&shared, &target, client_id, false);
+                            let pipe =
+                                pipe_for(&shared, &target, client_id, false, link.sharded.get());
                             match queue_on(&pipe, &reply_q, seq, head, req, expect) {
                                 Ok(Some(cold)) => cold.flush().await,
                                 Ok(None) => {}
@@ -2646,6 +2901,13 @@ async fn write_loop(
                         && let Some(req) = take_degrade_frame(&link.inflight, seq)
                         && let Some(plan) = multikey_plan(&req)
                     {
+                        // the singles carry no CACHING opt-in: they cannot fill
+                        if link.fills_armed.get() > 0
+                            && let Some(fill) = take_fill(&link, seq)
+                            && let Some(cache) = &shared.cache
+                        {
+                            fill.abandon(cache);
+                        }
                         let (merge, nkeys, slot) = (plan.merge, plan.nkeys, plan.slot);
                         link.mark_migrating(slot);
                         // any later command already holds a sequence: a re-run would land
@@ -2662,6 +2924,7 @@ async fn write_loop(
                                 resend_singles(
                                     &shared,
                                     client_id,
+                                    link.sharded.get(),
                                     &req,
                                     nkeys,
                                     0..nkeys,
@@ -2684,10 +2947,10 @@ async fn write_loop(
                     }
                 }
                 if link.fills_armed.get() > 0
-                    && let Some(key) = take_fill(&link, seq)
+                    && let Some(fill) = take_fill(&link, seq)
                     && let Some(cache) = &shared.cache
                 {
-                    cache.complete_fill(&key, &frame);
+                    fill.complete(cache, &frame);
                 }
                 if seq == next_emit {
                     link.proto_switches.apply(next_emit, &mut cur_proto);
@@ -2732,11 +2995,11 @@ async fn write_loop(
         if next_emit > swept_to {
             let mut inf = link.inflight.borrow_mut();
             while inf.front().is_some_and(|e| e.seq < next_emit) {
-                if let Some(key) = inf.pop_front().and_then(|e| e.fill_key)
+                if let Some(fill) = inf.pop_front().and_then(|e| e.fill)
                     && let Some(cache) = &shared.cache
                 {
                     link.fills_armed.set(link.fills_armed.get() - 1);
-                    cache.abandon_fill(&key);
+                    fill.abandon(cache);
                 }
             }
             swept_to = next_emit;
@@ -2767,12 +3030,12 @@ fn release_gates(gates: &RefCell<FanoutGates>, slots: &[u16]) {
     }
 }
 
-fn take_fill(link: &WriterLink, seq: u64) -> Option<Bytes> {
+fn take_fill(link: &WriterLink, seq: u64) -> Option<Fill> {
     let mut inf = link.inflight.borrow_mut();
     let idx = inf.binary_search_by_key(&seq, |e| e.seq).ok()?;
-    let key = inf[idx].fill_key.take()?;
+    let fill = inf[idx].fill.take()?;
     link.fills_armed.set(link.fills_armed.get() - 1);
-    Some(key)
+    Some(fill)
 }
 
 // retryable redirects: single-reply requests always, multi-reply blobs only for MOVED
@@ -2857,6 +3120,27 @@ mod tests {
 
     fn spec(name: &str) -> &'static Spec {
         command::lookup(name.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn pipe_switch_needs_four_idle_dispatches_to_share_and_four_busy_to_return() {
+        let mut score = PIPELINED_LOCAL;
+        for _ in 0..3 {
+            assert!(!switch_pipes(false, score));
+            score = pipelining_score(score, 0);
+        }
+        assert!(switch_pipes(false, score));
+        score = pipelining_score(score, 0);
+        assert_eq!(score, 0);
+        for _ in 0..3 {
+            score = pipelining_score(score, 3);
+            assert!(!switch_pipes(true, score));
+        }
+        score = pipelining_score(score, 3);
+        assert!(switch_pipes(true, score));
+        assert!(!switch_pipes(true, pipelining_score(score, 0)) || score > PIPELINED_LOCAL);
+        assert_eq!(pipelining_score(PIPELINED_MAX, 9), PIPELINED_MAX);
+        assert_eq!(pipelining_score(0, 0), 0);
     }
 
     #[test]

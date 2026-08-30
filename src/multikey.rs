@@ -232,7 +232,7 @@ fn single_item(frame: &[u8]) -> Option<&[u8]> {
         .filter(|item| !item.is_empty())
 }
 
-fn split_array(frame: &[u8]) -> Option<Vec<&[u8]>> {
+pub(crate) fn split_array(frame: &[u8]) -> Option<Vec<&[u8]>> {
     if frame.first() != Some(&b'*') {
         return None;
     }

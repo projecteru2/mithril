@@ -375,8 +375,8 @@ pub(crate) async fn pump<S, D: Fn(S, Bytes) + Copy>(
 ) {
     let mut pending: VecDeque<Pending<S>> = VecDeque::new();
     let mut front_err: Option<Bytes> = None;
-    let mut batch: Vec<Outbound<S>> = Vec::with_capacity(BATCH);
-    let mut frames: Vec<Bytes> = Vec::with_capacity(BATCH * 2);
+    let mut batch: Vec<Outbound<S>> = Vec::new();
+    let mut frames: Vec<Bytes> = Vec::new();
     let mut buf = BytesMut::with_capacity(READ_INIT);
     let mut cur = resp::Cursor::default();
     let mut tx_open = true;

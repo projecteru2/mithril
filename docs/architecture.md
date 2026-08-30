@@ -84,7 +84,20 @@ admission; no unbounded queue is reachable from client input.
 ## Backend connections
 
 Regular traffic multiplexes over `backend-conns` shared pipelined
-connections per node per worker (sticky per client). Blocking commands lease
+connections per node per worker (sticky per client). With
+`backend-sharding yes` every request to a node crosses to the worker that
+owns that node's single process-wide pipe, which batches deeper for
+unpipelined clients; with `auto` each session scores its own pipelining
+depth at dispatch (up over commands with replies still outstanding, down
+over idle ones) and moves to the shared pipe once four idle dispatches
+have run the score down, back to its worker's connections once four busy
+ones have restored it — and only while it has nothing in flight — so a
+request-response client ends up on the shared pipe and a pipelining client
+on its worker's connections. The reply cache is
+wired as under `yes` (owner-worker trackers, process-wide coverage,
+broadcast invalidation): sessions on the shared pipes fill it, sessions on
+the worker-local connections read it but never fill it, since those
+connections carry no key tracking. Blocking commands lease
 a dedicated connection (up to 512 per node) through an RAII lease whose drop
 either returns the connection to the idle pool or — if the command was
 abandoned mid-flight — closes it, so the backend cancels the block. Each
@@ -92,11 +105,14 @@ subscribing client gets its own pubsub connection with its own relay task.
 
 ## Reply cache
 
-`reply-cache yes` gives each worker a GET cache: two generations of
+`reply-cache yes` gives each worker a GET/MGET cache: two generations of
 `key -> reply frame` flipped under a byte budget, with a max-age backstop.
 A hit is emitted at the command's sequence like any other reply, so
 pipelining and ordering are untouched; a miss arms a fill ticket that the
-writer completes when the backend reply passes through.
+writer completes when the backend reply passes through. An MGET is served
+from the cache when every key it names hits (per slot part for a
+cross-slot MGET); otherwise the fetch fills all of its keys — one opt-in
+covers the whole command — up to 64 keys per MGET.
 
 Coherence is the cluster's job, not a timer's. Each worker keeps one RESP3
 tracking connection per master and learns its client id; every shared

@@ -30,6 +30,25 @@ impl fmt::Display for Placement {
     }
 }
 
+/// How backend connections are shared across workers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sharding {
+    Off,
+    On,
+    /// Per session: an unpipelined session uses the shared pipe, a pipelined one its worker's.
+    Auto,
+}
+
+impl fmt::Display for Sharding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Sharding::Off => "no",
+            Sharding::On => "yes",
+            Sharding::Auto => "auto",
+        })
+    }
+}
+
 /// Replica read routing mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlaveMode {
@@ -61,7 +80,7 @@ pub struct Config {
     pub maxclients: usize,
     pub bootstrap: Vec<String>,
     pub backend_conns: usize,
-    pub backend_sharding: bool,
+    pub backend_sharding: Sharding,
     pub reply_cache: bool,
     pub reply_cache_max_bytes: usize,
     pub reply_cache_max_age_secs: u64,
@@ -87,7 +106,7 @@ impl Default for Config {
             maxclients: 10000,
             bootstrap: Vec::new(),
             backend_conns: 1,
-            backend_sharding: false,
+            backend_sharding: Sharding::Off,
             reply_cache: false,
             reply_cache_max_bytes: 64 << 20,
             reply_cache_max_age_secs: 10,
@@ -136,7 +155,7 @@ impl Config {
                 self.bootstrap = value.split(',').map(|s| s.trim().to_string()).collect();
             }
             "backend-conns" => self.backend_conns = parse_bounded(key, value, 1, 512)?,
-            "backend-sharding" => self.backend_sharding = parse_yesno(key, value)?,
+            "backend-sharding" => self.backend_sharding = parse_sharding(key, value)?,
             "reply-cache" => self.reply_cache = parse_yesno(key, value)?,
             "reply-cache-max-bytes" => {
                 self.reply_cache_max_bytes = parse_bytes(key, value)?.max(1 << 20);
@@ -174,7 +193,7 @@ impl Config {
         if self.announce_addr.starts_with("0.0.0.0") {
             crate::log_warn!("announce-addr resolves to 0.0.0.0; set it for cluster clients");
         }
-        if self.backend_sharding && self.backend_conns > 1 {
+        if self.backend_sharding == Sharding::On && self.backend_conns > 1 {
             crate::log_warn!("backend-conns is ignored under backend-sharding");
         }
         Ok(self)
@@ -201,6 +220,17 @@ fn parse_yesno(key: &str, value: &str) -> Result<bool, String> {
         "no" | "off" | "false" => Ok(false),
         _ => Err(format!("{key}: expected yes or no, got '{value}'")),
     }
+}
+
+fn parse_sharding(key: &str, value: &str) -> Result<Sharding, String> {
+    if value == "auto" {
+        return Ok(Sharding::Auto);
+    }
+    Ok(if parse_yesno(key, value)? {
+        Sharding::On
+    } else {
+        Sharding::Off
+    })
 }
 
 fn parse_placement(value: &str) -> Result<Placement, String> {

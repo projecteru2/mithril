@@ -17,6 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::backend::{self, Backends};
 use crate::config::Config;
 use crate::log_debug;
+use crate::multikey;
 use crate::resp;
 use crate::shard::Fabric;
 use crate::stats::{self, Stats};
@@ -171,7 +172,7 @@ impl ReplyCache {
     }
 
     /// Caches an armed fill's reply unless an invalidation raced it.
-    pub fn complete_fill(&self, key: &Bytes, frame: &Bytes) {
+    pub fn complete_fill(&self, key: &Bytes, frame: &[u8]) {
         self.sync();
         if !self.settle_ticket(key)
             || frame.first() != Some(&b'$')
@@ -193,6 +194,24 @@ impl ReplyCache {
     /// Forgets a fill whose reply will never be observed.
     pub fn abandon_fill(&self, key: &Bytes) {
         self.settle_ticket(key);
+    }
+
+    /// Caches every key of an armed MGET fill from its array reply, or forgets them.
+    pub fn complete_fills(&self, keys: &[Bytes], frame: &[u8]) {
+        match multikey::split_array(frame) {
+            Some(items) if items.len() == keys.len() => {
+                for (key, item) in keys.iter().zip(items) {
+                    self.complete_fill(key, item);
+                }
+            }
+            _ => self.abandon_fills(keys),
+        }
+    }
+
+    pub fn abandon_fills(&self, keys: &[Bytes]) {
+        for key in keys {
+            self.settle_ticket(key);
+        }
     }
 
     /// Drops `key` from both generations and poisons its in-flight fill.

@@ -15,10 +15,11 @@ bootstrap 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
 
 # sticky shared connections per node per worker
 backend-conns 1
-# one process-wide pipe per node (deeper backend batches for unpipelined load)
+# one process-wide pipe per node (deeper backend batches for unpipelined load):
+# no | yes | auto (per session: unpipelined sessions share, pipelining ones stay local)
 # backend-sharding no
 
-# worker-local GET reply cache, kept coherent by server-side key tracking
+# worker-local GET/MGET reply cache, kept coherent by server-side key tracking
 # reply-cache no
 # reply-cache-max-bytes 64mb
 # reply-cache-max-age-secs 10

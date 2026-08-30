@@ -17,7 +17,9 @@ thread-per-core runtime and zero-copy frame forwarding.
   path, and a central acceptor places each connection on the least-loaded
   worker (configurable) so no worker becomes the latency floor. The optional
   `backend-sharding` mode trades that isolation for one process-wide pipe per
-  node, deepening backend batches for unpipelined workloads
+  node, deepening backend batches for unpipelined workloads — and `auto`
+  makes that call per session, so unpipelined and pipelining clients each
+  get the path that is faster for them
 - **Zero-copy pipeline** — requests and replies travel as `bytes::Bytes`
   slices of the socket buffers; the RESP layer finds frame boundaries without
   materializing values, and replies re-order per client by sequence number so
@@ -27,7 +29,7 @@ thread-per-core runtime and zero-copy frame forwarding.
   slot (a `TRYAGAIN` part is re-issued key by key), all verified against
   live slot migrations, and single-virtual-node cluster emulation so
   cluster-aware clients work unchanged against one endpoint
-- **Reply cache** — optional worker-local GET cache kept coherent by the
+- **Reply cache** — optional worker-local GET/MGET cache kept coherent by the
   cluster itself: every backend connection redirects RESP3 key tracking to
   a per-worker tracker and opts each cached read in, so the servers
   invalidate exactly the keys the proxy holds; writes through the proxy

@@ -101,7 +101,7 @@ static TABLE: &[Spec] = &[
     c("lrem", 4, W, 1, 1, 1, Kind::Single),
     c("lset", 4, W, 1, 1, 1, Kind::Single),
     c("ltrim", 4, W, 1, 1, 1, Kind::Single),
-    c("mget", -2, R, 1, -1, 1, Kind::Mget),
+    c("mget", -2, R | C, 1, -1, 1, Kind::Mget),
     c("mset", -3, W, 1, -1, 2, Kind::Mset),
     c("msetnx", -3, W, 1, -1, 2, Kind::Single),
     c("multi", 1, T, 0, 0, 0, Kind::Local),

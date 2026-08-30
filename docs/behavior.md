@@ -31,7 +31,7 @@
   keep RESP2 shape (flat arrays, not maps) — every mainstream client parses
   by wire type and accepts this.
 - AUTH is single-password (`requirepass`, default user). No ACL user table.
-- `reply-cache yes` serves GET from a worker-local cache. Coherence: every
+- `reply-cache yes` serves GET and MGET (up to 64 keys) from a worker-local cache. Coherence: every
   backend connection redirects RESP3 key tracking to a per-worker tracker
   connection and opts each cached read in (`CLIENT CACHING YES`), so a server
   invalidates exactly the keys this proxy holds, once, when they change;

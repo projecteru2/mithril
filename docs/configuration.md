@@ -14,8 +14,8 @@ See [`mithril.conf.sample`](https://github.com/projecteru2/mithril/blob/master/m
 | `worker-threads` | int | CPU count | worker threads, one runtime each |
 | `maxclients` | int | `10000` | client connection cap, enforced at accept |
 | `backend-conns` | 1..512 | `1` | shared pipelined connections per node per worker |
-| `backend-sharding` | `yes`/`no` | `no` | one process-wide connection per node, owned by the worker its address hashes to; deepens backend pipelines for unpipelined workloads |
-| `reply-cache` | `yes`/`no` | `no` | worker-local GET reply cache; the servers track the keys the proxy caches (redirected opt-in RESP3 tracking) and invalidate them on change, so hits skip the backend round trip and a session reads its own writes |
+| `backend-sharding` | `yes`/`no`/`auto` | `no` | `yes`: one process-wide connection per node, owned by the worker its address hashes to, which deepens backend pipelines for unpipelined workloads; `auto`: decided per session — a session that keeps sending one command at a time moves to the shared pipes, a pipelining session stays on its worker's own connections (switches happen only while it has nothing in flight; with the reply cache, only sessions on the shared pipes fill it — the worker-local connections carry no key tracking — while every session reads it) |
+| `reply-cache` | `yes`/`no` | `no` | worker-local GET/MGET reply cache; the servers track the keys the proxy caches (redirected opt-in RESP3 tracking) and invalidate them on change, so hits skip the backend round trip and a session reads its own writes |
 | `reply-cache-max-bytes` | bytes | `64mb` | per-worker cache budget (two generations under one budget) |
 | `reply-cache-max-age-secs` | 1..3600 | `10` | staleness backstop for missed invalidations; entries older than this never serve |
 | `requirepass` | string | empty | client password (default user); empty disables AUTH |

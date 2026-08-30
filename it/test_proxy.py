@@ -311,7 +311,8 @@ def test_dbsize_matches_direct_cluster_sum(r, cluster_direct):
         if proxy_size == total_direct or time.time() > deadline:
             break
         time.sleep(0.2)
-    assert proxy_size == total_direct
+    per_node = cluster_direct.dbsize(target_nodes=RedisCluster.ALL_NODES)
+    assert proxy_size == total_direct, (proxy_size, total_direct, per_node)
 
 
 # --- cluster emulation ---
@@ -630,3 +631,38 @@ def test_multikey_survives_a_migrating_slot(r, cluster_direct, key_prefix):
         r.delete(a, b, other)
         src.close()
         dst.close()
+
+
+def test_cache_mget_hits_and_read_your_writes(cache_proxy, key_prefix):
+    r = cache_proxy
+    a, b, c = f"{{{key_prefix}}}a", f"{{{key_prefix}}}b", f"{key_prefix}:c"
+    assert key_slot(c.encode()) != key_slot(a.encode())
+    assert r.mset({a: "1", b: "2", c: "3"})
+    assert r.mget(a, b) == ["1", "2"]
+    before = int(r.info()["cache_hits"])
+    assert r.mget(a, b) == ["1", "2"]
+    assert int(r.info()["cache_hits"]) > before
+    assert r.mget(a, b, c) == ["1", "2", "3"]
+    before = int(r.info()["cache_hits"])
+    assert r.mget(a, b, c) == ["1", "2", "3"]
+    assert int(r.info()["cache_hits"]) > before
+    assert r.set(a, "11")
+    assert r.mget(a, b, c) == ["11", "2", "3"]
+    assert r.mset({b: "22", c: "33"})
+    assert r.mget(a, b, c) == ["11", "22", "33"]
+    assert r.delete(c) == 1
+    assert r.mget(a, b, c) == ["11", "22", None]
+    assert r.mget(c, a) == [None, "11"]
+
+
+def test_cache_mget_converges_after_external_write(cache_proxy, cluster_direct, key_prefix):
+    r = cache_proxy
+    a, b = f"{{{key_prefix}}}a", f"{{{key_prefix}}}b"
+    assert r.mset({a: "1", b: "2"})
+    assert r.mget(a, b) == ["1", "2"]
+    assert r.mget(a, b) == ["1", "2"]
+    cluster_direct.set(a, "x")
+    deadline = time.time() + 2
+    while r.mget(a, b) != ["x", "2"] and time.time() < deadline:
+        time.sleep(0.05)
+    assert r.mget(a, b) == ["x", "2"]

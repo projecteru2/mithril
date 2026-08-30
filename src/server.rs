@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::backend::Backends;
 use crate::client::{Shared, serve};
-use crate::config::{Config, Placement};
+use crate::config::{Config, Placement, Sharding};
 use crate::shard;
 use crate::stats::Stats;
 use crate::topology::Topology;
@@ -177,7 +177,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
 
     let listener = bind_listener(&cfg.bind, cfg.port)
         .map_err(|e| format!("bind {}:{}: {e}", cfg.bind, cfg.port))?;
-    let mut shard_parts = if cfg.backend_sharding {
+    let mut shard_parts = if cfg.backend_sharding != Sharding::Off {
         let mut ctl_txs = Vec::with_capacity(cfg.workers);
         let mut ctl_rxs = Vec::with_capacity(cfg.workers);
         for _ in 0..cfg.workers {
@@ -193,7 +193,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
     } else {
         None
     };
-    let coverage = (cfg.reply_cache && cfg.backend_sharding).then(crate::cache::Coverage::new);
+    let coverage = (cfg.reply_cache && cfg.backend_sharding != Sharding::Off)
+        .then(crate::cache::Coverage::new);
     let mut conn_txs = Vec::with_capacity(cfg.workers);
     for worker in 0..cfg.workers {
         let (conn_tx, conn_rx) = mpsc::channel::<Admitted>(ACCEPT_QUEUE);
