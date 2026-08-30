@@ -35,8 +35,7 @@ pub enum ReqScan {
     Invalid(&'static str),
 }
 
-/// Resume point inside a top-level aggregate that is still arriving: a
-/// rescan after the next read starts at the first unverified element.
+/// Resume point inside an arriving aggregate: a rescan starts at the first unverified element.
 #[derive(Default)]
 pub struct Cursor {
     pos: usize,
@@ -113,21 +112,10 @@ pub fn scan_value_at(buf: &[u8], cur: &mut Cursor) -> Scan {
         if !matches!(kind, b'*' | b'~' | b'>' | b'%') {
             return scan_at(buf, 0, 0).unwrap_or(Scan::Incomplete);
         }
-        let Some((n, after)) = scan_int_line(buf, 1) else {
-            return Scan::Incomplete;
-        };
-        if n < -1 {
-            return Scan::Invalid("bad aggregate length");
-        }
-        let items = if n <= 0 {
-            0
-        } else if kind == b'%' {
-            match (n as usize).checked_mul(2) {
-                Some(v) => v,
-                None => return Scan::Incomplete,
-            }
-        } else {
-            n as usize
+        let (items, after) = match aggregate_items(buf, 0, kind) {
+            None => return Scan::Incomplete,
+            Some(Err(e)) => return Scan::Invalid(e),
+            Some(Ok(v)) => v,
         };
         if items == 0 {
             return Scan::Complete(after);
@@ -180,12 +168,7 @@ pub fn scan_request_at(buf: &[u8], cur: &mut Cursor) -> ReqScan {
         (pos, argc as usize, argc as usize)
     };
     while left > 0 {
-        // '=' verbatim bulks are reply-only; forwarding one breaks RESP2 backends
-        if buf.get(pos) == Some(&b'=') {
-            *cur = Cursor::default();
-            return ReqScan::Invalid("verbatim string in request");
-        }
-        match scan_bulk(buf, pos) {
+        match scan_arg(buf, pos) {
             Some(Ok(b)) => {
                 if b.payload_end == b.next {
                     *cur = Cursor::default();
@@ -215,11 +198,7 @@ pub fn write_command(out: &mut Vec<u8>, args: &[&[u8]]) {
     out.reserve(args.iter().map(|a| a.len() + 13).sum::<usize>() + 13);
     array_header(out, args.len());
     for a in args {
-        out.push(b'$');
-        push_usize(out, a.len());
-        out.extend_from_slice(b"\r\n");
-        out.extend_from_slice(a);
-        out.extend_from_slice(b"\r\n");
+        bulk(out, a);
     }
 }
 
@@ -404,12 +383,26 @@ pub(crate) fn u64_digits(buf: &mut [u8; DEC_BUF], mut n: u64) -> &[u8] {
 }
 
 pub(crate) fn scan_bulk(buf: &[u8], pos: usize) -> BulkScan {
+    scan_bulk_kind::<true>(buf, pos)
+}
+
+// '=' verbatim bulks are reply-only; forwarding one breaks RESP2 backends
+fn scan_arg(buf: &[u8], pos: usize) -> BulkScan {
+    scan_bulk_kind::<false>(buf, pos)
+}
+
+#[inline(always)]
+fn scan_bulk_kind<const VERBATIM: bool>(buf: &[u8], pos: usize) -> BulkScan {
     match buf.get(pos) {
-        Some(b'$') | Some(b'=') => {}
+        Some(b'$') => {}
+        Some(b'=') if VERBATIM => {}
+        Some(b'=') => return Some(Err("verbatim string in request")),
         Some(_) => return Some(Err("expected bulk string")),
         None => return None,
     }
-    let (n, body) = scan_int_line(buf, pos + 1)?;
+    let Some((n, body)) = scan_int_line(buf, pos + 1) else {
+        return (buf.len() - pos > MAX_INLINE_LEN).then_some(Err("bulk header too long"));
+    };
     if n == -1 {
         return Some(Ok(Bulk {
             payload_start: body,
@@ -449,16 +442,9 @@ fn scan_at(buf: &[u8], pos: usize, depth: usize) -> Option<Scan> {
             Err(e) => Some(Scan::Invalid(e)),
         },
         b'*' | b'~' | b'>' | b'%' => {
-            let (n, mut cur) = scan_int_line(buf, pos + 1)?;
-            if n < -1 {
-                return Some(Scan::Invalid("bad aggregate length"));
-            }
-            let items = if n <= 0 {
-                0
-            } else if kind == b'%' {
-                (n as usize).checked_mul(2)?
-            } else {
-                n as usize
+            let (items, mut cur) = match aggregate_items(buf, pos, kind)? {
+                Ok(v) => v,
+                Err(e) => return Some(Scan::Invalid(e)),
             };
             for _ in 0..items {
                 match scan_at(buf, cur, depth + 1)? {
@@ -470,6 +456,26 @@ fn scan_at(buf: &[u8], pos: usize, depth: usize) -> Option<Scan> {
         }
         _ => Some(Scan::Invalid("bad type byte")),
     }
+}
+
+// item count and body offset of an aggregate header; None while it is incomplete
+fn aggregate_items(
+    buf: &[u8],
+    pos: usize,
+    kind: u8,
+) -> Option<Result<(usize, usize), &'static str>> {
+    let (n, after) = scan_int_line(buf, pos + 1)?;
+    if n < -1 {
+        return Some(Err("bad aggregate length"));
+    }
+    let items = if n <= 0 {
+        0
+    } else if kind == b'%' {
+        (n as usize).checked_mul(2)?
+    } else {
+        n as usize
+    };
+    Some(Ok((items, after)))
 }
 
 fn scan_inline(buf: &[u8]) -> ReqScan {

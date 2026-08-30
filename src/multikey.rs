@@ -97,6 +97,7 @@ where
 /// Merges MGET part replies back into client key order.
 pub fn merge_mget(total: usize, parts: &[(Vec<usize>, Bytes)]) -> Result<Bytes, Bytes> {
     let mut slots: Vec<&[u8]> = vec![resp::NIL_BULK; total];
+    let (mut bytes, mut filled) = (0usize, 0usize);
     for (positions, reply) in parts {
         if reply.first() == Some(&b'-') {
             return Err(reply.clone());
@@ -106,10 +107,13 @@ pub fn merge_mget(total: usize, parts: &[(Vec<usize>, Bytes)]) -> Result<Bytes, 
             return Err(reply.clone());
         }
         for (i, item) in positions.iter().zip(items) {
+            bytes += item.len();
+            filled += 1;
             slots[*i] = item;
         }
     }
-    let mut out = Vec::with_capacity(slots.iter().map(|s| s.len()).sum::<usize>() + 16);
+    let nils = total.saturating_sub(filled) * resp::NIL_BULK.len();
+    let mut out = Vec::with_capacity(bytes + nils + 16);
     resp::array_header(&mut out, total);
     for s in slots {
         out.extend_from_slice(s);
@@ -126,7 +130,7 @@ pub fn merge_sum<'r>(parts: impl Iterator<Item = &'r Bytes>) -> Result<Bytes, By
             None => return Err(reply.clone()),
         }
     }
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(resp::DEC_BUF + 3);
     crate::resp::integer(&mut out, total);
     Ok(Bytes::from(out))
 }
@@ -146,7 +150,6 @@ pub fn pack_cursor(master_idx: usize, node_cursor: u64) -> u64 {
     ((master_idx as u64) << SCAN_CURSOR_BITS) | (node_cursor & ((1 << SCAN_CURSOR_BITS) - 1))
 }
 
-/// Unpacks a synthetic SCAN cursor.
 pub fn unpack_cursor(cursor: u64) -> (usize, u64) {
     (
         (cursor >> SCAN_CURSOR_BITS) as usize,

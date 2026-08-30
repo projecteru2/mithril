@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::backend::{self, Backends};
@@ -26,15 +26,14 @@ use crate::topology::Topology;
 const ENTRY_MAX_BYTES: usize = 64 * 1024;
 // map slot, two heap allocations with headers and size-class rounding
 const ENTRY_OVERHEAD: usize = 96;
-// routing follows a new epoch per request; trackers follow within one poll,
-// which is also the cache clock's tick
+// trackers follow topology within one poll, which is also the cache clock's tick
 const TRACKER_POLL: Duration = Duration::from_millis(100);
 const TICKS_PER_SEC: u32 = 10;
 // a generation this large is freed in chunks off the request path
 const DROP_CHUNK: usize = 4096;
 const TRACKER_RETRY: Duration = Duration::from_secs(1);
 const TRACKER_PING: Duration = Duration::from_secs(2);
-// unanswered pings before a silent tracker is declared dead
+// a tracker this many pings behind is dead
 const PING_DEBT_MAX: u32 = 3;
 const PING_FRAME: &[u8] = b"*1\r\n$4\r\nPING\r\n";
 const CLIENT_ID_FRAME: &[u8] = b"*2\r\n$6\r\nCLIENT\r\n$2\r\nID\r\n";
@@ -86,7 +85,6 @@ struct Entry {
     at: u32,
 }
 
-// one cache generation and the bytes it holds
 #[derive(Default)]
 struct Gen {
     map: RefCell<Map>,
@@ -111,7 +109,6 @@ impl Gen {
     }
 }
 
-// the masters that must be tracked, and those that are
 #[derive(Default)]
 struct Sets {
     wanted: HashSet<Box<str>>,
@@ -124,11 +121,17 @@ impl Sets {
     }
 }
 
-// one key's in-flight state: at most one fill ticket, any number of writes
 struct Fill {
     ticket: bool,
     writes: u32,
     poisoned: bool,
+}
+
+// what an invalidation push asks for; Keys carries the payload byte total
+#[derive(Debug, PartialEq, Eq)]
+enum Push {
+    Flush,
+    Keys(usize),
 }
 
 /// Which masters are tracked: per worker, or process-wide under sharding.
@@ -262,7 +265,7 @@ impl ReplyCache {
     /// Caches an armed fill's reply unless an invalidation raced it.
     pub fn complete_fill(&self, key: &Bytes, frame: &Bytes) {
         self.sync();
-        if self.settle_ticket(key) != Some(false)
+        if !self.settle_ticket(key)
             || frame.first() != Some(&b'$')
             || frame.len() > ENTRY_MAX_BYTES
             || entry_size(key.len(), frame.len()) > self.max_bytes / 2
@@ -352,19 +355,18 @@ impl ReplyCache {
         self.prev.take(key);
     }
 
-    // returns the ticket's poison state; the key's entry goes once nothing is in flight
-    fn settle_ticket(&self, key: &[u8]) -> Option<bool> {
+    // true when the key's ticket settled unpoisoned; the entry goes once nothing is in flight
+    fn settle_ticket(&self, key: &[u8]) -> bool {
         let mut fills = self.fills.borrow_mut();
-        let f = fills.get_mut(key)?;
-        if !f.ticket {
-            return None;
-        }
+        let Some(f) = fills.get_mut(key).filter(|f| f.ticket) else {
+            return false;
+        };
         f.ticket = false;
-        let poisoned = f.poisoned;
+        let clean = !f.poisoned;
         if f.writes == 0 {
             fills.remove(key);
         }
-        Some(poisoned)
+        clean
     }
 
     fn insert_hot(&self, k: Box<[u8]>, e: Entry) {
@@ -472,12 +474,12 @@ impl Wiring {
     }
 
     // compacted so the batch never pins the read buffer; a worker that cannot take it flushes
-    fn invalidate(&self, frame: &[u8], keys: &[Range<usize>]) {
+    fn invalidate(&self, frame: &[u8], keys: &[Range<usize>], bytes: usize) {
         match &self.fabric {
             Some(f) => {
-                let mut compact = BytesMut::with_capacity(keys.iter().map(Range::len).sum());
+                let mut compact = BytesMut::with_capacity(bytes);
                 for k in keys {
-                    compact.extend_from_slice(&frame[k.clone()]);
+                    compact.extend_from_slice(&frame[k.start..k.end]);
                 }
                 let compact = compact.freeze();
                 let mut at = 0;
@@ -495,14 +497,14 @@ impl Wiring {
             }
             None => {
                 for k in keys {
-                    self.cache.invalidate(&frame[k.clone()]);
+                    self.cache.invalidate(&frame[k.start..k.end]);
                 }
             }
         }
     }
 }
 
-// coverage accounting survives task aborts through this guard
+// coverage accounting survives task aborts
 struct UpGuard {
     w: Rc<Wiring>,
     addr: Box<str>,
@@ -519,12 +521,11 @@ fn entry_size(key_len: usize, frame_len: usize) -> usize {
 }
 
 // frees a large generation a chunk at a time so no request waits on the whole drop
-fn retire(map: Map) {
+fn retire(mut map: Map) {
     if map.len() <= DROP_CHUNK || tokio::runtime::Handle::try_current().is_err() {
         return;
     }
     tokio::task::spawn_local(async move {
-        let mut map = map;
         let mut drain = map.drain();
         while drain.by_ref().take(DROP_CHUNK).count() == DROP_CHUNK {
             tokio::task::yield_now().await;
@@ -558,10 +559,11 @@ pub async fn run_trackers(w: Rc<Wiring>, topo: Arc<ArcSwap<Topology>>) {
                 .collect();
             w.cache.set_coverage(&want);
             running.retain(|addr, task| {
-                want.contains(&**addr) || {
+                let keep = want.contains(&**addr);
+                if !keep {
                     task.abort();
-                    false
                 }
+                keep
             });
             for &addr in &want {
                 if !running.contains_key(addr) && w.owns(addr) {
@@ -589,25 +591,27 @@ async fn track_once(addr: &str, w: &Rc<Wiring>) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     let (mut read_half, mut write_half) = stream.into_split();
-    let mut setup: Vec<u8> = Vec::new();
-    if cfg.backend_pass.is_empty() {
-        resp::write_command(&mut setup, &[b"HELLO", b"3"]);
-    } else {
-        let user: &[u8] = if cfg.backend_user.is_empty() {
-            b"default"
+    {
+        let mut setup: Vec<u8> = Vec::new();
+        if cfg.backend_pass.is_empty() {
+            resp::write_command(&mut setup, &[b"HELLO", b"3"]);
         } else {
-            cfg.backend_user.as_bytes()
-        };
-        resp::write_command(
-            &mut setup,
-            &[b"HELLO", b"3", b"AUTH", user, cfg.backend_pass.as_bytes()],
-        );
+            let user: &[u8] = if cfg.backend_user.is_empty() {
+                b"default"
+            } else {
+                cfg.backend_user.as_bytes()
+            };
+            resp::write_command(
+                &mut setup,
+                &[b"HELLO", b"3", b"AUTH", user, cfg.backend_pass.as_bytes()],
+            );
+        }
+        setup.extend_from_slice(CLIENT_ID_FRAME);
+        write_half
+            .write_all(&setup)
+            .await
+            .map_err(|e| e.to_string())?;
     }
-    setup.extend_from_slice(CLIENT_ID_FRAME);
-    write_half
-        .write_all(&setup)
-        .await
-        .map_err(|e| e.to_string())?;
     let mut buf = BytesMut::with_capacity(backend::READ_INIT);
     backend::read_reply(&mut read_half, &mut buf).await?;
     let id = backend::read_reply(&mut read_half, &mut buf).await?;
@@ -644,12 +648,12 @@ async fn track_once(addr: &str, w: &Rc<Wiring>) -> Result<(), String> {
         loop {
             match resp::scan_value_at(&buf, &mut cur) {
                 resp::Scan::Complete(len) => {
-                    let frame = buf.split_to(len).freeze();
+                    let frame = &buf[..len];
                     match frame.first() {
-                        Some(b'>') => match collect_push(&frame, &mut keys) {
-                            Some(true) => w.cache.flush(),
-                            Some(false) => {
-                                w.invalidate(&frame, &keys);
+                        Some(b'>') => match collect_push(frame, &mut keys) {
+                            Some(Push::Flush) => w.cache.flush(),
+                            Some(Push::Keys(bytes)) => {
+                                w.invalidate(frame, &keys, bytes);
                                 keys.clear();
                             }
                             None => {}
@@ -658,6 +662,7 @@ async fn track_once(addr: &str, w: &Rc<Wiring>) -> Result<(), String> {
                         Some(b'-') => return Err("tracking connection error reply".to_string()),
                         _ => {}
                     }
+                    buf.advance(len);
                 }
                 resp::Scan::Invalid(e) => return Err(e.to_string()),
                 resp::Scan::Incomplete => break,
@@ -693,21 +698,20 @@ async fn track_once(addr: &str, w: &Rc<Wiring>) -> Result<(), String> {
 }
 
 // invalidation push: ["invalidate", [key, ...]], or a null meaning flush
-fn collect_push(frame: &[u8], keys: &mut Vec<Range<usize>>) -> Option<bool> {
-    let (_, mut pos) = resp::scan_int_line(frame, 1)?;
-    match resp::scan_bulk(frame, pos) {
-        Some(Ok(b))
-            if frame[b.payload_start..b.payload_end].eq_ignore_ascii_case(b"invalidate") =>
-        {
-            pos = b.next;
-        }
-        _ => return None,
+fn collect_push(frame: &[u8], keys: &mut Vec<Range<usize>>) -> Option<Push> {
+    let (_, pos) = resp::scan_int_line(frame, 1)?;
+    let Some(Ok(b)) = resp::scan_bulk(frame, pos) else {
+        return None;
+    };
+    if !frame[b.payload_start..b.payload_end].eq_ignore_ascii_case(b"invalidate") {
+        return None;
     }
+    let pos = b.next;
     match frame.get(pos)? {
         b'*' => {
             let (n, mut cur) = resp::scan_int_line(frame, pos + 1)?;
             if !(0..=INVAL_KEYS_MAX).contains(&n) {
-                return Some(true);
+                return Some(Push::Flush);
             }
             let mut bytes = 0;
             for _ in 0..n {
@@ -718,14 +722,14 @@ fn collect_push(frame: &[u8], keys: &mut Vec<Range<usize>>) -> Option<bool> {
                 bytes += b.payload_end - b.payload_start;
                 if bytes > INVAL_BYTES_MAX {
                     keys.clear();
-                    return Some(true);
+                    return Some(Push::Flush);
                 }
                 keys.push(b.payload_start..b.payload_end);
                 cur = b.next;
             }
-            Some(false)
+            Some(Push::Keys(bytes))
         }
-        b'_' => Some(true),
+        b'_' => Some(Push::Flush),
         _ => None,
     }
 }
@@ -977,17 +981,17 @@ mod tests {
     fn parses_invalidation_pushes() {
         let mut keys = Vec::new();
         let two = b">2\r\n$10\r\ninvalidate\r\n*2\r\n$2\r\nk1\r\n$2\r\nk2\r\n";
-        assert_eq!(collect_push(two, &mut keys), Some(false));
+        assert_eq!(collect_push(two, &mut keys), Some(Push::Keys(4)));
         let got: Vec<&[u8]> = keys.iter().map(|r| &two[r.clone()]).collect();
         assert_eq!(got, [b"k1".as_slice(), b"k2".as_slice()]);
         keys.clear();
         assert_eq!(
             collect_push(b">2\r\n$10\r\ninvalidate\r\n_\r\n", &mut keys),
-            Some(true)
+            Some(Push::Flush)
         );
         assert_eq!(
             collect_push(b">2\r\n$10\r\ninvalidate\r\n*-1\r\n", &mut keys),
-            Some(true)
+            Some(Push::Flush)
         );
         assert_eq!(
             collect_push(b">2\r\n$7\r\nmessage\r\n$1\r\nx\r\n", &mut keys),
@@ -999,7 +1003,7 @@ mod tests {
         for _ in 0..=INVAL_KEYS_MAX {
             huge.extend_from_slice(b"$1\r\nk\r\n");
         }
-        assert_eq!(collect_push(&huge, &mut keys), Some(true));
+        assert_eq!(collect_push(&huge, &mut keys), Some(Push::Flush));
         assert!(keys.is_empty());
         let wide_key = "k".repeat(INVAL_BYTES_MAX / 2 + 1);
         let wide = format!(
@@ -1007,7 +1011,7 @@ mod tests {
             wide_key.len(),
             wide_key
         );
-        assert_eq!(collect_push(wide.as_bytes(), &mut keys), Some(true));
+        assert_eq!(collect_push(wide.as_bytes(), &mut keys), Some(Push::Flush));
         assert!(keys.is_empty());
     }
 

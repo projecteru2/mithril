@@ -28,42 +28,34 @@ fn main() {
             }
             flag if flag.starts_with("--") => {
                 let Some(value) = args.next() else {
-                    eprintln!("missing value for {flag}");
-                    std::process::exit(1);
+                    die(format!("missing value for {flag}"));
                 };
                 overrides.push((flag[2..].to_string(), value));
             }
             path => match Config::load(path) {
                 Ok(c) => cfg = Some(c),
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                }
+                Err(e) => die(e),
             },
         }
     }
-    let mut cfg = match cfg {
-        Some(c) => c,
-        None => {
-            eprintln!("{USAGE}");
-            std::process::exit(1);
-        }
+    let Some(mut cfg) = cfg else {
+        die(USAGE);
     };
     for (key, value) in &overrides {
         if let Err(e) = cfg.set(key, value) {
-            eprintln!("{e}");
-            std::process::exit(1);
+            die(e);
         }
     }
     let cfg = match cfg.finish() {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
+        Err(e) => die(e),
     };
     if let Err(e) = mithril::server::run(cfg) {
-        eprintln!("{e}");
-        std::process::exit(1);
+        die(e);
     }
+}
+
+fn die(msg: impl std::fmt::Display) -> ! {
+    eprintln!("{msg}");
+    std::process::exit(1)
 }

@@ -2,7 +2,7 @@
 
 pub const SLOTS: usize = 16384;
 
-const CRC16_TAB: [u16; 256] = build_table();
+static CRC16_TAB: [u16; 256] = build_table();
 
 /// Returns the cluster slot for `key`, honoring `{tag}` extraction.
 pub fn slot(key: &[u8]) -> u16 {

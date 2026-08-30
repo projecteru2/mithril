@@ -201,7 +201,6 @@ pub enum Kind {
     Mget,
     /// Split key/value pairs per node, all replies must be OK (MSET).
     Mset,
-    /// Route to any master.
     AnyMaster,
     /// Blocking single-key family; uses a dedicated backend connection.
     Blocking,
@@ -253,7 +252,6 @@ impl Spec {
     }
 }
 
-/// Returns the full command table.
 pub fn table() -> &'static [Spec] {
     TABLE
 }

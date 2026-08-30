@@ -10,12 +10,10 @@ pub const WARNING: u8 = 3;
 
 static LEVEL: AtomicU8 = AtomicU8::new(NOTICE);
 
-/// Sets the global log threshold.
 pub fn set_level(level: u8) {
     LEVEL.store(level, Ordering::Relaxed);
 }
 
-/// Returns the current log threshold.
 pub fn level() -> u8 {
     LEVEL.load(Ordering::Relaxed)
 }

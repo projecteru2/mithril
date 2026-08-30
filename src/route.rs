@@ -28,7 +28,7 @@ pub fn pick(
     Some((master.replicas[pick], true))
 }
 
-/// Picks a master round-robin for keyless commands.
+/// Picks a random master for keyless commands.
 pub fn any_master(topo: &Topology, rng: &mut u64) -> Option<u16> {
     if topo.masters.is_empty() {
         return None;
