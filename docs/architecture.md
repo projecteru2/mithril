@@ -33,7 +33,8 @@ buffers. The RESP layer locates frame boundaries and argument positions
 without materializing values; a request is forwarded to its backend as a
 slice of the client's input buffer, and a reply to the client as a slice of
 the backend's. Backend writes batch up to 256 frames into one vectored
-`writev`, which is why the proxy can outrun a direct connection at depth-16
+`writev` (small batches build the iovec on the stack, so a flush allocates
+nothing), which is why the proxy can outrun a direct connection at depth-16
 pipelining: it amortizes per-operation syscall load the single-threaded
 redis processes otherwise pay themselves.
 
