@@ -4,6 +4,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, hash_map};
 use std::hash::{BuildHasherDefault, Hasher};
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -23,10 +24,14 @@ use crate::topology::Topology;
 
 // larger replies churn the byte budget faster than they earn hits
 const ENTRY_MAX_BYTES: usize = 64 * 1024;
-// per-entry map slot, key box, and refcount bookkeeping
-const ENTRY_OVERHEAD: usize = 64;
-// routing follows a new epoch per request; trackers follow within one poll
+// map slot, two heap allocations with headers and size-class rounding
+const ENTRY_OVERHEAD: usize = 96;
+// routing follows a new epoch per request; trackers follow within one poll,
+// which is also the cache clock's tick
 const TRACKER_POLL: Duration = Duration::from_millis(100);
+const TICKS_PER_SEC: u32 = 10;
+// a generation this large is freed in chunks off the request path
+const DROP_CHUNK: usize = 4096;
 const TRACKER_RETRY: Duration = Duration::from_secs(1);
 const TRACKER_PING: Duration = Duration::from_secs(2);
 // unanswered pings before a silent tracker is declared dead
@@ -49,7 +54,6 @@ pub type TrackingFrames = Rc<RefCell<HashMap<Box<str>, Bytes>>>;
 
 type Map = HashMap<Box<[u8]>, Entry, BuildHasherDefault<KeyHasher>>;
 type Fills = HashMap<Bytes, Fill, BuildHasherDefault<KeyHasher>>;
-type Sets = (HashSet<Box<str>>, HashSet<Box<str>>);
 
 /// Word-at-a-time multiply-fold; the length binds in the tail, not a prefix.
 #[derive(Default)]
@@ -79,7 +83,45 @@ impl Hasher for KeyHasher {
 
 struct Entry {
     frame: Bytes,
-    at: Instant,
+    at: u32,
+}
+
+// one cache generation and the bytes it holds
+#[derive(Default)]
+struct Gen {
+    map: RefCell<Map>,
+    bytes: Cell<usize>,
+}
+
+impl Gen {
+    fn take(&self, key: &[u8]) -> Option<(Box<[u8]>, Entry)> {
+        let mut map = self.map.borrow_mut();
+        if map.is_empty() {
+            return None;
+        }
+        let (k, e) = map.remove_entry(key)?;
+        self.bytes
+            .set(self.bytes.get() - entry_size(k.len(), e.frame.len()));
+        Some((k, e))
+    }
+
+    fn reset(&self) {
+        retire(std::mem::take(&mut *self.map.borrow_mut()));
+        self.bytes.set(0);
+    }
+}
+
+// the masters that must be tracked, and those that are
+#[derive(Default)]
+struct Sets {
+    wanted: HashSet<Box<str>>,
+    ready: HashSet<Box<str>>,
+}
+
+impl Sets {
+    fn covered(&self) -> bool {
+        !self.wanted.is_empty() && self.wanted.iter().all(|a| self.ready.contains(a))
+    }
 }
 
 // one key's in-flight state: at most one fill ticket, any number of writes
@@ -107,7 +149,7 @@ pub struct Coverage {
 impl Coverage {
     pub fn new() -> Arc<Coverage> {
         Arc::new(Coverage {
-            sets: Mutex::new((HashSet::new(), HashSet::new())),
+            sets: Mutex::new(Sets::default()),
             state: AtomicU64::new(0),
         })
     }
@@ -129,11 +171,10 @@ impl Coverage {
 /// Worker-local reply cache; two generations flip under a byte budget.
 pub struct ReplyCache {
     max_bytes: usize,
-    max_age: Duration,
-    hot: RefCell<Map>,
-    prev: RefCell<Map>,
-    hot_bytes: Cell<usize>,
-    prev_bytes: Cell<usize>,
+    max_age: u32,
+    clock: Cell<u32>,
+    hot: Gen,
+    prev: Gen,
     fills: RefCell<Fills>,
     scope: Scope,
     seen_flushes: Cell<u64>,
@@ -152,17 +193,16 @@ impl ReplyCache {
         let scope = match coverage {
             Some(c) => Scope::Shared(c),
             None => Scope::Local {
-                sets: RefCell::new((HashSet::new(), HashSet::new())),
+                sets: RefCell::new(Sets::default()),
                 armed: Cell::new(false),
             },
         };
         Rc::new(ReplyCache {
             max_bytes: cfg.reply_cache_max_bytes,
-            max_age: Duration::from_secs(cfg.reply_cache_max_age_secs),
-            hot: RefCell::new(Map::default()),
-            prev: RefCell::new(Map::default()),
-            hot_bytes: Cell::new(0),
-            prev_bytes: Cell::new(0),
+            max_age: cfg.reply_cache_max_age_secs as u32 * TICKS_PER_SEC,
+            clock: Cell::new(0),
+            hot: Gen::default(),
+            prev: Gen::default(),
             fills: RefCell::new(Fills::default()),
             scope,
             seen_flushes: Cell::new(0),
@@ -177,17 +217,23 @@ impl ReplyCache {
         self.frames.clone()
     }
 
+    /// Advances the coarse clock entries age against.
+    pub fn tick(&self, now: u32) {
+        self.clock.set(now);
+    }
+
     /// Returns the cached reply for `key` if fresh.
     pub fn lookup(&self, key: &[u8]) -> Option<Bytes> {
         self.sync();
-        if let Some(e) = self.hot.borrow().get(key) {
-            if e.at.elapsed() <= self.max_age {
+        let now = self.clock.get();
+        if let Some(e) = self.hot.map.borrow().get(key) {
+            if now.wrapping_sub(e.at) <= self.max_age {
                 return Some(e.frame.clone());
             }
             return None;
         }
-        let (k, e) = take_entry(&self.prev, &self.prev_bytes, key)?;
-        if e.at.elapsed() > self.max_age {
+        let (k, e) = self.prev.take(key)?;
+        if now.wrapping_sub(e.at) > self.max_age {
             return None;
         }
         let frame = e.frame.clone();
@@ -219,7 +265,7 @@ impl ReplyCache {
         if self.settle_ticket(key) != Some(false)
             || frame.first() != Some(&b'$')
             || frame.len() > ENTRY_MAX_BYTES
-            || entry_size(key, frame) > self.max_bytes / 2
+            || entry_size(key.len(), frame.len()) > self.max_bytes / 2
         {
             return;
         }
@@ -228,7 +274,7 @@ impl ReplyCache {
             Box::from(&key[..]),
             Entry {
                 frame: Bytes::copy_from_slice(frame),
-                at: Instant::now(),
+                at: self.clock.get(),
             },
         );
     }
@@ -240,10 +286,7 @@ impl ReplyCache {
 
     /// Drops `key` from both generations and poisons its in-flight fill.
     pub fn invalidate(&self, key: &[u8]) {
-        self.sync();
-        stats::bump(&self.stats.workers[self.worker].cache_invalidations);
-        take_entry(&self.hot, &self.hot_bytes, key);
-        take_entry(&self.prev, &self.prev_bytes, key);
+        self.evict(key);
         if let Some(f) = self.fills.borrow_mut().get_mut(key) {
             f.poisoned = true;
         }
@@ -251,7 +294,7 @@ impl ReplyCache {
 
     /// Invalidates `key` and blocks fills until [`ReplyCache::end_write`].
     pub fn begin_write(&self, key: &Bytes) {
-        self.invalidate(key);
+        self.evict(key);
         let mut fills = self.fills.borrow_mut();
         let f = fills.entry(key.clone()).or_insert(Fill {
             ticket: false,
@@ -274,10 +317,8 @@ impl ReplyCache {
 
     /// Empties both generations and poisons every in-flight fill.
     pub fn clear(&self) {
-        *self.hot.borrow_mut() = Map::default();
-        *self.prev.borrow_mut() = Map::default();
-        self.hot_bytes.set(0);
-        self.prev_bytes.set(0);
+        self.hot.reset();
+        self.prev.reset();
         for f in self.fills.borrow_mut().values_mut() {
             f.poisoned = true;
         }
@@ -285,15 +326,7 @@ impl ReplyCache {
 
     /// Clears every cache in the scope.
     pub fn flush(&self) {
-        match &self.scope {
-            Scope::Local { .. } => self.clear(),
-            Scope::Shared(c) => {
-                let sets = c.lock();
-                c.publish(covered(&sets), true);
-                drop(sets);
-                self.sync();
-            }
-        }
+        self.coverage(|_| true);
     }
 
     // catches up with the scope's flush generation; returns whether fills may arm
@@ -312,6 +345,13 @@ impl ReplyCache {
         }
     }
 
+    fn evict(&self, key: &[u8]) {
+        self.sync();
+        stats::bump(&self.stats.workers[self.worker].cache_invalidations);
+        self.hot.take(key);
+        self.prev.take(key);
+    }
+
     // returns the ticket's poison state; the key's entry goes once nothing is in flight
     fn settle_ticket(&self, key: &[u8]) -> Option<bool> {
         let mut fills = self.fills.borrow_mut();
@@ -328,43 +368,48 @@ impl ReplyCache {
     }
 
     fn insert_hot(&self, k: Box<[u8]>, e: Entry) {
-        let size = entry_size(&k, &e.frame);
-        if self.hot_bytes.get() + size > self.max_bytes / 2 {
-            let flipped = std::mem::take(&mut *self.hot.borrow_mut());
-            *self.prev.borrow_mut() = flipped;
-            self.prev_bytes.set(self.hot_bytes.get());
-            self.hot_bytes.set(0);
-        }
-        let mut hot = self.hot.borrow_mut();
         let klen = k.len();
-        let replaced = match hot.insert(k, e) {
-            Some(old) => klen + old.frame.len() + ENTRY_OVERHEAD,
+        let size = entry_size(klen, e.frame.len());
+        if self.hot.bytes.get() + size > self.max_bytes / 2 {
+            let flipped = std::mem::take(&mut *self.hot.map.borrow_mut());
+            retire(std::mem::replace(&mut *self.prev.map.borrow_mut(), flipped));
+            self.prev.bytes.set(self.hot.bytes.get());
+            self.hot.bytes.set(0);
+        }
+        let replaced = match self.hot.map.borrow_mut().insert(k, e) {
+            Some(old) => entry_size(klen, old.frame.len()),
             None => 0,
         };
-        self.hot_bytes.set(self.hot_bytes.get() + size - replaced);
+        self.hot.bytes.set(self.hot.bytes.get() + size - replaced);
+    }
+
+    // applies one coverage change; `f` says whether the scope must flush
+    fn coverage(&self, f: impl FnOnce(&mut Sets) -> bool) {
+        let armed = match &self.scope {
+            Scope::Local { sets, armed } => {
+                let mut sets = sets.borrow_mut();
+                if f(&mut sets) {
+                    self.clear();
+                }
+                armed.set(sets.covered());
+                armed.get()
+            }
+            Scope::Shared(c) => {
+                let mut sets = c.lock();
+                let flush = f(&mut sets);
+                let armed = sets.covered();
+                c.publish(armed, flush);
+                drop(sets);
+                self.sync();
+                armed
+            }
+        };
+        self.publish_stat(armed);
     }
 
     // any master-set change disarms immediately, before old trackers unwind
     fn set_coverage(&self, want: &HashSet<&str>) {
-        match &self.scope {
-            Scope::Local { sets, armed } => {
-                let mut sets = sets.borrow_mut();
-                if replace_set(&mut sets.0, want) {
-                    self.clear();
-                }
-                armed.set(covered(&sets));
-                self.publish(armed.get());
-            }
-            Scope::Shared(c) => {
-                let mut sets = c.lock();
-                let changed = replace_set(&mut sets.0, want);
-                let armed = covered(&sets);
-                c.publish(armed, changed);
-                drop(sets);
-                self.sync();
-                self.publish(armed);
-            }
-        }
+        self.coverage(|s| replace_set(&mut s.wanted, want));
     }
 
     // a dialer that races the rearm picks the frame up from here
@@ -373,48 +418,22 @@ impl ReplyCache {
     }
 
     fn tracker_up(&self, addr: &str) {
-        match &self.scope {
-            Scope::Local { sets, armed } => {
-                let mut sets = sets.borrow_mut();
-                sets.1.insert(Box::from(addr));
-                armed.set(covered(&sets));
-                self.publish(armed.get());
-            }
-            Scope::Shared(c) => {
-                let mut sets = c.lock();
-                sets.1.insert(Box::from(addr));
-                let armed = covered(&sets);
-                c.publish(armed, false);
-                self.publish(armed);
-            }
-        }
+        self.coverage(|s| {
+            s.ready.insert(Box::from(addr));
+            false
+        });
     }
 
     // missed invalidations: nothing cached survives, and no dial may redirect at the dead id
     fn tracker_down(&self, addr: &str) {
         self.frames.borrow_mut().remove(addr);
-        let armed = match &self.scope {
-            Scope::Local { sets, armed } => {
-                let mut sets = sets.borrow_mut();
-                sets.1.remove(addr);
-                self.clear();
-                armed.set(covered(&sets));
-                armed.get()
-            }
-            Scope::Shared(c) => {
-                let mut sets = c.lock();
-                sets.1.remove(addr);
-                let armed = covered(&sets);
-                c.publish(armed, true);
-                drop(sets);
-                self.sync();
-                armed
-            }
-        };
-        self.publish(armed);
+        self.coverage(|s| {
+            s.ready.remove(addr);
+            true
+        });
     }
 
-    fn publish(&self, armed: bool) {
+    fn publish_stat(&self, armed: bool) {
         let armed = u64::from(armed);
         match &self.scope {
             Scope::Local { .. } => self.stats.workers[self.worker]
@@ -429,14 +448,22 @@ impl ReplyCache {
     }
 }
 
-fn entry_size(key: &[u8], frame: &Bytes) -> usize {
-    key.len() + frame.len() + ENTRY_OVERHEAD
+fn entry_size(key_len: usize, frame_len: usize) -> usize {
+    key_len + frame_len + ENTRY_OVERHEAD
 }
 
-fn take_entry(map: &RefCell<Map>, bytes: &Cell<usize>, key: &[u8]) -> Option<(Box<[u8]>, Entry)> {
-    let (k, e) = map.borrow_mut().remove_entry(key)?;
-    bytes.set(bytes.get() - entry_size(&k, &e.frame));
-    Some((k, e))
+// frees a large generation a chunk at a time so no request waits on the whole drop
+fn retire(map: Map) {
+    if map.len() <= DROP_CHUNK || tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    tokio::task::spawn_local(async move {
+        let mut map = map;
+        let mut drain = map.drain();
+        while drain.by_ref().take(DROP_CHUNK).count() == DROP_CHUNK {
+            tokio::task::yield_now().await;
+        }
+    });
 }
 
 fn replace_set(cur: &mut HashSet<Box<str>>, want: &HashSet<&str>) -> bool {
@@ -445,10 +472,6 @@ fn replace_set(cur: &mut HashSet<Box<str>>, want: &HashSet<&str>) -> bool {
     }
     *cur = want.iter().map(|&a| Box::from(a)).collect();
     true
-}
-
-fn covered((wanted, ready): &Sets) -> bool {
-    !wanted.is_empty() && wanted.iter().all(|a| ready.contains(a))
 }
 
 /// Where a worker's trackers deliver what they receive.
@@ -475,12 +498,12 @@ impl Wiring {
     }
 
     // compacted so the batch never pins the read buffer; a worker that cannot take it flushes
-    fn invalidate(&self, keys: &[Bytes]) {
+    fn invalidate(&self, frame: &[u8], keys: &[Range<usize>]) {
         match &self.fabric {
             Some(f) => {
-                let mut compact = BytesMut::with_capacity(keys.iter().map(Bytes::len).sum());
+                let mut compact = BytesMut::with_capacity(keys.iter().map(Range::len).sum());
                 for k in keys {
-                    compact.extend_from_slice(k);
+                    compact.extend_from_slice(&frame[k.clone()]);
                 }
                 let compact = compact.freeze();
                 let mut at = 0;
@@ -498,7 +521,7 @@ impl Wiring {
             }
             None => {
                 for k in keys {
-                    self.cache.invalidate(k);
+                    self.cache.invalidate(&frame[k.clone()]);
                 }
             }
         }
@@ -509,7 +532,10 @@ impl Wiring {
 pub async fn run_trackers(w: Rc<Wiring>, topo: Arc<ArcSwap<Topology>>) {
     let mut running: HashMap<Box<str>, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut seen_epoch = 0u64;
+    let started = Instant::now();
     loop {
+        w.cache
+            .tick((started.elapsed().as_millis() / TRACKER_POLL.as_millis()) as u32);
         if crate::server::topo_epoch() != seen_epoch {
             let t = topo.load_full();
             seen_epoch = t.epoch;
@@ -612,7 +638,7 @@ async fn track_once(addr: &str, w: &Rc<Wiring>) -> Result<(), String> {
     let mut ping = tokio::time::interval(TRACKER_PING);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut debt = 0u32;
-    let mut keys: Vec<Bytes> = Vec::new();
+    let mut keys: Vec<Range<usize>> = Vec::new();
     let mut cur = resp::Cursor::default();
     loop {
         loop {
@@ -623,7 +649,7 @@ async fn track_once(addr: &str, w: &Rc<Wiring>) -> Result<(), String> {
                         Some(b'>') => match collect_push(&frame, &mut keys) {
                             Some(true) => w.cache.flush(),
                             Some(false) => {
-                                w.invalidate(&keys);
+                                w.invalidate(&frame, &keys);
                                 keys.clear();
                             }
                             None => {}
@@ -667,7 +693,7 @@ async fn track_once(addr: &str, w: &Rc<Wiring>) -> Result<(), String> {
 }
 
 // invalidation push: ["invalidate", [key, ...]], or a null meaning flush
-fn collect_push(frame: &Bytes, keys: &mut Vec<Bytes>) -> Option<bool> {
+fn collect_push(frame: &[u8], keys: &mut Vec<Range<usize>>) -> Option<bool> {
     let (_, mut pos) = resp::scan_int_line(frame, 1)?;
     match resp::scan_bulk(frame, pos) {
         Some(Ok(b))
@@ -694,7 +720,7 @@ fn collect_push(frame: &Bytes, keys: &mut Vec<Bytes>) -> Option<bool> {
                     keys.clear();
                     return Some(true);
                 }
-                keys.push(frame.slice(b.payload_start..b.payload_end));
+                keys.push(b.payload_start..b.payload_end);
                 cur = b.next;
             }
             Some(false)
@@ -913,16 +939,16 @@ mod tests {
         fill(&c, "d", "4");
         assert_eq!(c.lookup(&k1), Some(f1), "promotion survived the flip");
         assert_eq!(c.lookup(&k2), None, "unpromoted entry aged out");
-        assert!(c.hot_bytes.get() + c.prev_bytes.get() <= budget);
+        assert!(c.hot.bytes.get() + c.prev.bytes.get() <= budget);
     }
 
     #[test]
     fn overwrite_debits_the_replaced_entry() {
         let c = cache(1 << 20);
         let (_, f1) = fill(&c, "k", "short");
-        let before = c.hot_bytes.get();
+        let before = c.hot.bytes.get();
         let (_, f2) = fill(&c, "k", "a much longer value");
-        assert_eq!(c.hot_bytes.get(), before + f2.len() - f1.len());
+        assert_eq!(c.hot.bytes.get(), before + f2.len() - f1.len());
     }
 
     #[test]
@@ -944,29 +970,36 @@ mod tests {
         assert!(c.begin_fill(&huge_key));
         c.complete_fill(&huge_key, &Bytes::from_static(b"$1\r\nv\r\n"));
         assert_eq!(c.lookup(&huge_key), None);
-        assert_eq!(c.hot_bytes.get(), 0);
+        assert_eq!(c.hot.bytes.get(), 0);
     }
 
     #[test]
     fn parses_invalidation_pushes() {
         let mut keys = Vec::new();
-        let two = Bytes::from_static(b">2\r\n$10\r\ninvalidate\r\n*2\r\n$2\r\nk1\r\n$2\r\nk2\r\n");
-        assert_eq!(collect_push(&two, &mut keys), Some(false));
-        assert_eq!(keys, [Bytes::from_static(b"k1"), Bytes::from_static(b"k2")]);
+        let two = b">2\r\n$10\r\ninvalidate\r\n*2\r\n$2\r\nk1\r\n$2\r\nk2\r\n";
+        assert_eq!(collect_push(two, &mut keys), Some(false));
+        let got: Vec<&[u8]> = keys.iter().map(|r| &two[r.clone()]).collect();
+        assert_eq!(got, [b"k1".as_slice(), b"k2".as_slice()]);
         keys.clear();
-        let nil = Bytes::from_static(b">2\r\n$10\r\ninvalidate\r\n_\r\n");
-        assert_eq!(collect_push(&nil, &mut keys), Some(true));
-        let nil_array = Bytes::from_static(b">2\r\n$10\r\ninvalidate\r\n*-1\r\n");
-        assert_eq!(collect_push(&nil_array, &mut keys), Some(true));
-        let other = Bytes::from_static(b">2\r\n$7\r\nmessage\r\n$1\r\nx\r\n");
-        assert_eq!(collect_push(&other, &mut keys), None);
+        assert_eq!(
+            collect_push(b">2\r\n$10\r\ninvalidate\r\n_\r\n", &mut keys),
+            Some(true)
+        );
+        assert_eq!(
+            collect_push(b">2\r\n$10\r\ninvalidate\r\n*-1\r\n", &mut keys),
+            Some(true)
+        );
+        assert_eq!(
+            collect_push(b">2\r\n$7\r\nmessage\r\n$1\r\nx\r\n", &mut keys),
+            None
+        );
         assert!(keys.is_empty());
         let mut huge =
             format!(">2\r\n$10\r\ninvalidate\r\n*{}\r\n", INVAL_KEYS_MAX + 1).into_bytes();
         for _ in 0..=INVAL_KEYS_MAX {
             huge.extend_from_slice(b"$1\r\nk\r\n");
         }
-        assert_eq!(collect_push(&Bytes::from(huge), &mut keys), Some(true));
+        assert_eq!(collect_push(&huge, &mut keys), Some(true));
         assert!(keys.is_empty());
         let wide_key = "k".repeat(INVAL_BYTES_MAX / 2 + 1);
         let wide = format!(
@@ -974,7 +1007,17 @@ mod tests {
             wide_key.len(),
             wide_key
         );
-        assert_eq!(collect_push(&Bytes::from(wide), &mut keys), Some(true));
+        assert_eq!(collect_push(wide.as_bytes(), &mut keys), Some(true));
         assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn entries_age_against_the_coarse_clock() {
+        let c = cache(1 << 20);
+        let (key, frame) = fill(&c, "k1", "v1");
+        c.tick(c.max_age);
+        assert_eq!(c.lookup(&key), Some(frame));
+        c.tick(c.max_age + 1);
+        assert_eq!(c.lookup(&key), None);
     }
 }

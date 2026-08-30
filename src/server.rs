@@ -217,12 +217,8 @@ fn acceptor_thread(
                 return;
             }
         };
-        let mut next = 0usize;
-        let mut cmd_snap = vec![0u64; conn_txs.len()];
-        let mut buckets = vec![0u64; conn_txs.len()];
-        let mut placed = vec![0u64; conn_txs.len()];
-        let mut order: Vec<usize> = Vec::with_capacity(conn_txs.len());
         let least_loaded = cfg.placement == Placement::LeastLoaded;
+        let mut placer = Placer::new(conn_txs.len(), least_loaded);
         let period = if least_loaded {
             SNAP_WINDOW
         } else {
@@ -235,7 +231,7 @@ fn acceptor_thread(
                 a = listener.accept() => Some(a),
                 _ = tick.tick() => {
                     if least_loaded {
-                        refresh_buckets(&stats, &mut cmd_snap, &mut buckets, &mut placed);
+                        placer.refresh(&stats);
                     }
                     None
                 }
@@ -263,20 +259,14 @@ fn acceptor_thread(
             if admitted.stream.is_none() {
                 continue;
             }
-            // a full queue falls to the next-best key and never stalls accepts
+            // a full queue falls through the rotation and never stalls accepts
             'place: loop {
-                order.clear();
-                order.extend(0..conn_txs.len());
-                order.rotate_left(next);
-                if least_loaded {
-                    // stable sort keeps rotation order inside equal keys
-                    order.sort_by_key(|&i| (placed[i], buckets[i]));
-                }
-                for &i in &order {
+                let best = placer.best();
+                for k in 0..conn_txs.len() {
+                    let i = (best + k) % conn_txs.len();
                     match conn_txs[i].try_send(admitted) {
                         Ok(()) => {
-                            placed[i] += 1;
-                            next = (i + 1) % conn_txs.len();
+                            placer.placed(i);
                             break 'place;
                         }
                         Err(e) => admitted = e.into_inner(),
@@ -287,7 +277,7 @@ fn acceptor_thread(
                 }
                 if least_loaded {
                     tick.tick().await;
-                    refresh_buckets(&stats, &mut cmd_snap, &mut buckets, &mut placed);
+                    placer.refresh(&stats);
                 } else {
                     tokio::time::sleep(DRAIN_POLL).await;
                 }
@@ -385,18 +375,60 @@ fn worker_thread(
     });
 }
 
-fn refresh_buckets(stats: &Stats, snap: &mut [u64], buckets: &mut [u64], placed: &mut [u64]) {
-    let mut total = 0u64;
-    for i in 0..snap.len() {
-        let c = stats.workers[i].commands.load(Ordering::Relaxed);
-        buckets[i] = c - snap[i];
-        snap[i] = c;
-        placed[i] = 0;
-        total += buckets[i];
+// least-loaded placement: recent activity per worker, placements this window
+struct Placer {
+    snap: Vec<u64>,
+    buckets: Vec<u64>,
+    placed: Vec<u64>,
+    next: usize,
+    least_loaded: bool,
+}
+
+impl Placer {
+    fn new(workers: usize, least_loaded: bool) -> Placer {
+        Placer {
+            snap: vec![0; workers],
+            buckets: vec![0; workers],
+            placed: vec![0; workers],
+            next: 0,
+            least_loaded,
+        }
     }
-    let share = (total / snap.len() as u64).max(1);
-    for b in buckets.iter_mut() {
-        *b = if total < QUIET_FLOOR { 0 } else { *b / share };
+
+    fn refresh(&mut self, stats: &Stats) {
+        let mut total = 0u64;
+        for i in 0..self.snap.len() {
+            let c = stats.workers[i].commands.load(Ordering::Relaxed);
+            self.buckets[i] = c - self.snap[i];
+            self.snap[i] = c;
+            self.placed[i] = 0;
+            total += self.buckets[i];
+        }
+        let share = (total / self.snap.len() as u64).max(1);
+        for b in self.buckets.iter_mut() {
+            *b = if total < QUIET_FLOOR { 0 } else { *b / share };
+        }
+    }
+
+    // the least (placed, bucket) key; rotation order breaks ties
+    fn best(&self) -> usize {
+        let n = self.snap.len();
+        let mut best = self.next;
+        if self.least_loaded {
+            let key = |i: usize| (self.placed[i], self.buckets[i]);
+            for k in 1..n {
+                let i = (self.next + k) % n;
+                if key(i) < key(best) {
+                    best = i;
+                }
+            }
+        }
+        best
+    }
+
+    fn placed(&mut self, i: usize) {
+        self.placed[i] += 1;
+        self.next = (i + 1) % self.snap.len();
     }
 }
 

@@ -21,7 +21,7 @@ pub fn pick(
         SlaveMode::WriteOnly => n,
         _ => n + 1,
     };
-    let pick = (next_rand(rng) % pool as u64) as usize;
+    let pick = bounded(next_rand(rng), pool);
     if pick >= n {
         return Some((midx, false));
     }
@@ -33,7 +33,12 @@ pub fn any_master(topo: &Topology, rng: &mut u64) -> Option<u16> {
     if topo.masters.is_empty() {
         return None;
     }
-    Some(topo.masters[(next_rand(rng) % topo.masters.len() as u64) as usize])
+    Some(topo.masters[bounded(next_rand(rng), topo.masters.len())])
+}
+
+// multiply-shift keeps the uniform draw and avoids a runtime-divisor divide
+fn bounded(x: u64, n: usize) -> usize {
+    ((u128::from(x) * n as u128) >> 64) as usize
 }
 
 fn next_rand(state: &mut u64) -> u64 {

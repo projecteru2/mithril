@@ -52,14 +52,24 @@ where
     // adversarial key sets span thousands of slots: stay O(1) per key
     let mut by_slot: HashMap<u16, usize, std::hash::BuildHasherDefault<SlotHasher>> =
         HashMap::default();
+    let width = 1 + usize::from(values.is_some());
     for (i, (key, &slot)) in keys.iter().zip(slots).enumerate() {
-        let g = match by_slot.get(&slot) {
-            Some(&g) => g,
-            None => {
+        let g = match by_slot.entry(slot) {
+            std::collections::hash_map::Entry::Occupied(g) => *g.get(),
+            std::collections::hash_map::Entry::Vacant(v) => {
                 let node = route(slot).ok_or_else(|| "slot has no owner".to_string())?;
-                by_slot.insert(slot, parts.len());
-                parts.push((node, vec![name], Vec::new()));
-                parts.len() - 1
+                // the first group is sized for the common single-slot case
+                let (mut args, positions) = if parts.is_empty() {
+                    (
+                        Vec::with_capacity(1 + keys.len() * width),
+                        Vec::with_capacity(keys.len()),
+                    )
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                args.push(name);
+                parts.push((node, args, positions));
+                *v.insert(parts.len() - 1)
             }
         };
         let entry = &mut parts[g];
