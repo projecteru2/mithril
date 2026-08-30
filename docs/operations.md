@@ -2,16 +2,20 @@
 
 ## Observability
 
-`INFO` reports four sections. Counters are cumulative since start and
+`INFO` reports five sections. Counters are cumulative since start and
 aggregated across workers; `worker_commands` breaks commands down per worker
 so placement skew is visible at a glance.
 
 | section | fields |
 |---|---|
-| Server | version, process id, uptime |
-| Clients | `connected_clients`, `total_connections` |
-| Stats | `total_commands`, `total_errors`, `redirects`, `bytes_in`, `bytes_out` |
-| Mithril | `worker_threads`, `worker_commands` (per-worker), session lifecycle counters (`readers_exited`, `writers_exited`, `sessions_closed`) |
+| Server | `mithril_version`, `process_id`, `tcp_port`, `uptime_in_seconds`, `config_file` |
+| Clients | `connected_clients` |
+| CPU | `used_cpu_sys`, `used_cpu_user` |
+| Stats | `total_connections_received`, `total_commands_processed`, `total_net_input_bytes`, `total_net_output_bytes`, `total_errors`, `redirections`, session lifecycle counters (`readers_exited`, `writers_exited`, `sessions_closed`) |
+| Mithril | `worker_threads`, `backend_conns_per_node`, `backend_sharding`, `slave_mode`, `reply_cache`, `cache_hits`, `cache_misses`, `cache_invalidations`, `cache_armed_workers`, `worker_commands` (per-worker) |
+
+`CLIENT LIST` lists every connection across workers (id, addr, fd, name,
+age).
 
 The lifecycle counters exist for deploy verification: after a binary swap,
 `readers_exited`/`sessions_closed` moving under load proves which binary is
@@ -32,9 +36,12 @@ should stop routing before signaling.
 MOVED/ASK redirects are absorbed transparently (one retry against the named
 target) and each one schedules a topology refresh, so a live slot migration
 or a failover converges within the refresh debounce plus one round trip —
-verified against a live `CLUSTER SETSLOT` migration under traffic. If a slot
-has no known owner the client receives `-CLUSTERDOWN`; if a retry is not
-possible the client receives `-TRYAGAIN` and should back off and retry.
+verified against a live `CLUSTER SETSLOT` migration under traffic. Multi-key
+commands that the server refuses mid-migration (`TRYAGAIN`, keys split
+across source and target) are re-issued key by key, so they complete too.
+If a slot has no known owner the client receives `-CLUSTERDOWN`; if a retry
+is not possible the client receives `-TRYAGAIN` and should back off and
+retry.
 
 ## Deployment notes
 

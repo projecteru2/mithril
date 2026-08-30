@@ -23,9 +23,10 @@ thread-per-core runtime and zero-copy frame forwarding.
   materializing values, and replies re-order per client by sequence number so
   pipelining is preserved end to end
 - **Full cluster absorption** — slot routing with per-slot multi-key fan-out,
-  transparent MOVED/ASK retry verified against live slot migrations, and
-  single-virtual-node cluster emulation so cluster-aware clients work
-  unchanged against one endpoint
+  transparent MOVED/ASK retry, multi-key commands that ride out a migrating
+  slot (a `TRYAGAIN` part is re-issued key by key), all verified against
+  live slot migrations, and single-virtual-node cluster emulation so
+  cluster-aware clients work unchanged against one endpoint
 - **Reply cache** — optional worker-local GET cache kept coherent by the
   cluster itself: every backend connection redirects RESP3 key tracking to
   a per-worker tracker and opts each cached read in, so the servers
@@ -71,10 +72,11 @@ See [`mithril.conf.sample`](mithril.conf.sample) and the
 make test lint fmt-check   # the CI gate
 ```
 
-The integration suite lives in [`it/`](it/): 43 dockerized tests driving a
-real 3-master/3-replica cluster through the proxy with redis-py, run against
-redis 6.2 through 8.2 and valkey 9.1 in every mode combination
-(`backend-sharding`, `reply-cache`).
+The integration suite lives in [`it/`](it/): 48 dockerized tests driving a
+real 3-master/3-replica cluster through the proxy with redis-py — including
+a live slot migration under multi-key commands — run against redis 6.2
+through 8.2 and valkey 9.1 in every mode combination (`backend-sharding`,
+`reply-cache`).
 
 ## License
 

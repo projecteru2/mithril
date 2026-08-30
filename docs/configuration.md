@@ -7,7 +7,7 @@ See [`mithril.conf.sample`](https://github.com/projecteru2/mithril/blob/master/m
 
 | key | type | default | meaning |
 |---|---|---|---|
-| `bind` | address | `0.0.0.0` | listen address; one socket, owned by the acceptor thread |
+| `bind` | address | `0.0.0.0` | listen address (IPv4 or IPv6 literal); one socket, owned by the acceptor thread |
 | `port` | u16 | `7979` | listen port |
 | `announce-addr` | addr:port | `bind:port` | address the cluster emulation advertises to clients; must be externally routable when `bind` is a wildcard |
 | `bootstrap` | list | required | comma-separated seed nodes of the backing cluster |

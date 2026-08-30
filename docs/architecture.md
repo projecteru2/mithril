@@ -50,6 +50,20 @@ binary search, retries it transparently against the named target (with
 `ASKING` when required), and the client never sees a redirect — an
 unretryable one is converted to `-TRYAGAIN`.
 
+A slot under migration answers a multi-key request with `-TRYAGAIN` once
+its keys are split across source and target. The request is then re-issued
+key by key with the same command name — each single-key request follows
+`ASK` on its own, at most 256 in flight — and the replies merge as usual
+(MGET keeps every item, sums and OKs fold as they arrive). A fan-out part
+does this inside the fan-out task before its gate is released. A
+single-slot command does it from the writer only when nothing was
+dispatched after it (no later sequence exists), registering a slot gate for
+the resend and re-invalidating its write keys before the gate opens;
+otherwise the `TRYAGAIN` reaches the client and the session marks the slot
+so its later same-slot multi-key commands take the gated fan-out path until
+the slot's owner changes. Non-error replies pay nothing: the check lives in
+the error branch.
+
 Pubsub confirmations reserve their sequence slots before the command is even
 sent, from a reader-side mirror of the subscription set, so SUBSCRIBE
 replies interleave with normal replies in exactly the order redis would
@@ -105,6 +119,8 @@ coverage is process-wide. Replica reads and redirect retries carry no
 opt-in and therefore never fill.
 
 A fan-out (MGET/MSET/DEL...) also gates its slots on the session until its
-first-round replies are in, so a later same-slot command cannot have its
-own redirect retry land before the fan-out's. Other slots and other
-sessions are unaffected; the hot path pays one emptiness check.
+replies — redirect retries and key-by-key resends included — are in, so a
+later same-slot command cannot land before the fan-out's own retries.
+Cluster-wide commands (DBSIZE, FLUSHALL, SCAN) wait for every gate. Other
+slots and other sessions are unaffected; the hot path pays one emptiness
+check.

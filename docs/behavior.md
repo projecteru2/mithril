@@ -12,6 +12,16 @@
 - Blocking commands and pubsub use dedicated backend connections.
 - MOVED/ASK are absorbed: one transparent retry against the named target,
   plus a debounced topology refresh.
+- A multi-key command whose keys are split across a migrating slot
+  (`TRYAGAIN` from the server) is re-issued key by key, so it completes
+  through the migration; a same-slot MSET/DEL is then no longer atomic, and
+  a pipelined client with requests queued behind such a command receives
+  one `TRYAGAIN` for it before the session switches that slot to the
+  ordered path. PFCOUNT is never split this way.
+- After a failover the proxy's topology lags by at most one refresh
+  (`topology-refresh-secs`, or the first redirect it sees): in that window a
+  cluster-wide command can reach a demoted node and return `READONLY`, and a
+  keyed command is redirected transparently.
 - SCAN iterates the whole cluster with synthetic cursors (master index packed
   into the high bits). DBSIZE sums masters; FLUSHALL broadcasts.
 - CLUSTER NODES/SLOTS/SHARDS advertise the proxy itself as a single node
