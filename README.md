@@ -37,8 +37,10 @@ thread-per-core runtime and zero-copy frame forwarding.
   blocking commands and pubsub on dedicated backend connections with fully
   ordered subscription confirmations, cluster-wide SCAN with synthetic
   cursors, replica read splitting
-- **Fast** — beats predixy and mt-proxy at pipeline depth 16 on bare metal
-  while staying within ~2% of the fastest at depth 1; see
+- **Fast** — on a 32-node cluster with 8-worker proxies, mithril with the
+  reply cache leads every cell of an 8-cell memtier/redis-benchmark matrix
+  against mt-proxy and predixy (pipeline 1 through 16, 64 B to 4 KiB values,
+  mixed 1:1 SET/GET), with the best p99 in six of them; see
   [benchmarks](https://projecteru2.github.io/mithril/benchmarks.html)
 
 ## Quick start
