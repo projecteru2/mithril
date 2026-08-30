@@ -1,6 +1,6 @@
 //! Client sessions: dispatch, ordered replies, MULTI, pubsub, redirects.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::hash::BuildHasherDefault;
@@ -434,17 +434,17 @@ impl Session {
         it.nth(key_index).map(crc16::slot)
     }
 
-    // one Vec index per request once warm; re-resolves on epoch or death
-    fn cached_pipe(&self, topo: &Topology, idx: u16, is_replica: bool) -> Pipe {
-        {
-            let cache = self.conns.borrow();
-            if cache.epoch == topo.epoch
-                && let Some(Some(pipe)) = cache.by_node.get(idx as usize)
-                && !pipe.is_dead()
-            {
-                return pipe.clone();
-            }
+    // one borrow and index per request once warm; re-resolves on epoch or death
+    fn cached_pipe(&self, topo: &Topology, idx: u16, is_replica: bool) -> Option<Ref<'_, Pipe>> {
+        let i = idx as usize;
+        if let Ok(pipe) = Ref::filter_map(self.conns.borrow(), |c| c.live(topo.epoch, i)) {
+            return Some(pipe);
         }
+        self.resolve_pipe(topo, i, is_replica);
+        Ref::filter_map(self.conns.borrow(), |c| c.live(topo.epoch, i)).ok()
+    }
+
+    fn resolve_pipe(&self, topo: &Topology, i: usize, is_replica: bool) {
         let mut cache = self.conns.borrow_mut();
         if cache.epoch != topo.epoch {
             cache.epoch = topo.epoch;
@@ -453,20 +453,12 @@ impl Session {
         if cache.by_node.len() < topo.nodes.len() {
             cache.by_node.resize(topo.nodes.len(), None);
         }
-        let entry = &mut cache.by_node[idx as usize];
-        if let Some(pipe) = entry
-            && !pipe.is_dead()
-        {
-            return pipe.clone();
-        }
-        let pipe = pipe_for(
+        cache.by_node[i] = Some(pipe_for(
             &self.shared,
-            &topo.nodes[idx as usize].addr,
+            &topo.nodes[i].addr,
             self.id,
             is_replica,
-        );
-        *entry = Some(pipe.clone());
-        pipe
+        ));
     }
 
     fn queue_at(
@@ -524,7 +516,11 @@ impl Session {
                 self.emit_at(seq, Bytes::from_static(ERR_NO_OWNER));
                 return;
             };
-            self.cached_pipe(&topo, idx, false)
+            let Some(pipe) = self.cached_pipe(&topo, idx, false) else {
+                self.emit_at(seq, Bytes::from_static(ERR_BACKEND_LOST));
+                return;
+            };
+            pipe.clone()
         };
         self.send_at(&pipe, seq, frame, 1).await;
     }
@@ -548,7 +544,11 @@ impl Session {
             self.emit_at(seq, Bytes::from_static(ERR_NO_OWNER));
             return None;
         };
-        Some(self.cached_pipe(&topo, idx, false))
+        let Some(pipe) = self.cached_pipe(&topo, idx, false) else {
+            self.emit_at(seq, Bytes::from_static(ERR_BACKEND_LOST));
+            return None;
+        };
+        Some(pipe.clone())
     }
 
     fn route_single(
@@ -563,16 +563,22 @@ impl Session {
             let topo = self.topo();
             let picked = self
                 .with_rng(|r| route::pick(&topo, slot, readonly, self.shared.cfg.slave_mode, r));
-            let Some((idx, is_replica)) = picked else {
+            let routed = picked.and_then(|(idx, ro)| Some((self.cached_pipe(&topo, idx, ro)?, ro)));
+            let Some(routed) = routed else {
                 if let Some(key) = &fill
                     && let Some(cache) = &self.shared.cache
                 {
                     cache.abandon_fill(key);
                 }
-                self.emit_at(seq, Bytes::from_static(ERR_NO_OWNER));
+                let err = if picked.is_some() {
+                    ERR_BACKEND_LOST
+                } else {
+                    ERR_NO_OWNER
+                };
+                self.emit_at(seq, Bytes::from_static(err));
                 return None;
             };
-            (self.cached_pipe(&topo, idx, is_replica), is_replica)
+            routed
         };
         // replica connections are untracked: their replies never fill
         if is_replica
@@ -861,8 +867,12 @@ impl Session {
         };
         let pipes = parts
             .iter()
-            .map(|part| self.cached_pipe(&topo, part.node, part.readonly))
+            .map(|part| Some(self.cached_pipe(&topo, part.node, part.readonly)?.clone()))
             .collect();
+        let Some(pipes) = pipes else {
+            self.emit_at(seq, Bytes::from_static(ERR_BACKEND_LOST));
+            return Planned::Failed;
+        };
         Planned::Parts(FanoutPlan {
             seq,
             merge: match spec.kind {
@@ -1555,6 +1565,14 @@ impl Session {
 struct ConnCache {
     epoch: u64,
     by_node: Vec<Option<Pipe>>,
+}
+
+impl ConnCache {
+    fn live(&self, epoch: u64, i: usize) -> Option<&Pipe> {
+        (self.epoch == epoch)
+            .then(|| self.by_node.get(i)?.as_ref().filter(|p| !p.is_dead()))
+            .flatten()
+    }
 }
 
 /// A route to one backend node: worker-local conn or the process-wide shard.
