@@ -2,7 +2,7 @@
 
 use crate::crc16::SLOTS;
 
-pub const NO_NODE: u16 = u16::MAX;
+const NO_NODE: u16 = u16::MAX;
 
 /// One cluster node as seen in CLUSTER NODES output.
 #[derive(Debug, Clone)]

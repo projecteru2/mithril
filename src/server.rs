@@ -347,7 +347,6 @@ fn worker_thread(
             backends,
             wstats: stats.workers[worker].clone(),
             stats: stats.clone(),
-            worker,
             refresh,
             started,
             fabric,

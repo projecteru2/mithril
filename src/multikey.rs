@@ -6,7 +6,7 @@ use bytes::Bytes;
 
 use crate::resp;
 
-pub const SCAN_CURSOR_BITS: u32 = 51;
+const SCAN_CURSOR_BITS: u32 = 51;
 
 /// Sub-request for one slot: rebuilt command plus original key positions.
 pub struct Part {
@@ -95,7 +95,7 @@ where
 }
 
 /// Splits a multi-bulk reply into its top-level element frames.
-pub(crate) fn split_array(frame: &[u8]) -> Option<Vec<&[u8]>> {
+fn split_array(frame: &[u8]) -> Option<Vec<&[u8]>> {
     if frame.first() != Some(&b'*') {
         return None;
     }

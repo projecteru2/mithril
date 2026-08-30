@@ -10,7 +10,7 @@ pub fn slot(key: &[u8]) -> u16 {
 }
 
 /// Returns the hash-tag portion of `key` per the cluster spec.
-pub fn hash_tag(key: &[u8]) -> &[u8] {
+fn hash_tag(key: &[u8]) -> &[u8] {
     let Some(open) = key.iter().position(|&b| b == b'{') else {
         return key;
     };

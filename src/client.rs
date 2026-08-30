@@ -43,7 +43,6 @@ pub struct Shared {
     pub backends: Rc<Backends>,
     pub wstats: std::sync::Arc<stats::WorkerStats>,
     pub stats: std::sync::Arc<Stats>,
-    pub worker: usize,
     pub refresh: mpsc::UnboundedSender<()>,
     pub started: u64,
     pub fabric: Option<std::sync::Arc<crate::shard::Fabric>>,

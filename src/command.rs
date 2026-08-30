@@ -2,8 +2,8 @@
 
 const MAX_NAME: usize = 24;
 
-pub const FLAG_WRITE: u8 = 1;
-pub const FLAG_READONLY: u8 = 1 << 1;
+const FLAG_WRITE: u8 = 1;
+const FLAG_READONLY: u8 = 1 << 1;
 pub const FLAG_NO_AUTH: u8 = 1 << 2;
 /// Transaction-control commands dispatch normally inside MULTI.
 pub const FLAG_TXN_CTRL: u8 = 1 << 3;
@@ -11,7 +11,7 @@ pub const FLAG_TXN_CTRL: u8 = 1 << 3;
 pub const FLAG_CACHE: u8 = 1 << 4;
 /// Writes a destination key named by a STORE/STOREDIST option.
 pub const FLAG_STORE: u8 = 1 << 5;
-pub const PREFIX_LEN: usize = 8;
+const PREFIX_LEN: usize = 8;
 
 const LUT_BITS: u32 = 9;
 const LUT_LEN: usize = 1 << LUT_BITS;

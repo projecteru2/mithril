@@ -1,10 +1,10 @@
 //! RESP frame scanning: byte-range boundaries, nothing materialized.
 
-pub const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
-pub const MAX_INLINE_LEN: usize = 64 * 1024;
-pub const MAX_DEPTH: usize = 32;
-pub const MAX_ARGC: usize = 1024 * 1024;
-pub const MAX_INT_DIGITS: usize = 18;
+const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
+const MAX_INLINE_LEN: usize = 64 * 1024;
+const MAX_DEPTH: usize = 32;
+const MAX_ARGC: usize = 1024 * 1024;
+const MAX_INT_DIGITS: usize = 18;
 pub const DEC_BUF: usize = 20;
 
 pub const NIL_BULK: &[u8] = b"$-1\r\n";
@@ -155,12 +155,8 @@ pub fn scan_value_at(buf: &[u8], cur: &mut Cursor) -> Scan {
     Scan::Complete(pos)
 }
 
-/// Scans one client request at `buf[0..]` (array of bulk strings, or inline).
-pub fn scan_request(buf: &[u8]) -> ReqScan {
-    scan_request_at(buf, &mut Cursor::default())
-}
-
-/// [`scan_request`] resuming from `cur`, which must belong to this buffer start.
+/// Scans one client request at `buf[0..]` (array of bulk strings, or inline),
+/// resuming from `cur`, which must belong to this buffer start.
 pub fn scan_request_at(buf: &[u8], cur: &mut Cursor) -> ReqScan {
     let (mut pos, mut left, argc) = if cur.left > 0 {
         (cur.pos, cur.left, cur.total)
@@ -516,6 +512,10 @@ fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scan_request(buf: &[u8]) -> ReqScan {
+        scan_request_at(buf, &mut Cursor::default())
+    }
 
     #[test]
     fn scans_simple_types() {
