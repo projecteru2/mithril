@@ -279,6 +279,7 @@ struct Session {
     closing: Cell<bool>,
     conns: RefCell<ConnCache>,
     topo_cache: RefCell<std::sync::Arc<Topology>>,
+    fanouts: RefCell<Vec<Rc<FanoutGate>>>,
 }
 
 impl Session {
@@ -351,6 +352,9 @@ impl Session {
             Kind::Single => match it.nth(spec.first_key as usize - 1) {
                 Some(key) => {
                     let slot = crc16::slot(key);
+                    if self.fanouts_pending() {
+                        Box::pin(self.wait_fanouts(&[slot])).await;
+                    }
                     let seq = self.alloc_seq();
                     let mut fill = None;
                     if let Some(cache) = &self.shared.cache {
@@ -394,7 +398,7 @@ impl Session {
             Kind::MultiSum | Kind::Mget | Kind::Mset => {
                 Box::pin(self.fan_out(spec, &frame, argc)).await
             }
-            Kind::Blocking => self.forward_blocking(spec, frame, argc),
+            Kind::Blocking => Box::pin(self.forward_blocking(spec, frame, argc)).await,
             Kind::Eval => Box::pin(self.forward_eval(frame, argc)).await,
             Kind::Xread => Box::pin(self.forward_xread(spec, frame, argc)).await,
             Kind::Subscribe => self.enter_pubsub(spec, frame, argc),
@@ -595,6 +599,11 @@ impl Session {
             self.forward_any_master(frame).await;
             return;
         }
+        if let Some(slot) = slot
+            && self.fanouts_pending()
+        {
+            self.wait_fanouts(&[slot]).await;
+        }
         let seq = self.alloc_seq();
         let Some(pipe) = self.owner_pipe(seq, slot) else {
             return;
@@ -627,6 +636,9 @@ impl Session {
             self.emit_error("ERR Unbalanced XREAD list of streams");
             return;
         };
+        if self.fanouts_pending() {
+            self.wait_fanouts(&[slot]).await;
+        }
         if blocking {
             self.spawn_blocking(slot, frame);
             return;
@@ -637,11 +649,14 @@ impl Session {
         }
     }
 
-    fn forward_blocking(&self, spec: &Spec, frame: Bytes, argc: usize) {
+    async fn forward_blocking(&self, spec: &Spec, frame: Bytes, argc: usize) {
         let Some(slot) = self.key_slot(&frame, argc, spec.first_key as usize) else {
             self.emit_error("ERR missing key");
             return;
         };
+        if self.fanouts_pending() {
+            self.wait_fanouts(&[slot]).await;
+        }
         self.spawn_blocking(slot, frame);
     }
 
@@ -656,6 +671,28 @@ impl Session {
         let mut blocking = self.blocking.borrow_mut();
         blocking.retain(|(_, t)| !t.is_finished());
         blocking.push((seq, task));
+    }
+
+    fn fanouts_pending(&self) -> bool {
+        !self.fanouts.borrow().is_empty()
+    }
+
+    // cold: only sessions with a fan-out in flight get here
+    async fn wait_fanouts(&self, slots: &[u16]) {
+        loop {
+            let gate = {
+                let mut gates = self.fanouts.borrow_mut();
+                gates.retain(|g| !g.done.get());
+                gates
+                    .iter()
+                    .find(|g| slots.iter().any(|s| g.slots.contains(s)))
+                    .cloned()
+            };
+            let Some(gate) = gate else {
+                return;
+            };
+            gate.notify.notified().await;
+        }
     }
 
     async fn fan_out(&self, spec: &Spec, frame: &Bytes, argc: usize) {
@@ -681,20 +718,18 @@ impl Session {
                 }
             }
             let total = keys.len();
-            let marks: Vec<Bytes> = match &self.shared.cache {
-                Some(cache) if spec.is_write() => keys
-                    .iter()
-                    .map(|k| {
-                        let k = frame.slice_ref(k);
-                        cache.begin_write(&k);
-                        k
-                    })
-                    .collect(),
-                _ => Vec::new(),
+            let marks = match &self.shared.cache {
+                Some(cache) if spec.is_write() => Some(WriteMarks::new(
+                    cache,
+                    keys.iter().map(|k| frame.slice_ref(k)).collect(),
+                )),
+                _ => None,
             };
             let topo = self.topo();
+            let mut slots = Vec::new();
             let parts = self.with_rng(|rng| {
                 multikey::split(spec.name.as_bytes(), &keys, values.as_deref(), |slot| {
+                    slots.push(slot);
                     route::pick(&topo, slot, readonly, mode, rng)
                 })
             });
@@ -703,21 +738,25 @@ impl Session {
                     .iter()
                     .map(|part| self.cached_pipe(&topo, part.node, part.readonly))
                     .collect();
-                (p, pipes, total, marks)
+                (p, pipes, total, marks, slots)
             })
         };
-        let (parts, pipes, total, marks) = match split {
+        let (parts, pipes, total, marks, slots) = match split {
             Ok(v) => v,
             Err(e) => {
                 self.emit_at(seq, error_frame(&format!("CLUSTERDOWN {e}")));
                 return;
             }
         };
-        if let Some(cache) = &self.shared.cache {
-            for k in &marks {
-                cache.end_write(k);
-            }
+        if self.fanouts_pending() {
+            self.wait_fanouts(&slots).await;
         }
+        let gate = Rc::new(FanoutGate {
+            slots,
+            done: Cell::new(false),
+            notify: tokio::sync::Notify::new(),
+        });
+        self.fanouts.borrow_mut().push(gate.clone());
         let shared = self.shared.clone();
         let reply_q = self.reply_q.clone();
         let id = self.id;
@@ -734,6 +773,7 @@ impl Session {
         }
         // detached deliberately: completion is bounded by backend replies.
         tokio::task::spawn_local(async move {
+            let _marks = marks;
             let mut results: Vec<(Vec<usize>, Bytes)> = Vec::with_capacity(parts.len());
             let mut retries: Vec<(Vec<usize>, oneshot::Receiver<Bytes>)> = Vec::new();
             for (mut part, rx) in parts.into_iter().zip(receivers) {
@@ -750,6 +790,8 @@ impl Session {
                     None => results.push((part.positions, reply)),
                 }
             }
+            gate.done.set(true);
+            gate.notify.notify_waiters();
             for (positions, rx) in retries {
                 results.push((positions, recv_or_lost(rx).await));
             }
@@ -758,11 +800,6 @@ impl Session {
                 Merge::Ok => multikey::merge_ok(results.iter().map(|(_, r)| r)),
                 Merge::Sum => multikey::merge_sum(results.iter().map(|(_, r)| r)),
             };
-            if let Some(cache) = &shared.cache {
-                for k in &marks {
-                    cache.end_write(k);
-                }
-            }
             let _ = reply_q.send(Reply::At(seq, merged.unwrap_or_else(|e| e)));
         });
     }
@@ -1003,6 +1040,11 @@ impl Session {
             for k in &state.write_keys {
                 cache.invalidate(k);
             }
+        }
+        if let Some(slot) = state.slot
+            && self.fanouts_pending()
+        {
+            self.wait_fanouts(&[slot]).await;
         }
         let seq = self.alloc_seq();
         let Some(pipe) = self.owner_pipe(seq, state.slot) else {
@@ -1371,6 +1413,40 @@ impl ColdSend {
     }
 }
 
+// a fan-out's redirect retries are queued by a detached task: same-slot
+// commands wait for its first round so their own retries cannot overtake it
+struct FanoutGate {
+    slots: Vec<u16>,
+    done: Cell<bool>,
+    notify: tokio::sync::Notify,
+}
+
+// holds a fan-out write's keys against cache fills until the operation ends
+struct WriteMarks {
+    cache: Rc<crate::cache::ReplyCache>,
+    keys: Vec<Bytes>,
+}
+
+impl WriteMarks {
+    fn new(cache: &Rc<crate::cache::ReplyCache>, keys: Vec<Bytes>) -> WriteMarks {
+        for k in &keys {
+            cache.begin_write(k);
+        }
+        WriteMarks {
+            cache: cache.clone(),
+            keys,
+        }
+    }
+}
+
+impl Drop for WriteMarks {
+    fn drop(&mut self) {
+        for k in &self.keys {
+            self.cache.end_write(k);
+        }
+    }
+}
+
 struct MultiState {
     slot: Option<u16>,
     frames: Vec<Bytes>,
@@ -1468,6 +1544,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
             by_node: Vec::new(),
         }),
         topo_cache: RefCell::new(shared.topo.load_full()),
+        fanouts: RefCell::new(Vec::new()),
     };
 
     let (close_tx, close_rx) = oneshot::channel::<u64>();
