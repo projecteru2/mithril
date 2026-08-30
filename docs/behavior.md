@@ -27,7 +27,9 @@
   also drop their keys synchronously on their worker, so a session always
   reads its own writes. Residual staleness is the invalidation push latency
   (cross-client, sub-millisecond) plus, for keys expiring server-side, the
-  active-expire cycle; `reply-cache-max-age-secs` caps both. The cache only
+  active-expire cycle — the server broadcasts an invalidation when it deletes
+  the expired key, measured at ≤105 ms on Redis 8.0 (`hz 10`) and ~2 ms on
+  Redis 8.10 / Valkey 9.1; `reply-cache-max-age-secs` caps both. The cache only
   serves while every master's tracking connection is up — coverage loss
   flushes it and pauses fills. Enable it for read-dominant traffic: the
   BCAST stream delivers every cluster write to every worker, so at
