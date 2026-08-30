@@ -8,7 +8,7 @@ flags, key positions and routing kind. Unknown commands get
 
 Single-key commands (strings, hashes, lists, sets, sorted sets, streams,
 geo, bitmaps, HyperLogLog updates, EXPIRE family, SORT, per-key scans
-HSCAN/SSCAN/ZSCAN, ...) hash their key and go to the owning master — or to a
+HSCAN/SSCAN/ZSCAN, OBJECT subcommands, ...) hash their key and go to the owning master — or to a
 replica when [read splitting](configuration.md) applies and the command is
 read-only. Multi-key commands with single-node semantics (RENAME, SMOVE,
 MSETNX, BITOP, the *STORE family, RPOPLPUSH, ...) route by their first key;
@@ -44,7 +44,7 @@ RESP3, subscribed clients may keep issuing regular commands.
 ## Answered by the proxy
 
 PING, ECHO, SELECT (db 0 only), TIME, AUTH, HELLO, RESET, QUIT, INFO,
-CONFIG (GET; SET accepts only `loglevel`), CLIENT (ID/SETNAME/GETNAME),
+CONFIG (GET; SET accepts only `loglevel`), CLIENT (ID/SETNAME/GETNAME/LIST),
 COMMAND (table introspection), ACL WHOAMI, MULTI/EXEC/DISCARD, and the
 CLUSTER family. CLUSTER INFO/MYID/KEYSLOT/NODES/SLOTS/SHARDS describe a
 single virtual node owning slots 0-16383 — the emulation that lets
@@ -59,7 +59,7 @@ misbehaves:
 - shard pubsub: SSUBSCRIBE, SPUBLISH, SUNSUBSCRIBE
 - newer blocking forms: BLMOVE, BLMPOP, BZMPOP
 - WATCH/UNWATCH, FLUSHDB, cluster-wide KEYS
-- server management: WAIT, OBJECT, DEBUG, LATENCY, MEMORY, SHUTDOWN,
+- server management: WAIT, DEBUG, LATENCY, MEMORY, SHUTDOWN,
   FAILOVER, REPLICAOF, SAVE/BGSAVE, DUMP/RESTORE, MIGRATE and similar
 
 RANDOMKEY samples one random master's keyspace, not the whole cluster.
