@@ -580,3 +580,63 @@ pub(crate) async fn read_reply<R: AsyncRead + Unpin>(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending(expect: u32, tag: u32) -> Pending<u32> {
+        Pending { expect, sink: tag }
+    }
+
+    fn pair(
+        buf: &[u8],
+        pending: &mut VecDeque<Pending<u32>>,
+    ) -> Result<Vec<(u32, Bytes)>, &'static str> {
+        let mut buf = BytesMut::from(buf);
+        let mut cur = resp::Cursor::default();
+        let mut front_err = None;
+        let got = RefCell::new(Vec::new());
+        pair_replies(&mut buf, &mut cur, pending, &mut front_err, |s, f| {
+            got.borrow_mut().push((s, f))
+        })?;
+        Ok(got.into_inner())
+    }
+
+    #[test]
+    fn delivers_the_last_reply_of_a_group() {
+        let mut pending = VecDeque::from([pending(2, 7), pending(1, 8)]);
+        let got = pair(b"+OK\r\n:1\r\n$2\r\nab\r\n", &mut pending).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (7, Bytes::from_static(b":1\r\n")),
+                (8, Bytes::from_static(b"$2\r\nab\r\n"))
+            ]
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_failed_head_frame_is_the_reply() {
+        let mut pending = VecDeque::from([pending(2, 1)]);
+        let got = pair(b"-ERR head\r\n+OK\r\n", &mut pending).unwrap();
+        assert_eq!(got, vec![(1, Bytes::from_static(b"-ERR head\r\n"))]);
+    }
+
+    #[test]
+    fn a_reply_without_a_request_is_a_protocol_error() {
+        let mut pending = VecDeque::new();
+        assert_eq!(
+            pair(b"+OK\r\n", &mut pending),
+            Err("reply without a request")
+        );
+    }
+
+    #[test]
+    fn an_incomplete_frame_waits() {
+        let mut pending = VecDeque::from([pending(1, 1)]);
+        assert_eq!(pair(b"$5\r\nab", &mut pending).unwrap(), vec![]);
+        assert_eq!(pending.len(), 1);
+    }
+}

@@ -569,3 +569,53 @@ async fn fetch_from(cfg: &Config, addr: &str) -> Result<Topology, String> {
 fn bulk_text(frame: &[u8]) -> Option<&str> {
     std::str::from_utf8(resp::bulk_payload(frame)?).ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotation_places_round_robin() {
+        let mut p = Placer::new(3, false);
+        assert_eq!(p.best(), 0);
+        p.placed(0);
+        assert_eq!(p.best(), 1);
+        p.placed(1);
+        p.placed(2);
+        assert_eq!(p.best(), 0);
+    }
+
+    #[test]
+    fn least_loaded_prefers_the_quiet_worker_then_spreads() {
+        let mut p = Placer::new(3, true);
+        p.buckets = vec![5, 0, 5];
+        assert_eq!(p.best(), 1);
+        p.placed(1);
+        assert_eq!(p.best(), 2);
+        p.placed(2);
+        assert_eq!(p.best(), 0);
+        p.placed(0);
+        assert_eq!(p.best(), 1);
+    }
+
+    #[test]
+    fn rank_orders_by_key_then_rotation() {
+        let mut p = Placer::new(4, true);
+        p.buckets = vec![1, 0, 0, 1];
+        p.next = 2;
+        p.rank();
+        assert_eq!(p.order, vec![2, 1, 3, 0]);
+    }
+
+    #[test]
+    fn refresh_normalizes_activity_and_idles_below_the_floor() {
+        let stats = Stats::new(2);
+        stats.workers[0].commands.store(1000, Ordering::Relaxed);
+        stats.workers[1].commands.store(200, Ordering::Relaxed);
+        let mut p = Placer::new(2, true);
+        p.refresh(&stats);
+        assert_eq!(p.buckets, vec![1, 0]);
+        p.refresh(&stats);
+        assert_eq!(p.buckets, vec![0, 0]);
+    }
+}
