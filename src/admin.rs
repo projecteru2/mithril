@@ -14,13 +14,8 @@ const CLUSTER_BUS_OFFSET: u32 = 10000;
 
 /// Emulated node id: 40 hex chars derived from the announce address.
 fn node_id(announce: &str) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in announce.as_bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
     let mut id = String::with_capacity(40);
-    let mut x = h;
+    let mut x = crate::shard::fnv(announce.as_bytes());
     for _ in 0..40 {
         x = x
             .wrapping_mul(6364136223846793005)
@@ -182,6 +177,7 @@ pub fn cluster(args: &[&[u8]], cfg: &Config, proto: u8) -> Vec<u8> {
 }
 
 pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
+    let cpu = cpu_seconds();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -191,6 +187,7 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
          mithril_version:{}\r\nprocess_id:{}\r\ntcp_port:{}\r\nuptime_in_seconds:{}\r\n\
          config_file:{}\r\n\r\n\
          # Clients\r\nconnected_clients:{}\r\n\r\n\
+         # CPU\r\nused_cpu_sys:{:.3}\r\nused_cpu_user:{:.3}\r\n\r\n\
          # Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n\
          total_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\n\
          total_errors:{}\r\nredirections:{}\r\n\
@@ -205,6 +202,8 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
         cfg.port,
         now.saturating_sub(started),
         cfg.config_file,
+        cpu.0,
+        cpu.1,
         stats.clients.load(Ordering::Relaxed),
         stats.total_connections.load(Ordering::Relaxed),
         stats.sum(|w| &w.commands),
@@ -309,6 +308,21 @@ fn shard_node(out: &mut Vec<u8>, cfg: &Config, proto: u8) {
     resp::integer(out, 0);
     resp::bulk(out, b"health");
     resp::bulk(out, b"online");
+}
+
+// (system, user) seconds from /proc/self/stat at the usual 100 Hz; zero elsewhere
+fn cpu_seconds() -> (f64, f64) {
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+        return (0.0, 0.0);
+    };
+    let Some(after) = stat.rfind(')') else {
+        return (0.0, 0.0);
+    };
+    let mut fields = stat[after + 1..].split_whitespace().skip(11);
+    let ticks = |f: Option<&str>| f.and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) / 100.0;
+    let user = ticks(fields.next());
+    let sys = ticks(fields.next());
+    (sys, user)
 }
 
 fn split_announce(announce: &str) -> (&str, u16) {

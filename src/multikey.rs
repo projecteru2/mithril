@@ -35,10 +35,12 @@ impl std::hash::Hasher for SlotHasher {
     }
 }
 
-/// Groups keys per slot (nodes reject cross-slot multi-key commands).
+/// Groups keys per slot (nodes reject cross-slot multi-key commands);
+/// `slots[i]` is the slot of `keys[i]`.
 pub fn split<'k, F>(
     name: &'k [u8],
     keys: &[&'k [u8]],
+    slots: &[u16],
     values: Option<&[&'k [u8]]>,
     mut route: F,
 ) -> Result<Vec<Part>, String>
@@ -50,8 +52,7 @@ where
     // adversarial key sets span thousands of slots: stay O(1) per key
     let mut by_slot: HashMap<u16, usize, std::hash::BuildHasherDefault<SlotHasher>> =
         HashMap::default();
-    for (i, key) in keys.iter().enumerate() {
-        let slot = crate::crc16::slot(key);
+    for (i, (key, &slot)) in keys.iter().zip(slots).enumerate() {
         let g = match by_slot.get(&slot) {
             Some(&g) => g,
             None => {
@@ -96,13 +97,11 @@ pub(crate) fn split_array(frame: &[u8]) -> Option<Vec<&[u8]>> {
     let mut items = Vec::with_capacity(count);
     let mut pos = header_end;
     for _ in 0..count {
-        match resp::scan_value(&frame[pos..]) {
-            resp::Scan::Complete(len) => {
-                items.push(&frame[pos..pos + len]);
-                pos += len;
-            }
-            _ => return None,
-        }
+        let resp::Scan::Complete(len) = resp::scan_value(&frame[pos..]) else {
+            return None;
+        };
+        items.push(&frame[pos..pos + len]);
+        pos += len;
     }
     Some(items)
 }
@@ -205,7 +204,8 @@ mod tests {
     #[test]
     fn splits_by_slot_even_on_one_node() {
         let keys: Vec<&[u8]> = vec![b"{t}a", b"b", b"{t}c"];
-        let parts = split(b"MGET", &keys, None, |_slot| Some((7, false))).unwrap();
+        let slots: Vec<u16> = keys.iter().map(|k| crate::crc16::slot(k)).collect();
+        let parts = split(b"MGET", &keys, &slots, None, |_slot| Some((7, false))).unwrap();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].positions, vec![0, 2]);
         assert_eq!(

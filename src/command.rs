@@ -388,6 +388,15 @@ mod tests {
     }
 
     #[test]
+    fn single_key_kinds_declare_a_key() {
+        for spec in TABLE {
+            if spec.kind == Kind::Single {
+                assert!(spec.first_key >= 1, "{}", spec.name);
+            }
+        }
+    }
+
+    #[test]
     fn lookup_is_case_insensitive() {
         assert_eq!(lookup(b"GET").map(|s| s.name), Some("get"));
         assert_eq!(lookup(b"GeT").map(|s| s.name), Some("get"));

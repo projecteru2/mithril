@@ -355,6 +355,7 @@ fn worker_thread(
             cfg: local_cfg,
             topo,
             backends,
+            wstats: stats.workers[worker].clone(),
             stats: stats.clone(),
             worker,
             refresh,

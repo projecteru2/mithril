@@ -10,20 +10,15 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::backend::{
-    BATCH, ERR_BACKEND_LOST, OUTBOUND_QUEUE, check_rearm, ensure_read_room, write_slices,
+    BATCH, ERR_BACKEND_LOST, OUTBOUND_QUEUE, Outbound, check_rearm, drain_channel,
+    ensure_read_room, stage, write_slices,
 };
 use crate::cache::{ReplyCache, TrackingFrames};
 use crate::config::Config;
 use crate::log_debug;
 
 /// A request crossing to a node-owner worker.
-pub struct RemoteOutbound {
-    pub head: Option<Bytes>,
-    pub frame: Bytes,
-    /// Number of backend replies this produces; only the last is delivered.
-    pub expect: u32,
-    pub reply: RemoteSink,
-}
+pub type RemoteOutbound = Outbound<RemoteSink>;
 
 /// Where a sharded reply is delivered.
 pub enum RemoteSink {
@@ -111,7 +106,7 @@ impl Fabric {
                 head: None,
                 frame,
                 expect: 1,
-                reply: RemoteSink::One(otx),
+                sink: RemoteSink::One(otx),
             })
             .await;
         if sent.is_err() {
@@ -191,22 +186,14 @@ async fn run_shard_conn(
             .await
             .map_err(|e| e.to_string())?;
         let (mut r, mut w) = stream.into_split();
-        crate::backend::handshake(
-            &mut r,
-            &mut w,
-            readonly,
-            &cfg.backend_user,
-            &cfg.backend_pass,
-            tracking.as_deref(),
-        )
-        .await?;
+        crate::backend::handshake(&mut r, &mut w, readonly, cfg, tracking.as_deref()).await?;
         Ok::<_, String>((r, w))
     };
     let (mut read_half, mut write_half) = match setup.await {
         Ok(h) => h,
         Err(e) => {
             log_debug!("shard connect {addr}: {e}");
-            drain(&mut rx);
+            drain_channel(&mut rx, deliver);
             return;
         }
     };
@@ -228,17 +215,7 @@ async fn run_shard_conn(
                 if n == 0 {
                     break 'io;
                 }
-                frames.clear();
-                for out in batch.drain(..) {
-                    pending.push_back(crate::backend::Pending {
-                        expect: out.expect,
-                        sink: out.reply,
-                    });
-                    if let Some(h) = out.head {
-                        frames.push(h);
-                    }
-                    frames.push(out.frame);
-                }
+                stage(&mut batch, &mut pending, &mut frames);
                 let mut slices: Vec<std::io::IoSlice<'_>> =
                     frames.iter().map(|f| std::io::IoSlice::new(f)).collect();
                 if write_slices(&mut write_half, &mut slices).await.is_err() {
@@ -246,9 +223,8 @@ async fn run_shard_conn(
                 }
             }
             r = read_half.read_buf(&mut buf) => {
-                match r {
-                    Ok(0) | Err(_) => break 'io,
-                    Ok(_) => {}
+                if matches!(r, Ok(0) | Err(_)) {
+                    break 'io;
                 }
             }
         }
@@ -256,11 +232,11 @@ async fn run_shard_conn(
     for p in pending.drain(..) {
         deliver(p.sink, Bytes::from_static(ERR_BACKEND_LOST));
     }
-    drain(&mut rx);
+    drain_channel(&mut rx, deliver);
 }
 
-fn deliver(reply: RemoteSink, frame: Bytes) {
-    match reply {
+fn deliver(sink: RemoteSink, frame: Bytes) {
+    match sink {
         RemoteSink::Session { queue, seq } => {
             let _ = queue.send(crate::client::Reply::At(seq, frame));
         }
@@ -270,14 +246,7 @@ fn deliver(reply: RemoteSink, frame: Bytes) {
     }
 }
 
-fn drain(rx: &mut mpsc::Receiver<RemoteOutbound>) {
-    rx.close();
-    while let Ok(out) = rx.try_recv() {
-        deliver(out.reply, Bytes::from_static(ERR_BACKEND_LOST));
-    }
-}
-
-fn fnv(data: &[u8]) -> u64 {
+pub(crate) fn fnv(data: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in data {
         h ^= u64::from(b);

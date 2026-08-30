@@ -41,6 +41,7 @@ pub struct Shared {
     pub cfg: Rc<crate::config::Config>,
     pub topo: std::sync::Arc<ArcSwap<Topology>>,
     pub backends: Rc<Backends>,
+    pub wstats: std::sync::Arc<stats::WorkerStats>,
     pub stats: std::sync::Arc<Stats>,
     pub worker: usize,
     pub refresh: mpsc::UnboundedSender<()>,
@@ -225,8 +226,6 @@ struct WriterLink {
     // set when no reply can ever be written again; reader must stop dispatching
     closed: Cell<bool>,
     closed_notify: tokio::sync::Notify,
-    // a live relay can close the session while the reader is parked reading
-    has_relay: Cell<bool>,
     proto_switches: ProtoSwitchQueue,
     oob_budget: Cell<usize>,
     oob_notify: tokio::sync::Notify,
@@ -280,6 +279,8 @@ struct Session {
     subs: RefCell<PubsubSim>,
     blocking: RefCell<Vec<(u64, tokio::task::JoinHandle<()>)>>,
     closing: Cell<bool>,
+    // a live relay can close the session while the reader is parked reading
+    has_relay: Cell<bool>,
     conns: RefCell<ConnCache>,
     topo_cache: RefCell<std::sync::Arc<Topology>>,
     fanouts: Rc<RefCell<FanoutGates>>,
@@ -292,7 +293,7 @@ impl Session {
             self.closing.set(true);
             return;
         }
-        stats::bump(&self.shared.stats.workers[self.shared.worker].commands);
+        stats::bump(&self.shared.wstats.commands);
         if argc == 0 {
             return;
         }
@@ -356,8 +357,12 @@ impl Session {
             }
         }
         match spec.kind {
-            Kind::Single => match it.nth(spec.first_key as usize - 1) {
-                Some(key) => {
+            Kind::Single => {
+                let Some(key) = it.nth(spec.first_key as usize - 1) else {
+                    self.emit_error("ERR missing key");
+                    return;
+                };
+                {
                     let slot = crc16::slot(key);
                     if self.fanouts_pending() && !Box::pin(self.wait_fanouts(&[slot])).await {
                         self.closing.set(true);
@@ -377,15 +382,11 @@ impl Session {
                             }
                         } else if spec.flags & command::FLAG_CACHE != 0 {
                             if let Some(hit) = cache.lookup(key) {
-                                stats::bump(
-                                    &self.shared.stats.workers[self.shared.worker].cache_hits,
-                                );
+                                stats::bump(&self.shared.wstats.cache_hits);
                                 self.emit_at(seq, hit);
                                 return;
                             }
-                            stats::bump(
-                                &self.shared.stats.workers[self.shared.worker].cache_misses,
-                            );
+                            stats::bump(&self.shared.wstats.cache_misses);
                             let key = frame.slice_ref(key);
                             if cache.begin_fill(&key) {
                                 fill = Some(key);
@@ -398,8 +399,7 @@ impl Session {
                         cold.flush().await;
                     }
                 }
-                None => self.emit_error("ERR missing key"),
-            },
+            }
             Kind::Local => self.handle_local(spec, frame, argc),
             Kind::Exec => Box::pin(self.handle_exec()).await,
             Kind::AnyMaster => self.forward_any_master(frame).await,
@@ -417,8 +417,8 @@ impl Session {
             Kind::Xread => Box::pin(self.forward_xread(spec, frame, argc)).await,
             Kind::Subscribe => self.enter_pubsub(spec, frame, argc),
             Kind::Scan => self.run_scan(frame, argc),
-            Kind::Dbsize => Box::pin(self.run_broadcast(frame, true)).await,
-            Kind::Flushall => Box::pin(self.run_broadcast(frame, false)).await,
+            Kind::Dbsize => Box::pin(self.run_broadcast(frame, Merge::Sum)).await,
+            Kind::Flushall => Box::pin(self.run_broadcast(frame, Merge::Ok)).await,
         }
     }
 
@@ -460,11 +460,12 @@ impl Session {
         {
             return pipe.clone();
         }
-        let addr = &topo.nodes[idx as usize].addr;
-        let pipe = match &self.shared.fabric {
-            Some(f) => Pipe::Shard(f.pipe(addr, is_replica)),
-            None => Pipe::Local(self.shared.backends.shared(addr, self.id, is_replica)),
-        };
+        let pipe = pipe_for(
+            &self.shared,
+            &topo.nodes[idx as usize].addr,
+            self.id,
+            is_replica,
+        );
         *entry = Some(pipe.clone());
         pipe
     }
@@ -499,7 +500,7 @@ impl Session {
                     head,
                     frame,
                     expect,
-                    reply: crate::shard::RemoteSink::Session { queue, seq },
+                    sink: crate::shard::RemoteSink::Session { queue, seq },
                 };
                 match tx.try_send(out) {
                     Ok(()) => None,
@@ -610,13 +611,14 @@ impl Session {
 
     async fn forward_eval(&self, frame: Bytes, argc: usize) {
         let (numkeys, slot) = {
-            let args = collect_args(&frame, argc);
-            let numkeys: i64 = std::str::from_utf8(args[2])
-                .ok()
+            let mut args = resp::Args::new(&frame, argc);
+            let numkeys: i64 = args
+                .nth(2)
+                .and_then(|a| std::str::from_utf8(a).ok())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(-1);
-            let slot = if numkeys >= 1 && argc > 3 {
-                Some(crc16::slot(args[3]))
+            let slot = if numkeys >= 1 {
+                args.next().map(crc16::slot)
             } else {
                 None
             };
@@ -647,22 +649,20 @@ impl Session {
 
     async fn forward_xread(&self, spec: &Spec, frame: Bytes, argc: usize) {
         let parsed = {
-            let args = collect_args(&frame, argc);
-            let pos = args.iter().position(|a| a.eq_ignore_ascii_case(b"streams"));
-            match pos {
-                None => None,
-                Some(p) => {
-                    let tail = argc - p - 1;
-                    if tail == 0 || !tail.is_multiple_of(2) {
-                        None
-                    } else {
-                        let blocking = args
-                            .iter()
-                            .take(p)
-                            .any(|a| a.eq_ignore_ascii_case(b"block"));
-                        Some((crc16::slot(args[p + 1]), blocking))
-                    }
+            let mut blocking = false;
+            let mut streams = None;
+            let mut slot = None;
+            for (i, a) in resp::Args::new(&frame, argc).enumerate() {
+                match streams {
+                    None if a.eq_ignore_ascii_case(b"streams") => streams = Some(i),
+                    None => blocking |= a.eq_ignore_ascii_case(b"block"),
+                    Some(p) if i == p + 1 => slot = Some(crc16::slot(a)),
+                    Some(_) => {}
                 }
+            }
+            match (streams, slot) {
+                (Some(p), Some(slot)) if (argc - p - 1).is_multiple_of(2) => Some((slot, blocking)),
+                _ => None,
             }
         };
         let Some((slot, blocking)) = parsed else {
@@ -747,7 +747,33 @@ impl Session {
             );
             return None;
         }
-        let plan = self.plan_fanout(seq, spec, &frame, argc)?;
+        let plan = match self.plan_fanout(seq, spec, &frame, argc) {
+            Planned::Parts(plan) => plan,
+            Planned::Failed => return None,
+            Planned::Single(slot) => {
+                if let Some(cache) = &self.shared.cache
+                    && spec.is_write()
+                {
+                    write_keys(spec, &frame, argc, |k| cache.invalidate(k));
+                }
+                let readonly = spec.is_readonly();
+                if self.fanouts_pending() {
+                    return Some(Box::pin(async move {
+                        if !self.wait_fanouts(&[slot]).await {
+                            self.closing.set(true);
+                            return;
+                        }
+                        if let Some(cold) = self.route_single(seq, slot, readonly, frame, None) {
+                            cold.flush().await;
+                        }
+                    }));
+                }
+                return match self.route_single(seq, slot, readonly, frame, None) {
+                    Some(cold) => Some(Box::pin(cold.flush())),
+                    None => None,
+                };
+            }
+        };
         let n = plan.parts.len();
         if self.fanouts_pending() || !plan.pipes.iter().all(|p| p.has_room(n)) {
             return Some(Box::pin(self.fan_out_slow(plan)));
@@ -762,18 +788,34 @@ impl Session {
         None
     }
 
-    // splits the keys per slot and resolves every pipe; None after an error reply
-    fn plan_fanout(&self, seq: u64, spec: &Spec, frame: &Bytes, argc: usize) -> Option<FanoutPlan> {
+    // splits the keys per slot and resolves every pipe; one slot needs no fan-out
+    fn plan_fanout(&self, seq: u64, spec: &Spec, frame: &Bytes, argc: usize) -> Planned {
         let readonly = spec.is_readonly();
         let mode = self.shared.cfg.slave_mode;
-        let args = collect_args(frame, argc);
-        let mut keys: Vec<&[u8]> = Vec::with_capacity(argc);
-        let mut values: Option<Vec<&[u8]>> = (spec.step == 2).then(|| Vec::with_capacity(argc / 2));
-        for i in key_indices(spec, argc) {
-            keys.push(args[i]);
-            if let Some(vals) = values.as_mut() {
-                vals.push(args[i + 1]);
+        let nkeys = key_indices(spec, argc).count();
+        let mut keys: Vec<&[u8]> = Vec::with_capacity(nkeys);
+        let mut slots: Vec<u16> = Vec::with_capacity(nkeys);
+        let mut values: Option<Vec<&[u8]>> = (spec.step == 2).then(|| Vec::with_capacity(nkeys));
+        let mut args = resp::Args::new(frame, argc);
+        let mut cur = 0;
+        for want in key_indices(spec, argc) {
+            let Some(key) = args.nth(want - cur) else {
+                break;
+            };
+            cur = want + 1;
+            keys.push(key);
+            slots.push(crc16::slot(key));
+            if let Some(vals) = values.as_mut()
+                && let Some(v) = args.next()
+            {
+                vals.push(v);
+                cur += 1;
             }
+        }
+        if let Some(&first) = slots.first()
+            && slots.iter().all(|&s| s == first)
+        {
+            return Planned::Single(first);
         }
         let total = keys.len();
         let marks = match &self.shared.cache {
@@ -784,25 +826,31 @@ impl Session {
             _ => None,
         };
         let topo = self.topo();
-        let mut slots = Vec::new();
+        let mut part_slots = Vec::new();
         let parts = self.with_rng(|rng| {
-            multikey::split(spec.name.as_bytes(), &keys, values.as_deref(), |slot| {
-                slots.push(slot);
-                route::pick(&topo, slot, readonly, mode, rng)
-            })
+            multikey::split(
+                spec.name.as_bytes(),
+                &keys,
+                &slots,
+                values.as_deref(),
+                |slot| {
+                    part_slots.push(slot);
+                    route::pick(&topo, slot, readonly, mode, rng)
+                },
+            )
         });
         let parts = match parts {
             Ok(p) => p,
             Err(e) => {
                 self.emit_at(seq, error_frame(&format!("CLUSTERDOWN {e}")));
-                return None;
+                return Planned::Failed;
             }
         };
         let pipes = parts
             .iter()
             .map(|part| self.cached_pipe(&topo, part.node, part.readonly))
             .collect();
-        Some(FanoutPlan {
+        Planned::Parts(FanoutPlan {
             seq,
             merge: match spec.kind {
                 Kind::Mget => Merge::Mget,
@@ -813,7 +861,7 @@ impl Session {
             pipes,
             total,
             marks,
-            slots,
+            slots: part_slots,
         })
     }
 
@@ -936,7 +984,7 @@ impl Session {
         });
     }
 
-    async fn run_broadcast(&self, frame: Bytes, sum: bool) {
+    async fn run_broadcast(&self, frame: Bytes, merge: Merge) {
         let seq = self.alloc_seq();
         let shared = self.shared.clone();
         let reply_q = self.reply_q.clone();
@@ -952,10 +1000,9 @@ impl Session {
             for rx in receivers {
                 replies.push(recv_or_lost(rx).await);
             }
-            let merged = if sum {
-                multikey::merge_sum(replies.iter())
-            } else {
-                multikey::merge_ok(replies.iter())
+            let merged = match merge {
+                Merge::Sum => multikey::merge_sum(replies.iter()),
+                Merge::Ok | Merge::Mget => multikey::merge_ok(replies.iter()),
             };
             let _ = reply_q.send(Reply::At(seq, merged.unwrap_or_else(|e| e)));
         });
@@ -977,12 +1024,17 @@ impl Session {
             return;
         }
         let new_slot = {
-            let args = collect_args(&frame, argc);
+            let mut args = resp::Args::new(&frame, argc);
+            let mut cur = 0;
             let current = self.multi.borrow().as_ref().and_then(|s| s.slot);
             let mut slot = current;
             let mut conflict = false;
-            for idx in key_indices(spec, argc) {
-                let s = crc16::slot(args[idx]);
+            for want in key_indices(spec, argc) {
+                let Some(key) = args.nth(want - cur) else {
+                    break;
+                };
+                cur = want + 1;
+                let s = crc16::slot(key);
                 match slot {
                     None => slot = Some(s),
                     Some(prev) if prev != s => {
@@ -1056,8 +1108,8 @@ impl Session {
                     self.handle_hello(&args);
                     None
                 }
-                "acl" => match args.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
-                    Some(b"whoami") => {
+                "acl" => match args.get(1) {
+                    Some(sub) if sub.eq_ignore_ascii_case(b"whoami") => {
                         let mut out = Vec::new();
                         resp::bulk(&mut out, b"default");
                         Some(Bytes::from(out))
@@ -1135,8 +1187,7 @@ impl Session {
         let Some(pipe) = self.owner_pipe(seq, state.slot) else {
             return;
         };
-        let body: usize = state.frames.iter().map(Bytes::len).sum();
-        let mut blob = Vec::with_capacity(body + 32);
+        let mut blob = Vec::with_capacity(state.bytes + 32);
         blob.extend_from_slice(b"*1\r\n$5\r\nMULTI\r\n");
         for f in &state.frames {
             blob.extend_from_slice(f);
@@ -1242,13 +1293,14 @@ impl Session {
     }
 
     fn handle_client_cmd(&self, args: &[&[u8]]) {
-        match args.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
-            Some(b"id") => {
+        let sub = |name: &[u8]| args.get(1).is_some_and(|s| s.eq_ignore_ascii_case(name));
+        match args.get(1) {
+            Some(_) if sub(b"id") => {
                 let mut out = Vec::new();
                 resp::integer(&mut out, self.id as i64);
                 self.emit_local(out);
             }
-            Some(b"setname") if args.len() == 3 => {
+            Some(_) if sub(b"setname") && args.len() == 3 => {
                 let name = String::from_utf8_lossy(args[2]);
                 if let Some(c) = self.shared.stats.registry().get_mut(&self.id) {
                     c.name = Box::from(&*name);
@@ -1256,8 +1308,8 @@ impl Session {
                 *self.name.borrow_mut() = name.into_owned();
                 self.emit_local(Bytes::from_static(resp::OK));
             }
-            Some(b"list") => self.emit_local(admin::client_list(&self.shared.stats)),
-            Some(b"getname") => {
+            Some(_) if sub(b"list") => self.emit_local(admin::client_list(&self.shared.stats)),
+            Some(_) if sub(b"getname") => {
                 let name = self.name.borrow();
                 if name.is_empty() {
                     self.emit_local(Bytes::from_static(resp::NIL_BULK));
@@ -1304,7 +1356,7 @@ impl Session {
     }
 
     fn stop_pubsub(&self) {
-        self.link.has_relay.set(false);
+        self.has_relay.set(false);
         if let Some(ps) = self.pubsub.borrow_mut().take() {
             ps.task.abort();
         }
@@ -1402,7 +1454,7 @@ impl Session {
             return;
         };
         self.promise_subscription(&first_frame, argc);
-        self.link.has_relay.set(true);
+        self.has_relay.set(true);
         let (tx, rx) = mpsc::channel::<Bytes>(PUBSUB_FORWARD_QUEUE);
         let _ = tx.try_send(first_frame);
         let shared = self.shared.clone();
@@ -1452,7 +1504,7 @@ impl Session {
     }
 
     fn emit_error_frame(&self, frame: Bytes) {
-        stats::bump(&self.shared.stats.workers[self.shared.worker].errors);
+        stats::bump(&self.shared.wstats.errors);
         self.emit_local(frame);
     }
 
@@ -1493,6 +1545,13 @@ impl Pipe {
 // the awaited remainder of a command whose fast path could not finish
 type Cold<'a> = Pin<Box<dyn Future<Output = ()> + 'a>>;
 
+enum Planned {
+    Parts(FanoutPlan),
+    /// Every key hashes to one slot: the original frame routes as one command.
+    Single(u16),
+    Failed,
+}
+
 // a fan-out resolved and ready to queue; the frames retain themselves for resends
 struct FanoutPlan {
     seq: u64,
@@ -1520,7 +1579,7 @@ impl ColdSend {
             ColdSend::Local(conn, out) => conn.send_wait(out).await,
             ColdSend::Shard(tx, out, q) => {
                 if let Err(e) = Box::pin(tx.send(out)).await
-                    && let crate::shard::RemoteSink::Session { seq, .. } = e.0.reply
+                    && let crate::shard::RemoteSink::Session { seq, .. } = e.0.sink
                 {
                     let _ = q.send(Reply::At(seq, Bytes::from_static(ERR_BACKEND_LOST)));
                 }
@@ -1681,6 +1740,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         subs: RefCell::new(PubsubSim::default()),
         blocking: RefCell::new(Vec::new()),
         closing: Cell::new(false),
+        has_relay: Cell::new(false),
         conns: RefCell::new(ConnCache {
             epoch: 0,
             by_node: Vec::new(),
@@ -1747,7 +1807,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
                 match tokio::time::timeout(GATE_PROBE, read_half.read_buf(&mut buf)).await {
                     Ok(Ok(0)) | Ok(Err(_)) => break 'main,
                     Ok(Ok(n)) => {
-                        stats::add(&shared.stats.workers[shared.worker].bytes_in, n as u64);
+                        stats::add(&shared.wstats.bytes_in, n as u64);
                         if buf.len() > shared.cfg.query_buffer_limit {
                             session.emit_error("ERR query buffer exceeds limit");
                             break 'main;
@@ -1764,7 +1824,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         }
         ensure_read_room(&mut buf);
         // only a relay can close the session while the read is parked
-        let read = if link.has_relay.get() {
+        let read = if session.has_relay.get() {
             tokio::select! {
                 _ = link.closed_notify.notified() => break,
                 r = read_half.read_buf(&mut buf) => r,
@@ -1774,10 +1834,10 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
         };
         match read {
             Ok(0) | Err(_) => break,
-            Ok(n) => stats::add(&shared.stats.workers[shared.worker].bytes_in, n as u64),
+            Ok(n) => stats::add(&shared.wstats.bytes_in, n as u64),
         }
     }
-    stats::bump(&shared.stats.workers[shared.worker].readers_exited);
+    stats::bump(&shared.wstats.readers_exited);
     session.stop_pubsub();
     for (seq, task) in session.blocking.borrow_mut().drain(..) {
         if task.is_finished() {
@@ -1791,7 +1851,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, id: u64) {
     drop(reply_q);
     let _ = close_tx.send(final_seq);
     let _ = writer.await;
-    stats::bump(&shared.stats.workers[shared.worker].sessions_closed);
+    stats::bump(&shared.wstats.sessions_closed);
 }
 
 fn collect_args(frame: &Bytes, argc: usize) -> Vec<&[u8]> {
@@ -1847,53 +1907,81 @@ fn key_indices(spec: &Spec, argc: usize) -> impl Iterator<Item = usize> {
     (first..end).step_by((spec.step as usize).max(1))
 }
 
-// the caller checked has_room; a full queue drops the oneshot, which reads as LOST
-fn try_scatter(pipe: &Pipe, frame: Bytes) -> oneshot::Receiver<Bytes> {
-    let (tx, rx) = oneshot::channel();
-    match pipe {
-        Pipe::Local(conn) => {
-            let _ = conn.try_send(Outbound {
-                head: None,
-                frame,
-                expect: 1,
-                sink: Sink::One(tx),
-            });
-        }
-        Pipe::Shard(sender) => {
-            let _ = sender.try_send(crate::shard::RemoteOutbound {
-                head: None,
-                frame,
-                expect: 1,
-                reply: crate::shard::RemoteSink::One(tx),
-            });
+fn pipe_for(shared: &Shared, addr: &str, id: u64, readonly: bool) -> Pipe {
+    match &shared.fabric {
+        Some(f) => Pipe::Shard(f.pipe(addr, readonly)),
+        None => Pipe::Local(shared.backends.shared(addr, id, readonly)),
+    }
+}
+
+// a request with a oneshot sink, built for either pipe flavor
+enum Staged {
+    Local(Rc<crate::backend::Conn>, Outbound),
+    Shard(
+        tokio::sync::mpsc::Sender<crate::shard::RemoteOutbound>,
+        crate::shard::RemoteOutbound,
+    ),
+}
+
+impl Staged {
+    // a full or closed queue drops the oneshot, which the receiver reads as LOST
+    fn try_send(self) {
+        match self {
+            Staged::Local(conn, out) => {
+                let _ = conn.try_send(out);
+            }
+            Staged::Shard(tx, out) => {
+                let _ = tx.try_send(out);
+            }
         }
     }
+
+    async fn send(self) {
+        match self {
+            Staged::Local(conn, out) => conn.send(out).await,
+            Staged::Shard(tx, out) => {
+                let _ = tx.send(out).await;
+            }
+        }
+    }
+}
+
+fn stage_one(pipe: &Pipe, head: Option<Bytes>, frame: Bytes) -> (Staged, oneshot::Receiver<Bytes>) {
+    let (tx, rx) = oneshot::channel();
+    let expect = 1 + u32::from(head.is_some());
+    let staged = match pipe {
+        Pipe::Local(conn) => Staged::Local(
+            conn.clone(),
+            Outbound {
+                head,
+                frame,
+                expect,
+                sink: Sink::One(tx),
+            },
+        ),
+        Pipe::Shard(sender) => Staged::Shard(
+            sender.clone(),
+            Outbound {
+                head,
+                frame,
+                expect,
+                sink: crate::shard::RemoteSink::One(tx),
+            },
+        ),
+    };
+    (staged, rx)
+}
+
+// the caller checked has_room, so nothing waits
+fn try_scatter(pipe: &Pipe, frame: Bytes) -> oneshot::Receiver<Bytes> {
+    let (staged, rx) = stage_one(pipe, None, frame);
+    staged.try_send();
     rx
 }
 
 async fn scatter_pipe(pipe: &Pipe, frame: Bytes) -> oneshot::Receiver<Bytes> {
-    let (tx, rx) = oneshot::channel();
-    match pipe {
-        Pipe::Local(conn) => {
-            conn.send(Outbound {
-                head: None,
-                frame,
-                expect: 1,
-                sink: Sink::One(tx),
-            })
-            .await;
-        }
-        Pipe::Shard(sender) => {
-            let out = crate::shard::RemoteOutbound {
-                head: None,
-                frame,
-                expect: 1,
-                reply: crate::shard::RemoteSink::One(tx),
-            };
-            // a closed pipe drops the oneshot; the receiver reads that as LOST
-            let _ = sender.send(out).await;
-        }
-    }
+    let (staged, rx) = stage_one(pipe, None, frame);
+    staged.send().await;
     rx
 }
 
@@ -1905,29 +1993,8 @@ async fn scatter_one(
     head: Option<Bytes>,
     frame: Bytes,
 ) -> oneshot::Receiver<Bytes> {
-    let (tx, rx) = oneshot::channel();
-    let expect = 1 + u32::from(head.is_some());
-    match &shared.fabric {
-        Some(f) => {
-            let out = crate::shard::RemoteOutbound {
-                head,
-                frame,
-                expect,
-                reply: crate::shard::RemoteSink::One(tx),
-            };
-            let _ = f.pipe(addr, readonly).send(out).await;
-        }
-        None => {
-            let conn = shared.backends.shared(addr, id, readonly);
-            conn.send(Outbound {
-                head,
-                frame,
-                expect,
-                sink: Sink::One(tx),
-            })
-            .await;
-        }
-    }
+    let (staged, rx) = stage_one(&pipe_for(shared, addr, id, readonly), head, frame);
+    staged.send().await;
     rx
 }
 
@@ -1951,7 +2018,7 @@ fn display_name(raw: &[u8]) -> String {
 }
 
 fn error_frame(msg: &str) -> Bytes {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(msg.len() + 3);
     resp::write_error(&mut out, msg);
     Bytes::from(out)
 }
@@ -2084,9 +2151,8 @@ async fn pubsub_relay(
             }
         }
         ensure_read_room(&mut buf);
-        match read_half.read_buf(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
+        if matches!(read_half.read_buf(&mut buf).await, Ok(0) | Err(_)) {
+            break;
         }
     }
     backfill_acks(&link, &reply_q);
@@ -2192,7 +2258,7 @@ async fn write_loop(
                     }
                 }
             }
-            stats::bump(&self.shared.stats.workers[self.shared.worker].writers_exited);
+            stats::bump(&self.shared.wstats.writers_exited);
             self.link.oob_notify.notify_waiters();
         }
     }
@@ -2262,12 +2328,10 @@ async fn write_loop(
                     continue;
                 }
                 if frame.first() == Some(&b'-')
-                    && (frame.starts_with(b"-MOVED ") || frame.starts_with(b"-ASK "))
+                    && let Some((ask, target)) = parse_redirect(&frame)
                 {
-                    if let Some((ask, target)) = parse_redirect(&frame)
-                        && let Some((req, base_expect)) = take_retry_frame(&link.inflight, seq, ask)
-                    {
-                        stats::bump(&shared.stats.workers[shared.worker].redirects);
+                    if let Some((req, base_expect)) = take_retry_frame(&link.inflight, seq, ask) {
+                        stats::bump(&shared.wstats.redirects);
                         // the retry carries no CACHING opt-in: it cannot fill
                         if link.fills_armed.get() > 0
                             && let Some(key) = take_fill(&link, seq)
@@ -2278,26 +2342,25 @@ async fn write_loop(
                         let _ = shared.refresh.send(());
                         let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
                         let expect = base_expect + u32::from(ask);
-                        match &shared.fabric {
-                            Some(f) => {
+                        match pipe_for(&shared, &target, client_id, false) {
+                            Pipe::Shard(tx) => {
                                 let Some(queue) = reply_q.shard_handle() else {
                                     let _ = reply_q
                                         .send(Reply::At(seq, Bytes::from_static(ERR_BACKEND_LOST)));
                                     continue;
                                 };
-                                let out = crate::shard::RemoteOutbound {
+                                let out = Outbound {
                                     head,
                                     frame: req,
                                     expect,
-                                    reply: crate::shard::RemoteSink::Session { queue, seq },
+                                    sink: crate::shard::RemoteSink::Session { queue, seq },
                                 };
-                                if f.pipe(&target, false).send(out).await.is_err() {
+                                if tx.send(out).await.is_err() {
                                     let _ = reply_q
                                         .send(Reply::At(seq, Bytes::from_static(ERR_BACKEND_LOST)));
                                 }
                             }
-                            None => {
-                                let conn = shared.backends.shared(&target, client_id, false);
+                            Pipe::Local(conn) => {
                                 conn.send(Outbound {
                                     head,
                                     frame: req,
@@ -2384,7 +2447,7 @@ async fn write_loop(
                 return;
             }
             drop(slices);
-            stats::add(&shared.stats.workers[shared.worker].bytes_out, total as u64);
+            stats::add(&shared.wstats.bytes_out, total as u64);
             ready.clear();
         }
         link.emitted.set(next_emit);
@@ -2430,15 +2493,16 @@ fn is_publication(frame: &[u8]) -> bool {
     if frame.first() != Some(&b'*') {
         return false;
     }
-    let Some((n, _)) = resp::scan_int_line(frame, 1) else {
+    let Some((n, after)) = resp::scan_int_line(frame, 1) else {
         return false;
     };
     if n < 3 {
         return false;
     }
-    let Some(kind) = resp::Args::new(frame, 1).next() else {
+    let Some(Ok(b)) = resp::scan_bulk(frame, after) else {
         return false;
     };
+    let kind = &frame[b.payload_start..b.payload_end];
     kind.eq_ignore_ascii_case(b"message") || kind.eq_ignore_ascii_case(b"pmessage")
 }
 

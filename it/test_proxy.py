@@ -549,8 +549,8 @@ def test_subscribe_then_quit_pipelined_confirms_first(raw_socket, key_prefix):
     s = raw_socket()
     s.sendall(_resp_encode(["SUBSCRIBE", f"{key_prefix}:ch"]) + _resp_encode(["QUIT"]))
     reader = _RespReader(s)
-    assert reader.read() == [b"subscribe", f"{key_prefix}:ch".encode(), 1]
-    assert reader.read() == b"OK"
+    assert reader.read_reply() == ["subscribe", f"{key_prefix}:ch", 1]
+    assert reader.read_reply() == "OK"
 
 
 def test_object_encoding_routes_by_key(r, key_prefix):
@@ -570,16 +570,15 @@ def test_client_list_shows_this_connection(new_conn):
     assert rows[0]["addr"]
 
 
-def test_pubsub_context_and_multi_errors_match_redis_wording(new_conn):
+def test_pubsub_context_and_multi_errors_match_redis_wording(raw_socket, new_conn):
+    s = raw_socket()
+    s.sendall(_resp_encode(["SUBSCRIBE", "it:ctx"]) + _resp_encode(["GET", "x"]))
+    reader = _RespReader(s)
+    assert reader.read_reply()[0] == "subscribe"
+    with pytest.raises(redis.exceptions.ResponseError, match=r"Can't execute 'get'"):
+        reader.read_reply()
     c = new_conn()
-    p = c.pubsub()
-    p.subscribe("it:ctx")
-    assert p.get_message(timeout=2)["type"] == "subscribe"
-    with pytest.raises(redis.ResponseError, match=r"Can't execute 'get'"):
-        p.execute_command("GET", "x")
-    p.close()
-    c2 = new_conn()
-    with pytest.raises(redis.ResponseError, match=r"in MULTI / EXEC, only support"):
-        pipe = c2.pipeline(transaction=True)
+    with pytest.raises(redis.exceptions.ResponseError, match=r"in MULTI / EXEC, only support"):
+        pipe = c.pipeline(transaction=True)
         pipe.execute_command("CLIENT", "LIST")
         pipe.execute()

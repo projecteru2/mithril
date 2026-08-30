@@ -35,7 +35,7 @@ pub struct ClientInfo {
 
 /// Process-wide stats shared across workers.
 pub struct Stats {
-    pub workers: Vec<WorkerStats>,
+    pub workers: Vec<Arc<WorkerStats>>,
     pub clients: AtomicUsize,
     pub total_connections: AtomicU64,
     pub registry: Mutex<HashMap<u64, ClientInfo>>,
@@ -44,7 +44,7 @@ pub struct Stats {
 impl Stats {
     pub fn new(workers: usize) -> Arc<Stats> {
         Arc::new(Stats {
-            workers: (0..workers).map(|_| WorkerStats::default()).collect(),
+            workers: (0..workers).map(|_| Arc::default()).collect(),
             clients: AtomicUsize::new(0),
             total_connections: AtomicU64::new(0),
             registry: Mutex::new(HashMap::new()),

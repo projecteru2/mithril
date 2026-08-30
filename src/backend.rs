@@ -36,12 +36,21 @@ pub enum Sink {
 }
 
 /// One pipelined request: optional prefix frame, payload, expected replies.
-pub struct Outbound {
+pub struct Outbound<S = Sink> {
     pub head: Option<Bytes>,
     pub frame: Bytes,
     /// Number of backend replies this produces; only the last is delivered.
     pub expect: u32,
-    pub sink: Sink,
+    pub sink: S,
+}
+
+/// What a connection is for; only masters carry cache tracking.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Master,
+    Replica,
+    /// Leased to one blocking command; aborting it closes the socket.
+    Exclusive,
 }
 
 /// A live backend connection; cheap to clone via Rc.
@@ -142,11 +151,16 @@ impl Backends {
         let want = self.cfg.backend_conns;
         let idx = (sticky % want as u64) as usize;
         let mut conns = pool.shared.borrow_mut();
+        let role = if readonly {
+            Role::Replica
+        } else {
+            Role::Master
+        };
         while conns.len() <= idx {
-            conns.push(self.dial(addr, readonly, false));
+            conns.push(self.dial(addr, role));
         }
         if conns[idx].is_dead() {
-            conns[idx] = self.dial(addr, readonly, false);
+            conns[idx] = self.dial(addr, role);
         }
         conns[idx].clone()
     }
@@ -166,7 +180,7 @@ impl Backends {
                         return None;
                     }
                     pool.exclusive_count.set(pool.exclusive_count.get() + 1);
-                    break self.dial(addr, false, true);
+                    break self.dial(addr, Role::Exclusive);
                 }
             }
         };
@@ -194,7 +208,7 @@ impl Backends {
         pool
     }
 
-    fn dial(&self, addr: &str, readonly: bool, abortable: bool) -> Rc<Conn> {
+    fn dial(&self, addr: &str, role: Role) -> Rc<Conn> {
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
         let conn = Rc::new(Conn {
             tx,
@@ -202,15 +216,14 @@ impl Backends {
             abort: tokio::sync::Notify::new(),
         });
         let task_conn = conn.clone();
-        // only master reads fill the cache: replica connections stay untracked
         let tracking = match &self.tracking {
-            Some(t) if !readonly && !abortable => t.borrow().get(addr).cloned(),
+            Some(t) if role == Role::Master => t.borrow().get(addr).cloned(),
             _ => None,
         };
         let addr = addr.to_string();
         let cfg = self.cfg.clone();
         tokio::task::spawn_local(async move {
-            run_conn(&addr, rx, readonly, abortable, tracking, &cfg, &task_conn).await;
+            run_conn(&addr, rx, role, tracking, &cfg, &task_conn).await;
             task_conn.dead.set(true);
         });
         conn
@@ -265,16 +278,9 @@ pub async fn dial_raw(addr: &str, cfg: &Config) -> std::io::Result<TcpStream> {
         return Ok(stream);
     }
     let (mut r, mut w) = stream.into_split();
-    handshake(
-        &mut r,
-        &mut w,
-        false,
-        &cfg.backend_user,
-        &cfg.backend_pass,
-        None,
-    )
-    .await
-    .map_err(std::io::Error::other)?;
+    handshake(&mut r, &mut w, false, cfg, None)
+        .await
+        .map_err(std::io::Error::other)?;
     r.reunite(w).map_err(std::io::Error::other)
 }
 
@@ -335,12 +341,12 @@ pub(crate) fn pair_replies<S>(
 async fn run_conn(
     addr: &str,
     mut rx: mpsc::Receiver<Outbound>,
-    readonly: bool,
-    abortable: bool,
+    role: Role,
     tracking: Option<Bytes>,
     cfg: &Config,
     conn: &Conn,
 ) {
+    let abortable = role == Role::Exclusive;
     let setup = async {
         let stream = connect(addr, cfg.tcp_keepalive_secs)
             .await
@@ -349,9 +355,8 @@ async fn run_conn(
         handshake(
             &mut r,
             &mut w,
-            readonly,
-            &cfg.backend_user,
-            &cfg.backend_pass,
+            role == Role::Replica,
+            cfg,
             tracking.as_deref(),
         )
         .await?;
@@ -365,7 +370,7 @@ async fn run_conn(
         Ok(h) => h,
         Err(e) => {
             log_debug!("connect {addr}: {e}");
-            drain_channel(&mut rx);
+            drain_channel(&mut rx, deliver);
             return;
         }
     };
@@ -398,17 +403,7 @@ async fn run_conn(
                     }
                     continue;
                 }
-                frames.clear();
-                for out in batch.drain(..) {
-                    pending.push_back(Pending {
-                        expect: out.expect,
-                        sink: out.sink,
-                    });
-                    if let Some(h) = out.head {
-                        frames.push(h);
-                    }
-                    frames.push(out.frame);
-                }
+                stage(&mut batch, &mut pending, &mut frames);
                 let mut slices: Vec<IoSlice<'_>> = frames.iter().map(|f| IoSlice::new(f)).collect();
                 let wrote = tokio::select! {
                     _ = conn.abort.notified(), if abortable => false,
@@ -419,9 +414,8 @@ async fn run_conn(
                 }
             }
             r = read_half.read_buf(&mut buf) => {
-                match r {
-                    Ok(0) | Err(_) => break 'io,
-                    Ok(_) => {}
+                if matches!(r, Ok(0) | Err(_)) {
+                    break 'io;
                 }
             }
         }
@@ -430,7 +424,7 @@ async fn run_conn(
     for p in pending.drain(..) {
         deliver(p.sink, Bytes::from_static(ERR_BACKEND_LOST));
     }
-    drain_channel(&mut rx);
+    drain_channel(&mut rx, deliver);
 }
 
 /// Grows a read buffer geometrically to READ_CHUNK; idle sessions stay small.
@@ -451,10 +445,30 @@ fn deliver(sink: Sink, frame: Bytes) {
     }
 }
 
-fn drain_channel(rx: &mut mpsc::Receiver<Outbound>) {
+/// Fails every request still queued on a connection that is gone.
+pub(crate) fn drain_channel<S>(rx: &mut mpsc::Receiver<Outbound<S>>, deliver: impl Fn(S, Bytes)) {
     rx.close();
     while let Ok(out) = rx.try_recv() {
         deliver(out.sink, Bytes::from_static(ERR_BACKEND_LOST));
+    }
+}
+
+/// Records what each batched request expects and lays its frames out for one writev.
+pub(crate) fn stage<S>(
+    batch: &mut Vec<Outbound<S>>,
+    pending: &mut VecDeque<Pending<S>>,
+    frames: &mut Vec<Bytes>,
+) {
+    frames.clear();
+    for out in batch.drain(..) {
+        pending.push_back(Pending {
+            expect: out.expect,
+            sink: out.sink,
+        });
+        if let Some(h) = out.head {
+            frames.push(h);
+        }
+        frames.push(out.frame);
     }
 }
 
@@ -472,17 +486,17 @@ pub(crate) async fn handshake(
     reader: &mut OwnedReadHalf,
     writer: &mut OwnedWriteHalf,
     readonly: bool,
-    user: &str,
-    pass: &str,
+    cfg: &Config,
     tracking: Option<&[u8]>,
 ) -> Result<(), String> {
     let mut cmds: Vec<u8> = Vec::new();
     let mut expected = 0u32;
+    let (user, pass) = (cfg.backend_user.as_bytes(), cfg.backend_pass.as_bytes());
     if !pass.is_empty() {
         if user.is_empty() {
-            resp::write_command(&mut cmds, &[b"AUTH", pass.as_bytes()]);
+            resp::write_command(&mut cmds, &[b"AUTH", pass]);
         } else {
-            resp::write_command(&mut cmds, &[b"AUTH", user.as_bytes(), pass.as_bytes()]);
+            resp::write_command(&mut cmds, &[b"AUTH", user, pass]);
         }
         expected += 1;
     }
