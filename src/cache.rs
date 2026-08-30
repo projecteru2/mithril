@@ -5,7 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, hash_map};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -92,9 +92,12 @@ enum Scope {
 }
 
 /// Process-wide tracking coverage; owner workers report, everyone reads.
+/// Every flush bumps `flushes`; a worker whose cache lags a generation clears
+/// itself on its next touch, so no flush waits on a channel.
 pub struct Coverage {
     sets: Mutex<Sets>,
     armed: AtomicBool,
+    flushes: AtomicU64,
 }
 
 impl Coverage {
@@ -102,6 +105,7 @@ impl Coverage {
         Arc::new(Coverage {
             sets: Mutex::new((HashSet::new(), HashSet::new())),
             armed: AtomicBool::new(false),
+            flushes: AtomicU64::new(0),
         })
     }
 
@@ -122,6 +126,7 @@ pub struct ReplyCache {
     prev_bytes: Cell<usize>,
     fills: RefCell<Fills>,
     scope: Scope,
+    seen_flushes: Cell<u64>,
     frames: TrackingFrames,
     stats: Arc<Stats>,
     worker: usize,
@@ -150,6 +155,7 @@ impl ReplyCache {
             prev_bytes: Cell::new(0),
             fills: RefCell::new(Fills::default()),
             scope,
+            seen_flushes: Cell::new(0),
             frames: Rc::new(RefCell::new(HashMap::new())),
             stats,
             worker,
@@ -163,6 +169,7 @@ impl ReplyCache {
 
     /// Returns the cached reply for `key` if fresh.
     pub fn lookup(&self, key: &[u8]) -> Option<Bytes> {
+        self.sync();
         if let Some(e) = self.hot.borrow().get(key) {
             if e.at.elapsed() <= self.max_age {
                 return Some(e.frame.clone());
@@ -181,6 +188,7 @@ impl ReplyCache {
     /// Arms a fill for `key`; false while coverage is incomplete or the key
     /// already has a ticket or a write in flight.
     pub fn begin_fill(&self, key: &Bytes) -> bool {
+        self.sync();
         if !self.armed() {
             return false;
         }
@@ -199,6 +207,7 @@ impl ReplyCache {
 
     /// Caches an armed fill's reply unless an invalidation raced it.
     pub fn complete_fill(&self, key: &Bytes, frame: &Bytes) {
+        self.sync();
         if self.settle_ticket(key) != Some(false)
             || frame.first() != Some(&b'$')
             || frame.len() > ENTRY_MAX_BYTES
@@ -223,6 +232,7 @@ impl ReplyCache {
 
     /// Drops `key` from both generations and poisons its in-flight fill.
     pub fn invalidate(&self, key: &[u8]) {
+        self.sync();
         stats::bump(&self.stats.workers[self.worker].cache_invalidations);
         take_entry(&self.hot, &self.hot_bytes, key);
         take_entry(&self.prev, &self.prev_bytes, key);
@@ -266,10 +276,31 @@ impl ReplyCache {
         }
     }
 
+    /// Clears every cache in the scope.
+    pub fn flush(&self) {
+        match &self.scope {
+            Scope::Local { .. } => self.clear(),
+            Scope::Shared(c) => {
+                c.flushes.fetch_add(1, Ordering::Relaxed);
+                self.sync();
+            }
+        }
+    }
+
     fn armed(&self) -> bool {
         match &self.scope {
             Scope::Local { armed, .. } => armed.get(),
             Scope::Shared(c) => c.armed.load(Ordering::Relaxed),
+        }
+    }
+
+    fn sync(&self) {
+        if let Scope::Shared(c) = &self.scope {
+            let g = c.flushes.load(Ordering::Relaxed);
+            if g != self.seen_flushes.get() {
+                self.seen_flushes.set(g);
+                self.clear();
+            }
         }
     }
 
@@ -305,9 +336,8 @@ impl ReplyCache {
         self.hot_bytes.set(self.hot_bytes.get() + size - replaced);
     }
 
-    // any master-set change disarms immediately, before old trackers unwind;
-    // true when the caller must flush every cache in the scope
-    fn set_coverage(&self, want: &HashSet<&str>) -> bool {
+    // any master-set change disarms immediately, before old trackers unwind
+    fn set_coverage(&self, want: &HashSet<&str>) {
         match &self.scope {
             Scope::Local { sets, armed } => {
                 let mut sets = sets.borrow_mut();
@@ -316,21 +346,31 @@ impl ReplyCache {
                 }
                 armed.set(covered(&sets));
                 self.publish(armed.get());
-                false
             }
             Scope::Shared(c) => {
                 let mut sets = c.lock();
                 let changed = replace_set(&mut sets.0, want);
                 let armed = covered(&sets);
                 c.armed.store(armed, Ordering::Relaxed);
+                drop(sets);
+                if changed {
+                    self.flush();
+                }
                 self.publish(armed);
-                changed
             }
         }
     }
 
-    fn tracker_up(&self, addr: &str, frame: Bytes) {
+    // a dialer that races the rearm picks the frame up from here
+    fn install_frame(&self, addr: &str, frame: Bytes) {
         self.frames.borrow_mut().insert(Box::from(addr), frame);
+    }
+
+    fn forget_frame(&self, addr: &str) {
+        self.frames.borrow_mut().remove(addr);
+    }
+
+    fn tracker_up(&self, addr: &str) {
         match &self.scope {
             Scope::Local { sets, armed } => {
                 let mut sets = sets.borrow_mut();
@@ -349,21 +389,29 @@ impl ReplyCache {
     }
 
     // a gone tracker means missed invalidations: nothing cached survives, and
-    // a new connection must not redirect to the dead client id
+    // a new connection must not redirect to the dead client id; a departed
+    // master leaves the remaining coverage intact
     fn tracker_down(&self, addr: &str) {
-        self.frames.borrow_mut().remove(addr);
-        match &self.scope {
+        self.forget_frame(addr);
+        let armed = match &self.scope {
             Scope::Local { sets, armed } => {
-                sets.borrow_mut().1.remove(addr);
+                let mut sets = sets.borrow_mut();
+                sets.1.remove(addr);
                 self.clear();
-                armed.set(false);
+                armed.set(covered(&sets));
+                armed.get()
             }
             Scope::Shared(c) => {
-                c.lock().1.remove(addr);
-                c.armed.store(false, Ordering::Relaxed);
+                let mut sets = c.lock();
+                sets.1.remove(addr);
+                let armed = covered(&sets);
+                c.armed.store(armed, Ordering::Relaxed);
+                drop(sets);
+                self.flush();
+                armed
             }
-        }
-        self.publish(false);
+        };
+        self.publish(armed);
     }
 
     fn publish(&self, armed: bool) {
@@ -419,28 +467,26 @@ impl Wiring {
             .is_none_or(|f| f.owner(addr) == self.cache.worker)
     }
 
-    async fn rearm(&self, addr: &str, frame: &Bytes) {
+    async fn rearm(&self, addr: &str, frame: &Bytes) -> Result<(), String> {
         match &self.fabric {
             Some(f) => f.rearm(addr, frame.clone()).await,
             None => self.backends.rearm(addr, frame).await,
         }
     }
 
+    // a worker too slow to take its invalidations loses its whole cache instead
     fn invalidate(&self, keys: &[Bytes]) {
         match &self.fabric {
-            Some(f) => f.invalidate(Arc::from(keys)),
+            Some(f) => {
+                if !f.invalidate(Arc::from(keys)) {
+                    self.cache.flush();
+                }
+            }
             None => {
                 for k in keys {
                     self.cache.invalidate(k);
                 }
             }
-        }
-    }
-
-    fn flush(&self) {
-        match &self.fabric {
-            Some(f) => f.flush(),
-            None => self.cache.clear(),
         }
     }
 }
@@ -458,9 +504,7 @@ pub async fn run_trackers(w: Rc<Wiring>, topo: Arc<ArcSwap<Topology>>) {
                 .iter()
                 .map(|&i| t.nodes[i as usize].addr.as_str())
                 .collect();
-            if w.cache.set_coverage(&want) {
-                w.flush();
-            }
+            w.cache.set_coverage(&want);
             running.retain(|addr, task| {
                 want.contains(&**addr) || {
                     task.abort();
@@ -496,7 +540,6 @@ struct UpGuard {
 impl Drop for UpGuard {
     fn drop(&mut self) {
         self.w.cache.tracker_down(&self.addr);
-        self.w.flush();
     }
 }
 
@@ -543,9 +586,13 @@ async fn track_once(addr: &str, w: &Rc<Wiring>) -> Result<(), String> {
         ],
     );
     let frame = Bytes::from(frame);
-    // live connections learn the redirect before any fill can be armed
-    w.rearm(addr, &frame).await;
-    w.cache.tracker_up(addr, frame);
+    // every connection, live or dialed meanwhile, redirects before fills arm
+    w.cache.install_frame(addr, frame.clone());
+    if let Err(e) = w.rearm(addr, &frame).await {
+        w.cache.forget_frame(addr);
+        return Err(e);
+    }
+    w.cache.tracker_up(addr);
     let _up = UpGuard {
         w: w.clone(),
         addr: Box::from(addr),
@@ -562,7 +609,7 @@ async fn track_once(addr: &str, w: &Rc<Wiring>) -> Result<(), String> {
                     let frame = buf.split_to(len).freeze();
                     match frame.first() {
                         Some(b'>') => match collect_push(&frame, &mut keys) {
-                            Some(true) => w.flush(),
+                            Some(true) => w.cache.flush(),
                             Some(false) => {
                                 w.invalidate(&keys);
                                 keys.clear();
@@ -645,7 +692,8 @@ mod tests {
         };
         let c = ReplyCache::new(&cfg, Stats::new(1), 0, None);
         c.set_coverage(&HashSet::from(["m1"]));
-        c.tracker_up("m1", Bytes::new());
+        c.install_frame("m1", Bytes::new());
+        c.tracker_up("m1");
         c
     }
 
@@ -710,7 +758,7 @@ mod tests {
         c.set_coverage(&HashSet::from(["m1", "m2"]));
         assert_eq!(c.lookup(&key), None);
         assert!(!c.begin_fill(&key));
-        c.tracker_up("m2", Bytes::new());
+        c.tracker_up("m2");
         let (key, frame2) = fill(&c, "k1", "v2");
         assert_eq!(c.lookup(&key), Some(frame2));
         drop(frame);
@@ -728,33 +776,53 @@ mod tests {
         assert_eq!(c.lookup(&key), None);
         assert!(!c.begin_fill(&key));
         c.tracker_down("m1");
-        c.tracker_up("m3", Bytes::new());
+        c.tracker_up("m3");
         assert!(c.begin_fill(&key));
     }
 
     #[test]
-    fn shared_scope_arms_process_wide_and_reports_flushes() {
+    fn departed_master_leaves_the_rest_covered() {
+        let c = cache(1 << 20);
+        c.set_coverage(&HashSet::from(["m1", "m2"]));
+        c.tracker_up("m2");
+        assert!(c.begin_fill(&Bytes::from_static(b"a")));
+        c.set_coverage(&HashSet::from(["m2"]));
+        c.tracker_down("m1");
+        assert!(
+            c.begin_fill(&Bytes::from_static(b"b")),
+            "m2 alone covers the set"
+        );
+    }
+
+    #[test]
+    fn shared_scope_arms_process_wide_and_flushes_by_generation() {
         let cfg = Config::default();
         let stats = Stats::new(2);
         let cov = Coverage::new();
         let a = ReplyCache::new(&cfg, stats.clone(), 0, Some(cov.clone()));
-        let b = ReplyCache::new(&cfg, stats.clone(), 1, Some(cov));
-        assert!(a.set_coverage(&HashSet::from(["m1", "m2"])));
-        assert!(
-            !b.set_coverage(&HashSet::from(["m1", "m2"])),
-            "same set is idempotent"
-        );
-        a.tracker_up("m1", Bytes::new());
+        let b = ReplyCache::new(&cfg, stats.clone(), 1, Some(cov.clone()));
+        a.set_coverage(&HashSet::from(["m1", "m2"]));
+        b.set_coverage(&HashSet::from(["m1", "m2"]));
+        a.tracker_up("m1");
         assert!(!b.begin_fill(&Bytes::from_static(b"k")));
-        b.tracker_up("m2", Bytes::new());
-        assert!(a.begin_fill(&Bytes::from_static(b"k")));
-        assert_eq!(stats.workers[1].cache_armed.load(Ordering::Relaxed), 1);
-        assert!(
-            a.set_coverage(&HashSet::from(["m1"])),
-            "a changed set asks for a flush"
-        );
+        b.tracker_up("m2");
+        let (key, frame) = fill(&b, "k", "v");
+        assert_eq!(stats.workers[0].cache_armed.load(Ordering::Relaxed), 1);
+        let pending = Bytes::from_static(b"p");
+        assert!(b.begin_fill(&pending));
+        let flushes_before = cov.flushes.load(Ordering::Relaxed);
         a.tracker_down("m1");
-        assert!(!b.begin_fill(&Bytes::from_static(b"k")));
+        assert!(cov.flushes.load(Ordering::Relaxed) > flushes_before);
+        assert_eq!(b.lookup(&key), None, "b clears itself on its next touch");
+        b.complete_fill(&pending, &Bytes::from_static(b"$1\r\nx\r\n"));
+        a.tracker_up("m1");
+        assert_eq!(
+            b.lookup(&pending),
+            None,
+            "a fill from the old generation is gone"
+        );
+        assert!(b.begin_fill(&key));
+        drop(frame);
     }
 
     #[test]

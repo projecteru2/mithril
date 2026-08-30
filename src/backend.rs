@@ -111,14 +111,16 @@ impl Backends {
         })
     }
 
-    /// Redirects every live shared connection to `addr` at a new tracker.
-    pub async fn rearm(&self, addr: &str, frame: &Bytes) {
+    /// Redirects every live shared connection to `addr` at a new tracker;
+    /// a connection that dies meanwhile is replaced by one that dials with
+    /// the frame, any other refusal fails the tracker.
+    pub async fn rearm(&self, addr: &str, frame: &Bytes) -> Result<(), String> {
         let conns: Vec<Rc<Conn>> = match self.pools.borrow().get(addr) {
             Some([Some(pool), _]) => pool.shared.borrow().clone(),
             _ => Vec::new(),
         };
-        for conn in conns {
-            let (tx, _) = oneshot::channel();
+        for conn in conns.iter().filter(|c| !c.is_dead()) {
+            let (tx, rx) = oneshot::channel();
             conn.send(Outbound {
                 head: None,
                 frame: frame.clone(),
@@ -126,7 +128,9 @@ impl Backends {
                 sink: Sink::One(tx),
             })
             .await;
+            check_rearm(rx.await.ok())?;
         }
+        Ok(())
     }
 
     /// Returns the sticky shared connection for `addr`.
@@ -304,22 +308,18 @@ pub(crate) fn pair_replies<S>(
         match resp::scan_value(buf) {
             resp::Scan::Complete(len) => {
                 let frame = buf.split_to(len).freeze();
-                let is_err = frame.first() == Some(&b'-');
                 match pending.front_mut() {
                     Some(front) if front.expect > 1 => {
                         front.expect -= 1;
-                        if front_err.is_none() && is_err {
+                        if front_err.is_none() && frame.first() == Some(&b'-') {
                             *front_err = Some(frame);
                         }
                     }
                     _ => {
                         if let Some(d) = pending.pop_front() {
-                            // an aborted MULTI reports its first queued error
-                            let reply = match front_err.take() {
-                                Some(err) if is_err => err,
-                                _ => frame,
-                            };
-                            deliver(d.sink, reply);
+                            // a failed head (ASKING, CACHING, a queued MULTI
+                            // command) is the reply: its request never ran as sent
+                            deliver(d.sink, front_err.take().unwrap_or(frame));
                         }
                     }
                 }
@@ -501,6 +501,15 @@ pub(crate) async fn handshake(
         read_reply(reader, &mut buf).await?;
     }
     Ok(())
+}
+
+/// Accepts a rearm reply: +OK, or a connection that died before answering.
+pub(crate) fn check_rearm(reply: Option<Bytes>) -> Result<(), String> {
+    match reply {
+        Some(r) if r.as_ref() == resp::OK || r.as_ref() == ERR_BACKEND_LOST => Ok(()),
+        None => Ok(()),
+        Some(r) => Err(String::from_utf8_lossy(&r).trim_end().to_string()),
+    }
 }
 
 /// Reads one complete reply; an error reply or a closed stream is an Err.

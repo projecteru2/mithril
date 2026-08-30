@@ -34,7 +34,14 @@ const SNAP_WINDOW: Duration = Duration::from_millis(10);
 const QUIET_FLOOR: u64 = 128;
 const DRAIN_POLL: Duration = Duration::from_millis(50);
 
-type ShardWiring = (Arc<shard::Fabric>, mpsc::UnboundedReceiver<shard::Control>);
+// invalidation batches a worker may fall behind before its cache flushes
+const INVAL_QUEUE: usize = 4096;
+
+type ShardWiring = (
+    Arc<shard::Fabric>,
+    mpsc::UnboundedReceiver<shard::NewConn>,
+    mpsc::Receiver<shard::Invalidations>,
+);
 
 static TOPO_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Set on SIGINT/SIGTERM; accept loops stop taking new connections.
@@ -79,8 +86,12 @@ pub fn run(cfg: Config) -> Result<(), String> {
         let mut ctl_rxs = Vec::with_capacity(cfg.workers);
         for _ in 0..cfg.workers {
             let (ct, cr) = mpsc::unbounded_channel();
-            ctl_txs.push(ct);
-            ctl_rxs.push(cr);
+            let (it, ir) = mpsc::channel(INVAL_QUEUE);
+            ctl_txs.push(shard::Controls {
+                conns: ct,
+                invals: it,
+            });
+            ctl_rxs.push((cr, ir));
         }
         Some((shard::Fabric::new(ctl_txs), ctl_rxs))
     } else {
@@ -96,9 +107,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
         let stats = stats.clone();
         let refresh = refresh_tx.clone();
         // receivers ship in worker order; fabric controls index by worker
-        let shard = shard_parts
-            .as_mut()
-            .map(|(f, crs)| (f.clone(), crs.remove(0)));
+        let shard = shard_parts.as_mut().map(|(f, crs)| {
+            let (cr, ir) = crs.remove(0);
+            (f.clone(), cr, ir)
+        });
         let ctx = WorkerCtx {
             cfg,
             topo,
@@ -318,9 +330,10 @@ fn worker_thread(
             .reply_cache
             .then(|| crate::cache::ReplyCache::new(&cfg, stats.clone(), worker, coverage));
         let tracking = cache.as_ref().map(|c| c.tracking_frames());
-        let fabric = shard.map(|(fabric, ctl_rx)| {
+        let fabric = shard.map(|(fabric, ctl_rx, inval_rx)| {
             tokio::task::spawn_local(shard::control_loop(
                 ctl_rx,
+                inval_rx,
                 fabric.clone(),
                 cfg.clone(),
                 cache.clone(),

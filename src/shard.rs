@@ -9,7 +9,9 @@ use bytes::Bytes;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::backend::{BATCH, ERR_BACKEND_LOST, OUTBOUND_QUEUE, ensure_read_room, write_slices};
+use crate::backend::{
+    BATCH, ERR_BACKEND_LOST, OUTBOUND_QUEUE, check_rearm, ensure_read_room, write_slices,
+};
 use crate::cache::{ReplyCache, TrackingFrames};
 use crate::config::Config;
 use crate::log_debug;
@@ -41,22 +43,23 @@ pub struct NewConn {
     pub rx: mpsc::Receiver<RemoteOutbound>,
 }
 
-/// Messages to a worker's control loop.
-pub enum Control {
-    Conn(NewConn),
-    /// Cache invalidations received by a tracker on the owner worker.
-    Invalidate(Arc<[Bytes]>),
-    Flush,
+/// Cache invalidations crossing from a tracker to every worker.
+pub type Invalidations = Arc<[Bytes]>;
+
+/// Per-worker control channels: new pipes to run, invalidations to apply.
+pub struct Controls {
+    pub conns: mpsc::UnboundedSender<NewConn>,
+    pub invals: mpsc::Sender<Invalidations>,
 }
 
 /// Process-wide shard fabric shared by every worker.
 pub struct Fabric {
-    controls: Vec<mpsc::UnboundedSender<Control>>,
+    controls: Vec<Controls>,
     conns: Mutex<[HashMap<Box<str>, mpsc::Sender<RemoteOutbound>>; 2]>,
 }
 
 impl Fabric {
-    pub fn new(controls: Vec<mpsc::UnboundedSender<Control>>) -> Arc<Fabric> {
+    pub fn new(controls: Vec<Controls>) -> Arc<Fabric> {
         Arc::new(Fabric {
             controls,
             conns: Mutex::new([HashMap::new(), HashMap::new()]),
@@ -77,11 +80,11 @@ impl Fabric {
         }
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
         conns.insert(addr.into(), tx.clone());
-        let _ = self.controls[self.owner(addr)].send(Control::Conn(NewConn {
+        let _ = self.controls[self.owner(addr)].conns.send(NewConn {
             addr: addr.to_string(),
             readonly,
             rx,
-        }));
+        });
         tx
     }
 
@@ -92,7 +95,7 @@ impl Fabric {
 
     /// Redirects the node's live pipe at a new tracker; a pipe dialed later
     /// learns it from the handshake.
-    pub async fn rearm(&self, addr: &str, frame: Bytes) {
+    pub async fn rearm(&self, addr: &str, frame: Bytes) -> Result<(), String> {
         let tx = self
             .conns
             .lock()
@@ -100,29 +103,31 @@ impl Fabric {
             .get(addr)
             .filter(|tx| !tx.is_closed())
             .cloned();
-        if let Some(tx) = tx {
-            let (otx, _) = oneshot::channel();
-            let _ = tx
-                .send(RemoteOutbound {
-                    head: None,
-                    frame,
-                    expect: 1,
-                    reply: RemoteSink::One(otx),
-                })
-                .await;
+        let Some(tx) = tx else {
+            return Ok(());
+        };
+        let (otx, orx) = oneshot::channel();
+        let sent = tx
+            .send(RemoteOutbound {
+                head: None,
+                frame,
+                expect: 1,
+                reply: RemoteSink::One(otx),
+            })
+            .await;
+        if sent.is_err() {
+            return Ok(());
         }
+        check_rearm(orx.await.ok())
     }
 
-    pub fn invalidate(&self, keys: Arc<[Bytes]>) {
+    /// Hands invalidations to every worker; false when one could not take them.
+    pub fn invalidate(&self, keys: Invalidations) -> bool {
+        let mut all = true;
         for c in &self.controls {
-            let _ = c.send(Control::Invalidate(keys.clone()));
+            all &= c.invals.try_send(keys.clone()).is_ok();
         }
-    }
-
-    pub fn flush(&self) {
-        for c in &self.controls {
-            let _ = c.send(Control::Flush);
-        }
+        all
     }
 
     // generation-safe: a replacement pipe created meanwhile must survive
@@ -139,17 +144,19 @@ impl Fabric {
 }
 
 /// Worker control loop: runs the pipes the fabric assigns here and applies
-/// broadcast cache invalidations.
+/// the invalidations trackers broadcast.
 pub async fn control_loop(
-    mut ctl: mpsc::UnboundedReceiver<Control>,
+    mut ctl: mpsc::UnboundedReceiver<NewConn>,
+    mut invals: mpsc::Receiver<Invalidations>,
     fabric: Arc<Fabric>,
     cfg: Arc<Config>,
     cache: Option<Rc<ReplyCache>>,
     tracking: Option<TrackingFrames>,
 ) {
-    while let Some(msg) = ctl.recv().await {
-        match msg {
-            Control::Conn(nc) => {
+    loop {
+        tokio::select! {
+            nc = ctl.recv() => {
+                let Some(nc) = nc else { return };
                 let frame = match &tracking {
                     Some(t) if !nc.readonly => t.borrow().get(nc.addr.as_str()).cloned(),
                     _ => None,
@@ -161,16 +168,12 @@ pub async fn control_loop(
                     fabric.forget(&nc.addr, nc.readonly);
                 });
             }
-            Control::Invalidate(keys) => {
+            keys = invals.recv() => {
+                let Some(keys) = keys else { return };
                 if let Some(c) = &cache {
                     for k in keys.iter() {
                         c.invalidate(k);
                     }
-                }
-            }
-            Control::Flush => {
-                if let Some(c) = &cache {
-                    c.clear();
                 }
             }
         }
