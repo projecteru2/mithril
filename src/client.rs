@@ -208,8 +208,7 @@ struct InFlight {
     frame: Bytes,
     expect: u32,
     retried: bool,
-    // key of a cache fill this reply completes
-    fill: Option<Bytes>,
+    fill_key: Option<Bytes>,
 }
 
 // sequences are allocated monotonically, so the ring stays sorted
@@ -565,7 +564,7 @@ impl Session {
             frame: frame.clone(),
             expect,
             retried: false,
-            fill,
+            fill_key: fill,
         });
     }
 
@@ -1927,7 +1926,7 @@ async fn write_loop(
             mark_closed(self.link);
             if let Some(cache) = &self.shared.cache {
                 for e in self.link.inflight.borrow_mut().iter_mut() {
-                    if let Some(key) = e.fill.take() {
+                    if let Some(key) = e.fill_key.take() {
                         cache.abandon_fill(&key);
                     }
                 }
@@ -2095,7 +2094,7 @@ async fn write_loop(
         if next_emit > swept_to {
             let mut inf = link.inflight.borrow_mut();
             while inf.front().is_some_and(|e| e.seq < next_emit) {
-                if let Some(key) = inf.pop_front().and_then(|e| e.fill)
+                if let Some(key) = inf.pop_front().and_then(|e| e.fill_key)
                     && let Some(cache) = &shared.cache
                 {
                     link.fills_armed.set(link.fills_armed.get() - 1);
@@ -2132,7 +2131,7 @@ async fn write_loop(
 fn take_fill(link: &WriterLink, seq: u64) -> Option<Bytes> {
     let mut inf = link.inflight.borrow_mut();
     let idx = inf.binary_search_by_key(&seq, |e| e.seq).ok()?;
-    let key = inf[idx].fill.take()?;
+    let key = inf[idx].fill_key.take()?;
     link.fills_armed.set(link.fills_armed.get() - 1);
     Some(key)
 }
