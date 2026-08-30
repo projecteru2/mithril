@@ -340,9 +340,9 @@ impl Session {
         // writes drop their keys before they are queued: read-your-writes
         if let Some(cache) = &self.shared.cache
             && spec.is_write()
-            && spec.kind != Kind::Single
         {
             match spec.kind {
+                Kind::Single | Kind::MultiSum | Kind::Mset => {}
                 Kind::Flushall => cache.clear(),
                 _ => write_keys(spec, &frame, argc, |k| cache.invalidate(k)),
             }
@@ -540,6 +540,11 @@ impl Session {
             let picked = self
                 .with_rng(|r| route::pick(&topo, slot, readonly, self.shared.cfg.slave_mode, r));
             let Some((idx, is_replica)) = picked else {
+                if let Some(key) = &fill
+                    && let Some(cache) = &self.shared.cache
+                {
+                    cache.abandon_fill(key);
+                }
                 self.emit_at(seq, Bytes::from_static(ERR_NO_OWNER));
                 return None;
             };
@@ -676,6 +681,17 @@ impl Session {
                 }
             }
             let total = keys.len();
+            let marks: Vec<Bytes> = match &self.shared.cache {
+                Some(cache) if spec.is_write() => keys
+                    .iter()
+                    .map(|k| {
+                        let k = frame.slice_ref(k);
+                        cache.begin_write(&k);
+                        k
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
             let topo = self.topo();
             let parts = self.with_rng(|rng| {
                 multikey::split(spec.name.as_bytes(), &keys, values.as_deref(), |slot| {
@@ -687,16 +703,21 @@ impl Session {
                     .iter()
                     .map(|part| self.cached_pipe(&topo, part.node, part.readonly))
                     .collect();
-                (p, pipes, total)
+                (p, pipes, total, marks)
             })
         };
-        let (parts, pipes, total) = match split {
+        let (parts, pipes, total, marks) = match split {
             Ok(v) => v,
             Err(e) => {
                 self.emit_at(seq, error_frame(&format!("CLUSTERDOWN {e}")));
                 return;
             }
         };
+        if let Some(cache) = &self.shared.cache {
+            for k in &marks {
+                cache.end_write(k);
+            }
+        }
         let shared = self.shared.clone();
         let reply_q = self.reply_q.clone();
         let id = self.id;
@@ -714,34 +735,34 @@ impl Session {
         // detached deliberately: completion is bounded by backend replies.
         tokio::task::spawn_local(async move {
             let mut results: Vec<(Vec<usize>, Bytes)> = Vec::with_capacity(parts.len());
-            let mut redirected: Vec<(multikey::Part, bool, String)> = Vec::new();
-            for (part, rx) in parts.into_iter().zip(receivers) {
+            let mut retries: Vec<(Vec<usize>, oneshot::Receiver<Bytes>)> = Vec::new();
+            for (mut part, rx) in parts.into_iter().zip(receivers) {
                 let reply = recv_or_lost(rx).await;
                 // a redirected part executed nothing: one resend is idempotent
                 match parse_redirect(&reply) {
-                    Some((ask, target)) => redirected.push((part, ask, target)),
+                    Some((ask, target)) => {
+                        let _ = shared.refresh.send(());
+                        let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
+                        let frame = std::mem::take(&mut part.frame);
+                        let rx = scatter_one(&shared, &target, id, false, head, frame).await;
+                        retries.push((part.positions, rx));
+                    }
                     None => results.push((part.positions, reply)),
                 }
             }
-            if !redirected.is_empty() {
-                let _ = shared.refresh.send(());
-                let mut retries = Vec::with_capacity(redirected.len());
-                for (part, ask, target) in &mut redirected {
-                    let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
-                    let frame = std::mem::take(&mut part.frame);
-                    let rx = scatter_one(&shared, target, id, false, head, frame).await;
-                    retries.push(rx);
-                }
-                for ((part, _, _), rx) in redirected.into_iter().zip(retries) {
-                    let reply = recv_or_lost(rx).await;
-                    results.push((part.positions, reply));
-                }
+            for (positions, rx) in retries {
+                results.push((positions, recv_or_lost(rx).await));
             }
             let merged = match merge {
                 Merge::Mget => multikey::merge_mget(total, &results),
                 Merge::Ok => multikey::merge_ok(results.iter().map(|(_, r)| r)),
                 Merge::Sum => multikey::merge_sum(results.iter().map(|(_, r)| r)),
             };
+            if let Some(cache) = &shared.cache {
+                for k in &marks {
+                    cache.end_write(k);
+                }
+            }
             let _ = reply_q.send(Reply::At(seq, merged.unwrap_or_else(|e| e)));
         });
     }

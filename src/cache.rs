@@ -1,7 +1,7 @@
 //! Reply cache: worker-local GET cache, invalidated by RESP3 BCAST tracking.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -35,7 +35,7 @@ const TRACKING_FRAME: &[u8] =
 const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 
 type Map = HashMap<Box<[u8]>, Entry, BuildHasherDefault<KeyHasher>>;
-type Fills = HashMap<Bytes, bool, BuildHasherDefault<KeyHasher>>;
+type Fills = HashMap<Bytes, Fill, BuildHasherDefault<KeyHasher>>;
 
 /// Word-at-a-time multiply-fold; the length binds in the tail, not a prefix.
 #[derive(Default)]
@@ -68,6 +68,13 @@ struct Entry {
     at: Instant,
 }
 
+// one key's in-flight state: at most one fill ticket, any number of writes
+struct Fill {
+    ticket: bool,
+    writes: u32,
+    poisoned: bool,
+}
+
 /// Worker-local reply cache; two generations flip under a byte budget.
 pub struct ReplyCache {
     max_bytes: usize,
@@ -76,7 +83,6 @@ pub struct ReplyCache {
     prev: RefCell<Map>,
     hot_bytes: Cell<usize>,
     prev_bytes: Cell<usize>,
-    // in-flight fills by key; true = an invalidation raced the reply
     fills: RefCell<Fills>,
     wanted: RefCell<HashSet<Box<str>>>,
     ready: RefCell<HashSet<Box<str>>>,
@@ -120,22 +126,28 @@ impl ReplyCache {
         Some(frame)
     }
 
-    /// Arms a fill for `key`; false while tracking coverage is incomplete.
+    /// Arms a fill for `key`; false while coverage is incomplete or the key
+    /// already has a ticket or a write in flight.
     pub fn begin_fill(&self, key: &Bytes) -> bool {
         if !self.armed.get() {
             return false;
         }
-        // a poisoned entry stays poisoned: the first reply may predate the write
-        self.fills.borrow_mut().entry(key.clone()).or_insert(false);
-        true
+        match self.fills.borrow_mut().entry(key.clone()) {
+            hash_map::Entry::Occupied(_) => false,
+            hash_map::Entry::Vacant(v) => {
+                v.insert(Fill {
+                    ticket: true,
+                    writes: 0,
+                    poisoned: false,
+                });
+                true
+            }
+        }
     }
 
     /// Caches an armed fill's reply unless an invalidation raced it.
     pub fn complete_fill(&self, key: &Bytes, frame: &Bytes) {
-        let Some(poisoned) = self.fills.borrow_mut().remove(key) else {
-            return;
-        };
-        if poisoned
+        if self.settle_ticket(key) != Some(false)
             || frame.first() != Some(&b'$')
             || frame.len() > ENTRY_MAX_BYTES
             || entry_size(key, frame) > self.max_bytes / 2
@@ -154,7 +166,7 @@ impl ReplyCache {
 
     /// Forgets a fill whose reply will never be observed.
     pub fn abandon_fill(&self, key: &Bytes) {
-        self.fills.borrow_mut().remove(key);
+        self.settle_ticket(key);
     }
 
     /// Drops `key` from both generations and poisons its in-flight fill.
@@ -162,8 +174,32 @@ impl ReplyCache {
         stats::bump(&self.stats.workers[self.worker].cache_invalidations);
         take_entry(&self.hot, &self.hot_bytes, key);
         take_entry(&self.prev, &self.prev_bytes, key);
-        if let Some(p) = self.fills.borrow_mut().get_mut(key) {
-            *p = true;
+        if let Some(f) = self.fills.borrow_mut().get_mut(key) {
+            f.poisoned = true;
+        }
+    }
+
+    /// Invalidates `key` and blocks fills until [`ReplyCache::end_write`]:
+    /// a detached write may still be retrying while later reads complete.
+    pub fn begin_write(&self, key: &Bytes) {
+        self.invalidate(key);
+        let mut fills = self.fills.borrow_mut();
+        let f = fills.entry(key.clone()).or_insert(Fill {
+            ticket: false,
+            writes: 0,
+            poisoned: true,
+        });
+        f.writes += 1;
+        f.poisoned = true;
+    }
+
+    pub fn end_write(&self, key: &[u8]) {
+        let mut fills = self.fills.borrow_mut();
+        if let Some(f) = fills.get_mut(key) {
+            f.writes = f.writes.saturating_sub(1);
+            if f.writes == 0 && !f.ticket {
+                fills.remove(key);
+            }
         }
     }
 
@@ -173,9 +209,24 @@ impl ReplyCache {
         *self.prev.borrow_mut() = Map::default();
         self.hot_bytes.set(0);
         self.prev_bytes.set(0);
-        for p in self.fills.borrow_mut().values_mut() {
-            *p = true;
+        for f in self.fills.borrow_mut().values_mut() {
+            f.poisoned = true;
         }
+    }
+
+    // returns the ticket's poison state; the key's entry goes once nothing is in flight
+    fn settle_ticket(&self, key: &[u8]) -> Option<bool> {
+        let mut fills = self.fills.borrow_mut();
+        let f = fills.get_mut(key)?;
+        if !f.ticket {
+            return None;
+        }
+        f.ticket = false;
+        let poisoned = f.poisoned;
+        if f.writes == 0 {
+            fills.remove(key);
+        }
+        Some(poisoned)
     }
 
     fn insert_hot(&self, k: Box<[u8]>, e: Entry) {
@@ -514,14 +565,53 @@ mod tests {
     }
 
     #[test]
-    fn repeated_miss_keeps_the_poison() {
+    fn one_ticket_per_key_survives_a_write_between_misses() {
+        let c = cache(1 << 20);
+        let key = Bytes::from_static(b"k1");
+        let stale = Bytes::from_static(b"$2\r\nv1\r\n");
+        let fresh = Bytes::from_static(b"$2\r\nv2\r\n");
+        assert!(c.begin_fill(&key));
+        assert!(!c.begin_fill(&key), "second miss gets no ticket");
+        c.invalidate(&key);
+        c.complete_fill(&key, &stale);
+        assert_eq!(c.lookup(&key), None);
+        assert!(c.begin_fill(&key), "settled key accepts a new ticket");
+        c.complete_fill(&key, &stale);
+        assert_eq!(
+            c.lookup(&key),
+            Some(stale),
+            "the untracked reply cannot poison it"
+        );
+        c.invalidate(&key);
+        assert!(c.begin_fill(&key));
+        c.complete_fill(&key, &fresh);
+        assert_eq!(c.lookup(&key), Some(fresh));
+    }
+
+    #[test]
+    fn pending_write_blocks_fills_until_it_ends() {
+        let c = cache(1 << 20);
+        let (key, _) = fill(&c, "k1", "v1");
+        c.begin_write(&key);
+        assert_eq!(c.lookup(&key), None);
+        assert!(!c.begin_fill(&key));
+        c.begin_write(&key);
+        c.end_write(&key);
+        assert!(!c.begin_fill(&key), "still one write in flight");
+        c.end_write(&key);
+        assert!(c.begin_fill(&key));
+        c.complete_fill(&key, &Bytes::from_static(b"$2\r\nv2\r\n"));
+        assert!(c.lookup(&key).is_some());
+    }
+
+    #[test]
+    fn abandoned_ticket_frees_the_key() {
         let c = cache(1 << 20);
         let key = Bytes::from_static(b"k1");
         assert!(c.begin_fill(&key));
-        c.invalidate(&key);
+        c.abandon_fill(&key);
+        assert!(c.fills.borrow().is_empty());
         assert!(c.begin_fill(&key));
-        c.complete_fill(&key, &Bytes::from_static(b"$2\r\nv1\r\n"));
-        assert_eq!(c.lookup(&key), None);
     }
 
     #[test]
