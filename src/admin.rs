@@ -203,7 +203,7 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
          cache_hits:{}\r\ncache_misses:{}\r\ncache_invalidations:{}\r\n\
          cache_armed_workers:{}\r\n\
          worker_commands:{}\r\n",
-        env!("CARGO_PKG_VERSION"),
+        crate::VERSION,
         std::process::id(),
         cfg.port,
         now.saturating_sub(started),
@@ -393,6 +393,7 @@ mod tests {
                 .map(|v| v.trim_end().to_string())
         };
         assert_eq!(field("connected_clients").as_deref(), Some("7"));
+        assert_eq!(field("mithril_version").as_deref(), Some(crate::VERSION));
         assert_eq!(
             field("worker_threads").as_deref(),
             Some(cfg.workers.to_string().as_str())

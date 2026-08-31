@@ -1,5 +1,14 @@
 //! Mithril: a Redis Cluster proxy.
 
+pub const VERSION: &str = match option_env!("MITHRIL_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+pub const REVISION: &str = match option_env!("MITHRIL_REVISION") {
+    Some(v) => v,
+    None => "unknown",
+};
+
 pub mod config;
 pub mod server;
 

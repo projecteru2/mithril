@@ -2775,7 +2775,7 @@ async fn pubsub_relay(
 
 fn mark_closed(link: &WriterLink) {
     link.closed.set(true);
-    link.closed_notify.notify_waiters();
+    link.closed_notify.notify_one();
 }
 
 // a push holds one window slot from here until the writer emits it
@@ -3123,6 +3123,16 @@ mod tests {
 
     fn spec(name: &str) -> &'static Spec {
         command::lookup(name.as_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn close_notification_survives_a_late_reader() {
+        let link = WriterLink::default();
+        mark_closed(&link);
+        tokio::time::timeout(Duration::from_millis(10), link.closed_notify.notified())
+            .await
+            .unwrap();
+        assert!(link.closed.get());
     }
 
     #[test]
