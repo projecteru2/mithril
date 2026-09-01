@@ -51,44 +51,29 @@ Without the cache, mithril's default mode is the tail-latency choice in the
 pipelined cells and mt-proxy's single-connection-per-node design wins the
 unpipelined saturation cells — which `backend-sharding` recovers.
 
-### backend-sharding auto (same rig, commit 627b196 lineage)
+### backend-sharding auto (same rig, commit e6e1592 lineage)
 
-`auto` scores each session's pipelining and routes it to whichever path
-above is faster for it, so one proxy serves both client populations
-without a knob:
+`auto` decides per worker and per session: a worker that is busy with
+thin local batches moves every session it hosts to the shared pipes, a
+lightly loaded worker keeps its own connections, and an unpipelined
+session prefers the shared pipe on its own (see architecture.md). Two
+rounds each, redis-benchmark unless stated:
 
 | cell | default | shard | auto |
 |---|---|---|---|
-| memtier P1, 400 conns | 474-480k / p99 1.09-1.10 | 540k / 1.25-1.26 | **537-543k / 1.25-1.26** |
-| memtier P16, 200 conns | **2.21M / p99 1.99-2.01** | 2.03-2.04M / 2.61-2.62 | 2.16-2.19M / 2.00-2.05 |
-| redis-benchmark GET, P1, 400 conns | 410-417k | 500-505k | **500-505k** |
+| P16, 1000 conns GET | 5.58M / p50 2.86 | 8.95M / 0.94 | **8.85-8.91M / 0.93** |
+| P16, 1000 conns SET | 5.54M / 2.89 | 9.02M / 0.93 | **9.13-9.20M / 0.91** |
+| P16, 2000 conns GET | 6.70M / 4.52 | 9.67M / 1.86 | **10.4M / 1.8** |
+| P64, 1000 conns GET | 10.66M / 5.80 | 12.62M / 2.89 | 10.8-14.4M / 1.9-3.0 |
+| P1, 2000 conns GET | 2.20M / 0.89 | 2.63M / 0.71 | **2.66M / 0.70** |
+| P16, 256 conns GET | 4.78M / 0.84 | 5.49M / 0.33 | **5.56-5.66M / 0.31** |
+| memtier P16, 200 conns (sliding) | **4.36M / 0.76** | 3.59M / 0.92 | 3.74M / 0.86 |
+| memtier P1, 400 conns | 445k | 443k | 443k |
 
-An unpipelined session lands on the shard ceiling, a pipelining one keeps
-the default path within 1-2%. The trade-off appears when both classes hit
-the same proxy at once: the pipelined side gets the best cell of the
-three modes and the highest combined throughput, while the unpipelined
-side queues behind the flood's cross-worker reply hop — if unpipelined
-latency under mixed saturation is the priority, pick `yes` or `no`
-explicitly.
-
-### MGET through the reply cache (same rig, commit 64015c9 lineage)
-
-redis-benchmark P16, 12 M requests per cell, 100k random values per key
-name, `reply-cache yes` vs default; two passes with the order swapped:
-
-| cell | default | cache |
-|---|---|---|
-| 3-key MGET, cross-slot | 773k / p50 0.87-0.88 | **1.30-1.33M / p50 0.38-0.39** |
-| 3-key MGET, one slot | **1.14M** / p50 0.64 | 872-940k / p50 0.55→**0.28** |
-| 8-key MGET, one slot | 377-591k / p50 1.06-1.08 | 447-557k / p50 1.18-1.29 |
-
-A cross-slot MGET whose keys hit skips its whole fan-out, which is where
-the cache pays most. Fills are admitted in proportion to each shape's
-measured hit ratio (see architecture.md), so shapes whose working set
-cannot live in the cache run near the uncached rate instead of paying
-the servers' key-tracking cost on every miss — that cost sits outside
-the servers' per-command timing and once dominated these cells at a
-seventh of the uncached rate.
+`auto` lands on the better of the two paths in every cell but one: a
+sliding-pipeline client at moderate concurrency on a partly idle proxy
+runs 14% slower than default, because the shared pipes cost a hop those
+sessions cannot hide. If that is your only workload, set `no`.
 
 ## Bare-metal reference (2026-08, 4-worker proxies, 6-node cluster)
 
