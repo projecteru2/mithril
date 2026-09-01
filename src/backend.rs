@@ -25,7 +25,7 @@ pub const READ_INIT: usize = 8 * 1024;
 pub const BATCH: usize = 256;
 pub const ASKING_FRAME: &[u8] = b"*1\r\n$6\r\nASKING\r\n";
 pub const ERR_BACKEND_LOST: &[u8] = b"-ERR mithril: backend connection lost\r\n";
-const IOV_STACK: usize = 64;
+const IOV_STACK: usize = 16;
 const MAX_EXCLUSIVE_PER_NODE: usize = 512;
 
 /// Where a backend reply is delivered.
