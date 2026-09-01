@@ -424,15 +424,15 @@ pub(crate) async fn pump<S, D: Fn(S, Bytes) + Copy>(
                     continue;
                 }
                 stage(&mut batch, &mut pending, &mut frames);
+                if let Some(d) = depth {
+                    d.record(frames.len());
+                }
                 let wrote = tokio::select! {
                     _ = abort_signal(abort) => false,
                     r = write_frames(&mut write_half, &frames) => r.is_ok(),
                 };
                 if !wrote {
                     break 'io;
-                }
-                if let Some(d) = depth {
-                    d.record(frames.len());
                 }
             }
             r = read_half.read_buf(&mut buf) => {
@@ -589,7 +589,10 @@ async fn run_conn(
         r = open(addr, role == Role::Replica, cfg, tracking.as_deref()) => r,
     };
     match halves {
-        Ok(halves) => pump(addr, &mut rx, halves, abort, Some(depth), deliver).await,
+        Ok(halves) => {
+            let depth = (role != Role::Exclusive).then_some(depth);
+            pump(addr, &mut rx, halves, abort, depth, deliver).await
+        }
         Err(e) => {
             log_debug!("connect {addr}: {e}");
             drain_channel(&mut rx, deliver);

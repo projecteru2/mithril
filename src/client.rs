@@ -2426,7 +2426,9 @@ pub async fn auto_tuner(shared: Rc<Shared>) {
     }
 }
 
-// the measured local batch while local traffic flows, else what it would be
+// the measured local batch while local traffic flows; with none, the in-flight
+// commands spread over the masters — an estimate that errs toward staying on the
+// shared pipes, which at saturation batch at least as well as local connections
 fn tune_depth(measured: u32, writes: u32, inflight: u64, masters: u64) -> u64 {
     if writes > 0 {
         u64::from(measured)
@@ -3078,7 +3080,10 @@ async fn write_loop(
         if next_emit > swept_to {
             let mut inf = link.inflight.borrow_mut();
             while inf.front().is_some_and(|e| e.seq < next_emit) {
-                if let Some(fill) = inf.pop_front().and_then(|e| e.fill)
+                let Some(e) = inf.pop_front() else {
+                    break;
+                };
+                if let Some(fill) = e.fill
                     && let Some(cache) = &shared.cache
                 {
                     link.fills_armed.set(link.fills_armed.get() - 1);
