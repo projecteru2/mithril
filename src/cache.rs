@@ -158,6 +158,7 @@ impl ReplyCache {
         }
         let (k, e) = self.prev.take(key)?;
         if now.wrapping_sub(e.at) > self.max_age {
+            self.publish_size();
             return None;
         }
         let frame = e.frame.clone();
@@ -322,7 +323,9 @@ impl ReplyCache {
     fn evict(&self, key: &[u8]) {
         self.sync();
         stats::bump(&self.stats.workers[self.worker].cache_invalidations);
-        if self.hot.take(key).is_some() || self.prev.take(key).is_some() {
+        let in_hot = self.hot.take(key).is_some();
+        let in_prev = self.prev.take(key).is_some();
+        if in_hot || in_prev {
             self.publish_size();
         }
     }
@@ -905,6 +908,19 @@ mod tests {
         let c = cache(1 << 20);
         let (key, frame) = fill(&c, "k1", "v1");
         assert_eq!(c.lookup(&key), Some(frame));
+        c.invalidate(&key);
+        assert_eq!(c.lookup(&key), None);
+    }
+
+    #[test]
+    fn invalidation_clears_both_generations() {
+        let c = cache(4 * (ENTRY_OVERHEAD + 16));
+        let (key, _) = fill(&c, "k1", "v1");
+        fill(&c, "f0", "vv");
+        fill(&c, "f1", "vv");
+        fill(&c, "k1", "v2");
+        assert!(c.prev.map.borrow().contains_key(&key[..]));
+        assert!(c.hot.map.borrow().contains_key(&key[..]));
         c.invalidate(&key);
         assert_eq!(c.lookup(&key), None);
     }

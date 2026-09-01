@@ -331,6 +331,8 @@ struct Session {
     subs: RefCell<PubsubSim>,
     blocking: RefCell<Vec<(u64, tokio::task::JoinHandle<()>)>>,
     closing: Cell<bool>,
+    // the worker wants this session on the shared pipes: reading pauses until it drains
+    switch_pending: Cell<bool>,
     // a live relay can close the session while the reader is parked reading
     has_relay: Cell<bool>,
     auto: bool,
@@ -764,10 +766,10 @@ impl Session {
         let score = self.pipelined.get();
         self.pipelined.set(pipelining_score(score, depth));
         let sharded = self.link.sharded.get();
-        if depth == 0
-            && switch_pipes(sharded, score, self.shared.prefer_shared.get())
-            && !self.fanouts_pending()
-        {
+        let prefer_shared = self.shared.prefer_shared.get();
+        self.switch_pending
+            .set(prefer_shared && !sharded && depth > 0);
+        if depth == 0 && switch_pipes(sharded, score, prefer_shared) && !self.fanouts_pending() {
             self.link.sharded.set(!sharded);
             self.conns.borrow_mut().by_node.clear();
         }
@@ -1740,7 +1742,8 @@ impl Session {
     }
 
     fn window_full(&self) -> bool {
-        self.outstanding() >= MAX_INFLIGHT as u64
+        let outstanding = self.outstanding();
+        outstanding >= MAX_INFLIGHT as u64 || (self.switch_pending.get() && outstanding > 0)
     }
 
     fn alloc_seq(&self) -> u64 {
@@ -2191,6 +2194,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: SocketAddr, id: 
         subs: RefCell::new(PubsubSim::default()),
         blocking: RefCell::new(Vec::new()),
         closing: Cell::new(false),
+        switch_pending: Cell::new(false),
         has_relay: Cell::new(false),
         auto: shared.cfg.backend_sharding == Sharding::Auto,
         pipelined: Cell::new(PIPELINED_LOCAL),
@@ -2395,7 +2399,7 @@ fn prefer_shared(current: bool, busy_pct: u32, depth: u64) -> bool {
 pub async fn auto_tuner(shared: Rc<Shared>) {
     let mut last_ticks = stats::thread_cpu_ticks();
     let mut last_at = Instant::now();
-    let mut busy_pct = 0u32;
+    let mut busy_x16 = 0u32;
     loop {
         tokio::time::sleep(TUNE_PERIOD).await;
         let now = Instant::now();
@@ -2404,7 +2408,7 @@ pub async fn auto_tuner(shared: Rc<Shared>) {
             let wall_ms = now.duration_since(last_at).as_millis().max(1) as u64;
             let sample =
                 ((b.saturating_sub(a)) * 1000 * 100 / (stats::USER_HZ * wall_ms)).min(100) as u32;
-            busy_pct = (busy_pct * 3 + sample) / 4;
+            busy_x16 = busy_ewma(busy_x16, sample);
         }
         last_ticks = ticks;
         last_at = now;
@@ -2413,8 +2417,12 @@ pub async fn auto_tuner(shared: Rc<Shared>) {
         let cur = shared.prefer_shared.get();
         shared
             .prefer_shared
-            .set(prefer_shared(cur, busy_pct, depth));
+            .set(prefer_shared(cur, (busy_x16 + 8) / 16, depth));
     }
+}
+
+fn busy_ewma(busy_x16: u32, sample: u32) -> u32 {
+    (busy_x16 * 3 + sample * 16) / 4
 }
 
 fn pipelining_score(score: u8, depth: u64) -> u8 {
@@ -3067,7 +3075,13 @@ async fn write_loop(
         }
         if !ready.is_empty() {
             let total: usize = ready.iter().map(Bytes::len).sum();
-            if write_frames(&mut write_half, &ready).await.is_err() {
+            let held = link.next_seq.get().saturating_sub(link.emitted.get());
+            shared
+                .inflight
+                .set(shared.inflight.get().saturating_sub(held));
+            let written = write_frames(&mut write_half, &ready).await;
+            shared.inflight.set(shared.inflight.get() + held);
+            if written.is_err() {
                 return;
             }
             stats::add(&shared.wstats.bytes_out, total as u64);
@@ -3230,6 +3244,11 @@ mod tests {
         assert!(prefer_shared(true, 61, DEPTH_LEAVE - 1));
         assert!(!prefer_shared(true, 60, 1));
         assert!(!prefer_shared(true, 99, DEPTH_LEAVE));
+        let mut b = 0;
+        for _ in 0..64 {
+            b = busy_ewma(b, BUSY_ENTER);
+        }
+        assert_eq!((b + 8) / 16, BUSY_ENTER);
     }
 
     #[test]

@@ -98,7 +98,8 @@ while it is busy (85% and above) and the local batches would stay thin
 shared pipes, since one pipe per node batches what 64 workers × 128 nodes
 of per-worker connections cannot; it lets go once busyness drops under
 60% or the depth passes sixteen. Switches happen only while a session has
-nothing in flight, so a request-response client ends up on the shared
+nothing in flight — a session that never idles is paused for one round
+trip so it can drain and move — so a request-response client ends up on the shared
 pipe, a pipelining client on a lightly loaded worker on its own
 connections, and a saturated proxy in front of a wide cluster on the
 shared pipes. The reply cache is
