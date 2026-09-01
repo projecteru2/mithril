@@ -70,5 +70,8 @@ uniformly random keyspace larger than that caches at the capacity ratio
 still pays the invalidation lookups, and is better served with the cache
 off. Watch `cache_flips` against `cache_hits`: flips climbing while the hit
 ratio stays flat means the live generation is thrashing. `cache_bytes` is
-the accounted size; the process RSS runs above it by the allocator and
-hash-table overhead per entry.
+the accounted size and tracks RSS closely while entries only accumulate
+(measured: 58.9M entries on 64 workers cost 13.7 GB of RSS, which the
+current accounting puts at 12.7 GB); under steady eviction churn the
+allocator keeps freed pieces, and RSS ran at about twice
+`reply-cache-max-bytes × workers` in a saturated run — budget for that.
