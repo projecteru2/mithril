@@ -184,7 +184,7 @@ async fn run_shard_conn(
     cfg: &Config,
 ) {
     match open(addr, readonly, cfg, tracking.as_deref()).await {
-        Ok(halves) => pump(addr, &mut rx, halves, None, deliver).await,
+        Ok(halves) => pump(addr, &mut rx, halves, None, None, deliver).await,
         Err(e) => {
             log_debug!("shard connect {addr}: {e}");
             drain_channel(&mut rx, deliver);

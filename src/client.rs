@@ -243,6 +243,8 @@ type InflightRing = RefCell<VecDeque<InFlight>>;
 // state shared between a session's reader, writer, and pubsub relay
 #[derive(Default)]
 struct WriterLink {
+    // the writer is parked on the client socket: the worker's in-flight count skips this session
+    writer_blocked: Cell<bool>,
     inflight: InflightRing,
     emitted: Cell<u64>,
     // set when no reply can ever be written again; reader must stop dispatching
@@ -1749,7 +1751,9 @@ impl Session {
     fn alloc_seq(&self) -> u64 {
         let seq = self.link.next_seq.get();
         self.link.next_seq.set(seq + 1);
-        self.shared.inflight.set(self.shared.inflight.get() + 1);
+        if !self.link.writer_blocked.get() {
+            self.shared.inflight.set(self.shared.inflight.get() + 1);
+        }
         seq
     }
 
@@ -2413,11 +2417,21 @@ pub async fn auto_tuner(shared: Rc<Shared>) {
         last_ticks = ticks;
         last_at = now;
         let masters = shared.topo.load().masters.len().max(1) as u64;
-        let depth = shared.inflight.get() / masters;
+        let (measured, writes) = shared.backends.batch_depth();
+        let depth = tune_depth(measured, writes, shared.inflight.get(), masters);
         let cur = shared.prefer_shared.get();
         shared
             .prefer_shared
             .set(prefer_shared(cur, (busy_x16 + 8) / 16, depth));
+    }
+}
+
+// the measured local batch while local traffic flows, else what it would be
+fn tune_depth(measured: u32, writes: u32, inflight: u64, masters: u64) -> u64 {
+    if writes > 0 {
+        u64::from(measured)
+    } else {
+        inflight / masters
     }
 }
 
@@ -3079,7 +3093,10 @@ async fn write_loop(
             shared
                 .inflight
                 .set(shared.inflight.get().saturating_sub(held));
+            link.writer_blocked.set(true);
             let written = write_frames(&mut write_half, &ready).await;
+            link.writer_blocked.set(false);
+            let held = link.next_seq.get().saturating_sub(link.emitted.get());
             shared.inflight.set(shared.inflight.get() + held);
             if written.is_err() {
                 return;
@@ -3249,6 +3266,8 @@ mod tests {
             b = busy_ewma(b, BUSY_ENTER);
         }
         assert_eq!((b + 8) / 16, BUSY_ENTER);
+        assert_eq!(tune_depth(3, 10, 900, 128), 3);
+        assert_eq!(tune_depth(3, 0, 900, 128), 7);
     }
 
     #[test]

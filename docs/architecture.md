@@ -92,9 +92,10 @@ its own pipelining depth at dispatch (up over commands with replies still
 outstanding, down over idle ones) and moves to the shared pipe once four
 idle dispatches have run the score down, back to its worker's connections
 once four busy ones have restored it. On top of that each worker samples
-its own CPU busyness and its in-flight commands per master every 100 ms:
-while it is busy (85% and above) and the local batches would stay thin
-(fewer than eight in flight per master) every session on it prefers the
+its own CPU busyness and the frames its own backend connections batch per
+write every 100 ms (the in-flight commands per master stand in while no
+local traffic flows): while it is busy (85% and above) and the local
+batches are thin (under eight frames per write) every session on it prefers the
 shared pipes, since one pipe per node batches what 64 workers × 128 nodes
 of per-worker connections cannot; it lets go once busyness drops under
 60% or the depth passes sixteen. Switches happen only while a session has

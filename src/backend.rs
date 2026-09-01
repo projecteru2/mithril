@@ -109,18 +109,47 @@ impl Conn {
 }
 
 /// Per-worker backend pools keyed by node address, split by readonly role.
+/// Frames per writev on this worker's own backend connections, for auto sharding.
+#[derive(Default)]
+pub struct BatchDepth {
+    ewma_x16: Cell<u32>,
+    writes: Cell<u32>,
+}
+
+impl BatchDepth {
+    fn record(&self, frames: usize) {
+        let x16 = self.ewma_x16.get();
+        self.ewma_x16
+            .set((x16 * 3 + (frames.min(4096) as u32) * 16) / 4);
+        self.writes.set(self.writes.get() + 1);
+    }
+
+    /// Rounded depth and the writes recorded since the previous take.
+    pub fn take(&self) -> (u32, u32) {
+        let writes = self.writes.replace(0);
+        ((self.ewma_x16.get() + 8) / 16, writes)
+    }
+}
+
 pub struct Backends {
     cfg: Rc<Config>,
     pools: RefCell<HashMap<Box<str>, PoolPair>>,
     tracking: Option<TrackingFrames>,
+    depth: Rc<BatchDepth>,
 }
 
 impl Backends {
+    /// Batch depth of this worker's own connections since the previous call.
+    pub fn batch_depth(&self) -> (u32, u32) {
+        self.depth.take()
+    }
+
     pub fn new(cfg: Rc<Config>, tracking: Option<TrackingFrames>) -> Rc<Backends> {
         Rc::new(Backends {
             cfg,
             pools: RefCell::new(HashMap::new()),
             tracking,
+            depth: Rc::new(BatchDepth::default()),
         })
     }
 
@@ -219,8 +248,9 @@ impl Backends {
         };
         let addr = addr.to_string();
         let cfg = self.cfg.clone();
+        let depth = self.depth.clone();
         tokio::task::spawn_local(async move {
-            run_conn(&addr, rx, role, tracking, &cfg, &task_conn).await;
+            run_conn(&addr, rx, role, tracking, &cfg, &task_conn, &depth).await;
             task_conn.dead.set(true);
         });
         conn
@@ -371,6 +401,7 @@ pub(crate) async fn pump<S, D: Fn(S, Bytes) + Copy>(
     rx: &mut mpsc::Receiver<Outbound<S>>,
     (mut read_half, mut write_half): (OwnedReadHalf, OwnedWriteHalf),
     abort: Option<&tokio::sync::Notify>,
+    depth: Option<&BatchDepth>,
     deliver: D,
 ) {
     let mut pending: VecDeque<Pending<S>> = VecDeque::new();
@@ -399,6 +430,9 @@ pub(crate) async fn pump<S, D: Fn(S, Bytes) + Copy>(
                 };
                 if !wrote {
                     break 'io;
+                }
+                if let Some(d) = depth {
+                    d.record(frames.len());
                 }
             }
             r = read_half.read_buf(&mut buf) => {
@@ -547,6 +581,7 @@ async fn run_conn(
     tracking: Option<Bytes>,
     cfg: &Config,
     conn: &Conn,
+    depth: &BatchDepth,
 ) {
     let abort = (role == Role::Exclusive).then_some(&conn.abort);
     let halves = tokio::select! {
@@ -554,7 +589,7 @@ async fn run_conn(
         r = open(addr, role == Role::Replica, cfg, tracking.as_deref()) => r,
     };
     match halves {
-        Ok(halves) => pump(addr, &mut rx, halves, abort, deliver).await,
+        Ok(halves) => pump(addr, &mut rx, halves, abort, Some(depth), deliver).await,
         Err(e) => {
             log_debug!("connect {addr}: {e}");
             drain_channel(&mut rx, deliver);
@@ -583,6 +618,17 @@ fn deliver(sink: Sink, frame: Bytes) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_depth_tracks_frames_per_write() {
+        let d = BatchDepth::default();
+        assert_eq!(d.take(), (0, 0));
+        for _ in 0..32 {
+            d.record(6);
+        }
+        assert_eq!(d.take(), (6, 32));
+        assert_eq!(d.take(), (6, 0));
+    }
 
     fn pending(expect: u32, tag: u32) -> Pending<u32> {
         Pending { expect, sink: tag }
