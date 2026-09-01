@@ -45,6 +45,10 @@ const BUSY_ENTER: u32 = 85;
 const BUSY_LEAVE: u32 = 60;
 const DEPTH_ENTER: u64 = 8;
 const DEPTH_LEAVE: u64 = 16;
+// ticks the enter or leave condition must hold: moving sessions off a worker
+// lowers its own busyness, so leaving is slow and entering prompt
+const ENTER_TICKS: u32 = 3;
+const LEAVE_TICKS: u32 = 30;
 // an MGET with more keys than this is never cached: it would arm one ticket per key
 const MGET_CACHE_KEYS: usize = 64;
 const SUBS_LIMIT: usize = 32768;
@@ -2398,12 +2402,28 @@ fn prefer_shared(current: bool, busy_pct: u32, depth: u64) -> bool {
     }
 }
 
+// a change of preference must hold for ENTER_TICKS or LEAVE_TICKS samples
+fn settle(current: bool, wanted: bool, streak: &mut u32) -> bool {
+    if wanted == current {
+        *streak = 0;
+        return current;
+    }
+    *streak += 1;
+    let need = if current { LEAVE_TICKS } else { ENTER_TICKS };
+    if *streak < need {
+        return current;
+    }
+    *streak = 0;
+    wanted
+}
+
 /// Samples this worker's CPU busyness and in-flight depth per master and publishes
 /// whether its sessions should prefer the shared pipes.
 pub async fn auto_tuner(shared: Rc<Shared>) {
     let mut last_ticks = stats::thread_cpu_ticks();
     let mut last_at = Instant::now();
     let mut busy_x16 = 0u32;
+    let mut streak = 0u32;
     loop {
         tokio::time::sleep(TUNE_PERIOD).await;
         let now = Instant::now();
@@ -2420,9 +2440,8 @@ pub async fn auto_tuner(shared: Rc<Shared>) {
         let (measured, writes) = shared.backends.batch_depth();
         let depth = tune_depth(measured, writes, shared.inflight.get(), masters);
         let cur = shared.prefer_shared.get();
-        shared
-            .prefer_shared
-            .set(prefer_shared(cur, (busy_x16 + 8) / 16, depth));
+        let wanted = prefer_shared(cur, (busy_x16 + 8) / 16, depth);
+        shared.prefer_shared.set(settle(cur, wanted, &mut streak));
     }
 }
 
@@ -3273,6 +3292,17 @@ mod tests {
         assert_eq!((b + 8) / 16, BUSY_ENTER);
         assert_eq!(tune_depth(3, 10, 900, 128), 3);
         assert_eq!(tune_depth(3, 0, 900, 128), 7);
+        let mut streak = 0;
+        for _ in 0..ENTER_TICKS - 1 {
+            assert!(!settle(false, true, &mut streak));
+        }
+        assert!(settle(false, true, &mut streak));
+        for _ in 0..LEAVE_TICKS - 1 {
+            assert!(settle(true, false, &mut streak));
+        }
+        assert!(!settle(true, false, &mut streak));
+        assert!(settle(true, true, &mut streak));
+        assert_eq!(streak, 0);
     }
 
     #[test]

@@ -97,8 +97,10 @@ write every 100 ms (the in-flight commands per master stand in while no
 local traffic flows): while it is busy (85% and above) and the local
 batches are thin (under eight frames per write) every session on it prefers the
 shared pipes, since one pipe per node batches what 64 workers × 128 nodes
-of per-worker connections cannot; it lets go once busyness drops under
-60% or the depth passes sixteen. Switches happen only while a session has
+of per-worker connections cannot; it lets go once busyness has stayed under
+60% or the depth above sixteen for three seconds — slowly, because moving
+its sessions away is what lowers its own busyness — and takes the shared
+pipes after 300 ms of the entry condition. Switches happen only while a session has
 nothing in flight — a session that never idles is paused for one round
 trip so it can drain and move — so a request-response client ends up on the shared
 pipe, a pipelining client on a lightly loaded worker on its own
