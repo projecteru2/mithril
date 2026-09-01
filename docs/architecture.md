@@ -87,13 +87,21 @@ Regular traffic multiplexes over `backend-conns` shared pipelined
 connections per node per worker (sticky per client). With
 `backend-sharding yes` every request to a node crosses to the worker that
 owns that node's single process-wide pipe, which batches deeper for
-unpipelined clients; with `auto` each session scores its own pipelining
-depth at dispatch (up over commands with replies still outstanding, down
-over idle ones) and moves to the shared pipe once four idle dispatches
-have run the score down, back to its worker's connections once four busy
-ones have restored it — and only while it has nothing in flight — so a
-request-response client ends up on the shared pipe and a pipelining client
-on its worker's connections. The reply cache is
+unpipelined clients; with `auto` two signals decide. Each session scores
+its own pipelining depth at dispatch (up over commands with replies still
+outstanding, down over idle ones) and moves to the shared pipe once four
+idle dispatches have run the score down, back to its worker's connections
+once four busy ones have restored it. On top of that each worker samples
+its own CPU busyness and its in-flight commands per master every 100 ms:
+while it is busy (85% and above) and the local batches would stay thin
+(fewer than eight in flight per master) every session on it prefers the
+shared pipes, since one pipe per node batches what 64 workers × 128 nodes
+of per-worker connections cannot; it lets go once busyness drops under
+60% or the depth passes sixteen. Switches happen only while a session has
+nothing in flight, so a request-response client ends up on the shared
+pipe, a pipelining client on a lightly loaded worker on its own
+connections, and a saturated proxy in front of a wide cluster on the
+shared pipes. The reply cache is
 wired as under `yes` (owner-worker trackers, process-wide coverage,
 broadcast invalidation): sessions on the shared pipes fill it, sessions on
 the worker-local connections read it but never fill it, since those

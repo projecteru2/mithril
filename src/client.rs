@@ -38,6 +38,13 @@ const MAX_INFLIGHT: usize = 65536;
 // pipelining score: a local session shares at 0, a shared one returns at PIPELINED_LOCAL
 const PIPELINED_LOCAL: u8 = 4;
 const PIPELINED_MAX: u8 = 8;
+// auto sharding moves a worker's sessions to the shared pipes while the worker is
+// busy and its local backend batches would stay thin (in-flight commands per master)
+const TUNE_PERIOD: Duration = Duration::from_millis(100);
+const BUSY_ENTER: u32 = 85;
+const BUSY_LEAVE: u32 = 60;
+const DEPTH_ENTER: u64 = 8;
+const DEPTH_LEAVE: u64 = 16;
 // an MGET with more keys than this is never cached: it would arm one ticket per key
 const MGET_CACHE_KEYS: usize = 64;
 const SUBS_LIMIT: usize = 32768;
@@ -60,6 +67,8 @@ pub struct Shared {
     pub started: u64,
     pub fabric: Option<Arc<Fabric>>,
     pub cache: Option<Rc<ReplyCache>>,
+    pub inflight: Cell<u64>,
+    pub prefer_shared: Cell<bool>,
 }
 
 /// One frame travelling to the client writer.
@@ -755,7 +764,10 @@ impl Session {
         let score = self.pipelined.get();
         self.pipelined.set(pipelining_score(score, depth));
         let sharded = self.link.sharded.get();
-        if depth == 0 && switch_pipes(sharded, score) && !self.fanouts_pending() {
+        if depth == 0
+            && switch_pipes(sharded, score, self.shared.prefer_shared.get())
+            && !self.fanouts_pending()
+        {
             self.link.sharded.set(!sharded);
             self.conns.borrow_mut().by_node.clear();
         }
@@ -1734,6 +1746,7 @@ impl Session {
     fn alloc_seq(&self) -> u64 {
         let seq = self.link.next_seq.get();
         self.link.next_seq.set(seq + 1);
+        self.shared.inflight.set(self.shared.inflight.get() + 1);
         seq
     }
 
@@ -2291,6 +2304,12 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: SocketAddr, id: 
     drop(reply_q);
     let _ = close_tx.send(final_seq);
     let _ = writer.await;
+    shared.inflight.set(
+        shared
+            .inflight
+            .get()
+            .saturating_sub(final_seq.saturating_sub(link.emitted.get())),
+    );
     stats::bump(&shared.wstats.sessions_closed);
 }
 
@@ -2351,11 +2370,50 @@ fn pipe_for(shared: &Shared, addr: &str, id: u64, readonly: bool, sharded: bool)
 }
 
 // decided on an idle dispatch from the score before that dispatch counts
-fn switch_pipes(sharded: bool, score: u8) -> bool {
+fn switch_pipes(sharded: bool, score: u8, worker_prefers_shared: bool) -> bool {
+    if worker_prefers_shared {
+        return !sharded;
+    }
     if sharded {
         score >= PIPELINED_LOCAL
     } else {
         score <= 1
+    }
+}
+
+// hysteresis on both signals so a worker does not flap its sessions between pipe kinds
+fn prefer_shared(current: bool, busy_pct: u32, depth: u64) -> bool {
+    if current {
+        busy_pct > BUSY_LEAVE && depth < DEPTH_LEAVE
+    } else {
+        busy_pct >= BUSY_ENTER && depth < DEPTH_ENTER
+    }
+}
+
+/// Samples this worker's CPU busyness and in-flight depth per master and publishes
+/// whether its sessions should prefer the shared pipes.
+pub async fn auto_tuner(shared: Rc<Shared>) {
+    let mut last_ticks = stats::thread_cpu_ticks();
+    let mut last_at = Instant::now();
+    let mut busy_pct = 0u32;
+    loop {
+        tokio::time::sleep(TUNE_PERIOD).await;
+        let now = Instant::now();
+        let ticks = stats::thread_cpu_ticks();
+        if let (Some(a), Some(b)) = (last_ticks, ticks) {
+            let wall_ms = now.duration_since(last_at).as_millis().max(1) as u64;
+            let sample =
+                ((b.saturating_sub(a)) * 1000 * 100 / (stats::USER_HZ * wall_ms)).min(100) as u32;
+            busy_pct = (busy_pct * 3 + sample) / 4;
+        }
+        last_ticks = ticks;
+        last_at = now;
+        let masters = shared.topo.load().masters.len().max(1) as u64;
+        let depth = shared.inflight.get() / masters;
+        let cur = shared.prefer_shared.get();
+        shared
+            .prefer_shared
+            .set(prefer_shared(cur, busy_pct, depth));
     }
 }
 
@@ -3015,6 +3073,12 @@ async fn write_loop(
             stats::add(&shared.wstats.bytes_out, total as u64);
             ready.clear();
         }
+        shared.inflight.set(
+            shared
+                .inflight
+                .get()
+                .saturating_sub(next_emit.saturating_sub(link.emitted.get())),
+        );
         link.emitted.set(next_emit);
         if close_now {
             return;
@@ -3139,21 +3203,33 @@ mod tests {
     fn pipe_switch_needs_four_idle_dispatches_to_share_and_four_busy_to_return() {
         let mut score = PIPELINED_LOCAL;
         for _ in 0..3 {
-            assert!(!switch_pipes(false, score));
+            assert!(!switch_pipes(false, score, false));
             score = pipelining_score(score, 0);
         }
-        assert!(switch_pipes(false, score));
+        assert!(switch_pipes(false, score, false));
         score = pipelining_score(score, 0);
         assert_eq!(score, 0);
         for _ in 0..3 {
             score = pipelining_score(score, 3);
-            assert!(!switch_pipes(true, score));
+            assert!(!switch_pipes(true, score, false));
         }
         score = pipelining_score(score, 3);
-        assert!(switch_pipes(true, score));
-        assert!(!switch_pipes(true, pipelining_score(score, 0)) || score > PIPELINED_LOCAL);
+        assert!(switch_pipes(true, score, false));
+        assert!(!switch_pipes(true, pipelining_score(score, 0), false) || score > PIPELINED_LOCAL);
         assert_eq!(pipelining_score(PIPELINED_MAX, 9), PIPELINED_MAX);
         assert_eq!(pipelining_score(0, 0), 0);
+    }
+
+    #[test]
+    fn worker_preference_overrides_the_score_with_hysteresis() {
+        assert!(switch_pipes(false, PIPELINED_MAX, true));
+        assert!(!switch_pipes(true, PIPELINED_MAX, true));
+        assert!(!prefer_shared(false, 84, 2));
+        assert!(!prefer_shared(false, 90, DEPTH_ENTER));
+        assert!(prefer_shared(false, 90, DEPTH_ENTER - 1));
+        assert!(prefer_shared(true, 61, DEPTH_LEAVE - 1));
+        assert!(!prefer_shared(true, 60, 1));
+        assert!(!prefer_shared(true, 99, DEPTH_LEAVE));
     }
 
     #[test]

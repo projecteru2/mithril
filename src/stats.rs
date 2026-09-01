@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+/// Ticks per second in /proc stat fields (Linux USER_HZ).
+pub const USER_HZ: u64 = 100;
+
 /// One worker's counters; padding keeps writers on distinct cachelines.
 #[repr(align(64))]
 #[derive(Default)]
@@ -73,4 +76,14 @@ pub fn bump(counter: &AtomicU64) {
 /// Adds to a single-writer counter; cross-thread readers use relaxed loads.
 pub fn add(counter: &AtomicU64, n: u64) {
     counter.store(counter.load(Ordering::Relaxed) + n, Ordering::Relaxed);
+}
+
+/// This thread's user+system CPU time in USER_HZ ticks; None where /proc is absent.
+pub fn thread_cpu_ticks() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/thread-self/stat").ok()?;
+    let rest = &stat[stat.rfind(')')? + 2..];
+    let mut fields = rest.split(' ').skip(11);
+    let utime: u64 = fields.next()?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+    Some(utime + stime)
 }

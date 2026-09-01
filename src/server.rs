@@ -1,5 +1,6 @@
 //! Acceptor, per-core worker runtimes, topology refresher, and shutdown.
 
+use std::cell::Cell;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 use crate::backend::Backends;
-use crate::client::{Shared, serve};
+use crate::client::{Shared, auto_tuner, serve};
 use crate::config::{Config, Placement, Sharding};
 use crate::shard;
 use crate::stats::Stats;
@@ -437,7 +438,12 @@ fn worker_thread(
             started,
             fabric,
             cache,
+            inflight: Cell::new(0),
+            prefer_shared: Cell::new(false),
         });
+        if shared.cfg.backend_sharding == Sharding::Auto {
+            tokio::task::spawn_local(auto_tuner(shared.clone()));
+        }
         let mut next_client: u64 = worker as u64;
         while let Some(mut admitted) = conn_rx.recv().await {
             let stream = admitted
