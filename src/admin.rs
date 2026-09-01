@@ -370,7 +370,8 @@ fn config_value<'a>(cfg: &'a Config, key: &str) -> Cow<'a, str> {
         "tcp-keepalive" => cfg.tcp_keepalive_secs.to_string().into(),
         "query-buffer-limit" => cfg.query_buffer_limit.to_string().into(),
         "topology-refresh-secs" => cfg.topology_refresh_secs.to_string().into(),
-        _ => crate::log::level_name(crate::log::level()).into(),
+        "loglevel" => crate::log::level_name(crate::log::level()).into(),
+        _ => Cow::Borrowed(""),
     }
 }
 
@@ -382,6 +383,16 @@ fn sub_is(args: &[&[u8]], i: usize, name: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn every_config_key_has_a_value() {
+        let mut cfg = test_cfg();
+        cfg.requirepass = "x".to_string();
+        for key in CONFIG_KEYS {
+            assert!(!config_value(&cfg, key).is_empty(), "{key}");
+        }
+        assert!(config_value(&cfg, "no-such-key").is_empty());
+    }
 
     #[test]
     fn info_fields_line_up() {

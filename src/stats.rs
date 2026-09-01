@@ -71,9 +71,9 @@ impl Stats {
     }
 }
 
-/// Bumps a single-writer counter: plain load/store beats an atomic RMW on the hot path.
+/// Bumps a single-writer counter.
 pub fn bump(counter: &AtomicU64) {
-    counter.store(counter.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+    add(counter, 1);
 }
 
 /// Adds to a single-writer counter; cross-thread readers use relaxed loads.

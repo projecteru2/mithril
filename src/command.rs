@@ -264,11 +264,7 @@ pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
     // OR 0x20 case-folds [A-Za-z0-9]: a letter's only preimages are its two cases
     let prefix = match <[u8; PREFIX_LEN]>::try_from(&name[..name.len().min(PREFIX_LEN)]) {
         Ok(head) => u64::from_be_bytes(head) | LOWER_MASK,
-        Err(_) => {
-            let mut head = [0u8; PREFIX_LEN];
-            head[..name.len()].copy_from_slice(name);
-            u64::from_be_bytes(head) | (LOWER_MASK << (8 * (PREFIX_LEN - name.len())))
-        }
+        Err(_) => prefix64(name) | (LOWER_MASK << (8 * (PREFIX_LEN - name.len()))),
     };
     let mut h = lut_hash(prefix, name.len() as u8);
     loop {

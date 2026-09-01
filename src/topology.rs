@@ -1,5 +1,7 @@
 //! Cluster topology: CLUSTER NODES parsing and the slot-to-node map.
 
+use std::collections::HashMap;
+
 use crate::crc16::SLOTS;
 
 const NO_NODE: u16 = u16::MAX;
@@ -26,7 +28,7 @@ impl Topology {
     pub fn parse(raw: &str) -> Result<Topology, String> {
         let mut nodes = Vec::new();
         let mut slot_specs: Vec<(u16, Vec<(u16, u16)>)> = Vec::new();
-        let mut master_ids: Vec<(&str, u16)> = Vec::new();
+        let mut master_ids: HashMap<&str, u16> = HashMap::new();
         let mut masters = Vec::new();
         let mut replica_refs: Vec<(u16, &str)> = Vec::new();
 
@@ -45,7 +47,7 @@ impl Topology {
             let is_master = flags.contains("master");
             let fail = flags.contains("fail") && !flags.contains("failover");
             if is_master {
-                master_ids.push((id, idx));
+                master_ids.insert(id, idx);
                 let mut ranges = Vec::new();
                 let mut importing = false;
                 for field in fields.skip(4) {
@@ -73,11 +75,11 @@ impl Topology {
             return Err("no slot-owning masters in topology".to_string());
         }
         for (idx, master_ref) in replica_refs {
-            let Some((_, midx)) = master_ids.iter().find(|(id, _)| *id == master_ref) else {
+            let Some(&midx) = master_ids.get(master_ref) else {
                 return Err(format!("replica {idx} references unknown master"));
             };
             if !nodes[idx as usize].fail {
-                nodes[*midx as usize].replicas.push(idx);
+                nodes[midx as usize].replicas.push(idx);
             }
         }
 
