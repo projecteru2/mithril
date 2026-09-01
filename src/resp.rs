@@ -6,6 +6,7 @@ pub const PONG: &[u8] = b"+PONG\r\n";
 pub const NIL_BULK: &[u8] = b"$-1\r\n";
 pub const NIL_ARRAY: &[u8] = b"*-1\r\n";
 pub const NIL_RESP3: &[u8] = b"_\r\n";
+
 const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
 const MAX_INLINE_LEN: usize = 64 * 1024;
 const MAX_DEPTH: usize = 32;

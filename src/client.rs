@@ -36,9 +36,11 @@ use crate::topology::Topology;
 use crate::{admin, crc16, route};
 
 const MAX_INFLIGHT: usize = 65536;
+
 // pipelining score: a local session shares at 0, a shared one returns at PIPELINED_LOCAL
 const PIPELINED_LOCAL: u8 = 4;
 const PIPELINED_MAX: u8 = 8;
+
 // auto sharding moves a worker's sessions to the shared pipes while the worker is
 // busy and its local backend batches would stay thin (in-flight commands per master)
 const TUNE_PERIOD: Duration = Duration::from_millis(100);
@@ -50,14 +52,17 @@ const DEPTH_LEAVE: u64 = 16;
 // lowers its own busyness, so leaving is slow and entering prompt
 const ENTER_TICKS: u32 = 3;
 const LEAVE_TICKS: u32 = 30;
+
 // an MGET with more keys than this is never cached: it would arm one ticket per key
 const MGET_CACHE_KEYS: usize = 64;
 // reserved per item of a cached MGET reply before the sizes are known
 const MGET_ITEM_GUESS: usize = 128;
+
 const SUBS_LIMIT: usize = 32768;
 const PUBSUB_FORWARD_QUEUE: usize = 64;
 const PUBSUB_PUSH_WINDOW: usize = 4096;
 const GATE_PROBE: Duration = Duration::from_millis(100);
+
 const ERR_NOAUTH: &[u8] = b"-NOAUTH Authentication required.\r\n";
 const ERR_CROSSSLOT: &[u8] = b"-CROSSSLOT Keys in request don't hash to the same slot\r\n";
 const ERR_NO_OWNER: &[u8] = b"-CLUSTERDOWN Hash slot not served\r\n";
@@ -2310,6 +2315,34 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: SocketAddr, id: 
     stats::bump(&shared.wstats.sessions_closed);
 }
 
+/// Samples this worker's CPU busyness and in-flight depth per master and publishes
+/// whether its sessions should prefer the shared pipes.
+pub async fn auto_tuner(shared: Rc<Shared>) {
+    let mut last_ticks = stats::thread_cpu_ticks();
+    let mut last_at = Instant::now();
+    let mut busy_x16 = 0u32;
+    let mut streak = 0u32;
+    loop {
+        tokio::time::sleep(TUNE_PERIOD).await;
+        let now = Instant::now();
+        let ticks = stats::thread_cpu_ticks();
+        if let (Some(a), Some(b)) = (last_ticks, ticks) {
+            let wall_ms = now.duration_since(last_at).as_millis().max(1) as u64;
+            let sample =
+                ((b.saturating_sub(a)) * 1000 * 100 / (stats::USER_HZ * wall_ms)).min(100) as u32;
+            busy_x16 = busy_ewma(busy_x16, sample);
+        }
+        last_ticks = ticks;
+        last_at = now;
+        let masters = shared.topo.load().masters.len().max(1) as u64;
+        let (measured, writes) = shared.backends.batch_depth();
+        let depth = tune_depth(measured, writes, shared.inflight.get(), masters);
+        let cur = shared.prefer_shared.get();
+        let wanted = prefer_shared(cur, (busy_x16 + 8) / 16, depth);
+        shared.prefer_shared.set(settle(cur, wanted, &mut streak));
+    }
+}
+
 fn collect_args(frame: &Bytes, argc: usize) -> Vec<&[u8]> {
     resp::Args::new(frame, argc).collect()
 }
@@ -2423,34 +2456,6 @@ fn settle(current: bool, wanted: bool, streak: &mut u32) -> bool {
     }
     *streak = 0;
     wanted
-}
-
-/// Samples this worker's CPU busyness and in-flight depth per master and publishes
-/// whether its sessions should prefer the shared pipes.
-pub async fn auto_tuner(shared: Rc<Shared>) {
-    let mut last_ticks = stats::thread_cpu_ticks();
-    let mut last_at = Instant::now();
-    let mut busy_x16 = 0u32;
-    let mut streak = 0u32;
-    loop {
-        tokio::time::sleep(TUNE_PERIOD).await;
-        let now = Instant::now();
-        let ticks = stats::thread_cpu_ticks();
-        if let (Some(a), Some(b)) = (last_ticks, ticks) {
-            let wall_ms = now.duration_since(last_at).as_millis().max(1) as u64;
-            let sample =
-                ((b.saturating_sub(a)) * 1000 * 100 / (stats::USER_HZ * wall_ms)).min(100) as u32;
-            busy_x16 = busy_ewma(busy_x16, sample);
-        }
-        last_ticks = ticks;
-        last_at = now;
-        let masters = shared.topo.load().masters.len().max(1) as u64;
-        let (measured, writes) = shared.backends.batch_depth();
-        let depth = tune_depth(measured, writes, shared.inflight.get(), masters);
-        let cur = shared.prefer_shared.get();
-        let wanted = prefer_shared(cur, (busy_x16 + 8) / 16, depth);
-        shared.prefer_shared.set(settle(cur, wanted, &mut streak));
-    }
 }
 
 // the measured local batch while local traffic flows; with none, the in-flight

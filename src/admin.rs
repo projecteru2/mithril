@@ -12,11 +12,14 @@ use crate::resp;
 use crate::stats::{ClientInfo, Stats};
 
 pub const SERVER_VERSION: &str = "7.4.0";
+
 const CLUSTER_BUS_OFFSET: u32 = 10000;
 const HEX: &[u8; 16] = b"0123456789abcdef";
+
 const CLUSTER_INFO: &str = "cluster_enabled:1\r\ncluster_state:ok\r\ncluster_slots_assigned:16384\r\n\
      cluster_slots_ok:16384\r\ncluster_slots_pfail:0\r\ncluster_slots_fail:0\r\n\
      cluster_known_nodes:1\r\ncluster_size:1\r\n";
+
 const CONFIG_KEYS: [&str; 18] = [
     "bind",
     "port",

@@ -13,6 +13,7 @@ pub const FLAG_STORE: u8 = 1 << 5;
 pub const FLAG_PUBSUB: u8 = 1 << 6;
 /// A multi-key reply that is one aggregate, never rebuilt from per-key resends.
 pub const FLAG_UNION: u8 = 1 << 7;
+
 const MAX_NAME: usize = 24;
 
 const PREFIX_LEN: usize = 8;

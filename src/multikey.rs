@@ -224,13 +224,6 @@ pub(crate) fn parse_int(frame: &[u8]) -> Option<i64> {
     std::str::from_utf8(&frame[1..end]).ok()?.parse().ok()
 }
 
-// the item of a one-element array reply; an error reply has none
-fn single_item(frame: &[u8]) -> Option<&[u8]> {
-    frame
-        .strip_prefix(b"*1\r\n")
-        .filter(|item| !item.is_empty())
-}
-
 /// Splits a multi-bulk reply into its element count and top-level element frames.
 pub(crate) fn split_array(frame: &[u8]) -> Option<(usize, impl Iterator<Item = &[u8]>)> {
     if frame.first() != Some(&b'*') {
@@ -249,6 +242,13 @@ pub(crate) fn split_array(frame: &[u8]) -> Option<(usize, impl Iterator<Item = &
     })
     .take(count);
     Some((count, items))
+}
+
+// the item of a one-element array reply; an error reply has none
+fn single_item(frame: &[u8]) -> Option<&[u8]> {
+    frame
+        .strip_prefix(b"*1\r\n")
+        .filter(|item| !item.is_empty())
 }
 
 #[cfg(test)]

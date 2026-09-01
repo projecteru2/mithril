@@ -24,36 +24,41 @@ use crate::shard::Fabric;
 use crate::stats::{self, Stats, WorkerStats};
 use crate::topology::Topology;
 
+/// Marks the next command on a tracking connection as cached.
+pub const CACHING_FRAME: &[u8] = b"*3\r\n$6\r\nCLIENT\r\n$7\r\nCACHING\r\n$3\r\nYES\r\n";
+
 // larger replies churn the byte budget faster than they earn hits
 const ENTRY_MAX_BYTES: usize = 64 * 1024;
 // map slot, two heap allocations with headers and size-class rounding
 // per-entry allocator and table cost, measured: 58.9M entries of 16 B keys and
 // 71 B frames cost 13.7 GB of RSS (232 B each) against key + frame + this
 const ENTRY_OVERHEAD: usize = 128;
+// a generation this large is freed in chunks off the request path
+const DROP_CHUNK: usize = 4096;
+
 // trackers follow topology within one poll, which is also the cache clock's tick
 const TRACKER_POLL: Duration = Duration::from_millis(100);
 const TICKS_PER_SEC: u32 = 10;
-// a generation this large is freed in chunks off the request path
-const DROP_CHUNK: usize = 4096;
+const TRACKER_RETRY: Duration = Duration::from_secs(1);
+const TRACKER_PING: Duration = Duration::from_secs(2);
+// a tracker this many pings behind is dead
+const PING_DEBT_MAX: u32 = 3;
+// a push that cannot complete within this many buffered bytes restarts the tracker
+const TRACKER_FRAME_MAX: usize = 1024 * 1024;
+const PING_FRAME: &[u8] = b"*1\r\n$4\r\nPING\r\n";
+const CLIENT_ID_FRAME: &[u8] = b"*2\r\n$6\r\nCLIENT\r\n$2\r\nID\r\n";
+
 // fills stop paying for their tracking below one hit in FILL_SAMPLE lookups,
 // judged per exact key count so shapes without locality cannot starve the rest
 const FILL_WINDOW: u32 = 8192;
 const FILL_SAMPLE: u32 = 8;
 const FILL_SHAPES: usize = 64;
-const TRACKER_RETRY: Duration = Duration::from_secs(1);
-const TRACKER_PING: Duration = Duration::from_secs(2);
-// a tracker this many pings behind is dead
-const PING_DEBT_MAX: u32 = 3;
-const PING_FRAME: &[u8] = b"*1\r\n$4\r\nPING\r\n";
-const CLIENT_ID_FRAME: &[u8] = b"*2\r\n$6\r\nCLIENT\r\n$2\r\nID\r\n";
-/// Marks the next command on a tracking connection as cached.
-pub const CACHING_FRAME: &[u8] = b"*3\r\n$6\r\nCLIENT\r\n$7\r\nCACHING\r\n$3\r\nYES\r\n";
-const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+
 // a larger invalidation push flushes the scope instead of pinning its frame
 const INVAL_KEYS_MAX: i64 = 1024;
 const INVAL_BYTES_MAX: usize = 64 * 1024;
-// a push that cannot complete within this many buffered bytes restarts the tracker
-const TRACKER_FRAME_MAX: usize = 1024 * 1024;
+
+const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 // the armed flag rides above the flush generation: one load is a consistent snapshot
 const ARMED_BIT: u64 = 1 << 63;
 
