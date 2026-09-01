@@ -21,7 +21,7 @@ use crate::multikey;
 use crate::resp;
 use crate::route;
 use crate::shard::Fabric;
-use crate::stats::{self, Stats};
+use crate::stats::{self, Stats, WorkerStats};
 use crate::topology::Topology;
 
 // larger replies churn the byte budget faster than they earn hits
@@ -99,10 +99,13 @@ pub struct ReplyCache {
     lookups: [Cell<u32>; FILL_SHAPES],
     hits: [Cell<u32>; FILL_SHAPES],
     rng: Cell<u64>,
-    scope: Scope,
+    coverage: Arc<Coverage>,
+    // under sharding the coverage is process-wide and every worker's gauge follows it
+    process_wide: bool,
     seen_flushes: Cell<u64>,
     frames: TrackingFrames,
     stats: Arc<Stats>,
+    wstats: Arc<WorkerStats>,
     worker: usize,
 }
 
@@ -113,13 +116,6 @@ impl ReplyCache {
         worker: usize,
         coverage: Option<Arc<Coverage>>,
     ) -> Rc<ReplyCache> {
-        let scope = match coverage {
-            Some(c) => Scope::Shared(c),
-            None => Scope::Local {
-                sets: RefCell::new(Sets::default()),
-                armed: Cell::new(false),
-            },
-        };
         Rc::new(ReplyCache {
             max_bytes: cfg.reply_cache_max_bytes,
             max_age: cfg.reply_cache_max_age_secs as u32 * TICKS_PER_SEC,
@@ -130,9 +126,11 @@ impl ReplyCache {
             lookups: [const { Cell::new(0) }; FILL_SHAPES],
             hits: [const { Cell::new(0) }; FILL_SHAPES],
             rng: Cell::new((worker as u64) << 32 | 0x9E37_79B9),
-            scope,
+            process_wide: coverage.is_some(),
+            coverage: coverage.unwrap_or_else(Coverage::new),
             seen_flushes: Cell::new(0),
             frames: Rc::new(RefCell::new(HashMap::new())),
+            wstats: stats.workers[worker].clone(),
             stats,
             worker,
         })
@@ -143,29 +141,40 @@ impl ReplyCache {
         self.frames.clone()
     }
 
-    /// Advances the coarse clock entries age against.
+    /// Advances the coarse clock entries age against and publishes the size gauges.
     pub fn tick(&self, now: u32) {
         self.clock.set(now);
+        let entries = self.hot.map.borrow().len() + self.prev.map.borrow().len();
+        self.wstats
+            .cache_entries
+            .store(entries as u64, Ordering::Relaxed);
+        self.wstats.cache_bytes.store(
+            (self.hot.bytes.get() + self.prev.bytes.get()) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Catches up with the scope's flush generation; true when fills may arm.
+    pub fn sync(&self) -> bool {
+        let state = self.coverage.state.load(Ordering::Relaxed);
+        let generation = state & !ARMED_BIT;
+        if generation != self.seen_flushes.get() {
+            self.seen_flushes.set(generation);
+            self.clear();
+        }
+        state & ARMED_BIT != 0
     }
 
     /// Returns the cached reply for `key` if fresh.
     pub fn lookup(&self, key: &[u8]) -> Option<Bytes> {
         self.sync();
-        let now = self.clock.get();
-        if let Some(e) = self.hot.map.borrow().get(key) {
-            if now.wrapping_sub(e.at) <= self.max_age {
-                return Some(e.frame.clone());
-            }
-            return None;
-        }
-        let (k, e) = self.prev.take(key)?;
-        if now.wrapping_sub(e.at) > self.max_age {
-            self.publish_size();
-            return None;
-        }
-        let frame = e.frame.clone();
-        self.insert_hot(k, e);
-        Some(frame)
+        self.fresh(key, Bytes::clone)
+    }
+
+    /// Appends the cached reply for `key` to `out` if fresh; the caller has synced.
+    pub fn lookup_into(&self, key: &[u8], out: &mut Vec<u8>) -> bool {
+        self.fresh(key, |frame| out.extend_from_slice(frame))
+            .is_some()
     }
 
     /// Records whether a `keys`-wide command (one part of a cross-slot MGET)
@@ -179,12 +188,8 @@ impl ReplyCache {
         self.hits[b].set(hits >> halve);
     }
 
-    /// Whether a miss may arm fills for `keys`: always until half a window of
-    /// same-shape decisions settles the hit ratio, then in proportion to it
-    /// (FILL_SAMPLE times the ratio, so admission is full once hits pay for
-    /// the tracking), floored at one key in FILL_SAMPLE to keep finding hot
-    /// keys — proportional so a cache rebuilding after a generation flip can
-    /// climb back instead of sticking under the threshold.
+    /// Admits a fill for `keys` in proportion to the shape's hit ratio once half a
+    /// window has judged it, floored to keep sampling so a flipped cache can recover.
     pub fn admit_fill(&self, keys: u32) -> bool {
         let b = shape(keys);
         let lookups = self.lookups[b].get();
@@ -201,40 +206,23 @@ impl ReplyCache {
 
     /// Arms a fill for `key`; false when uncovered or the key is already in flight.
     pub fn begin_fill(&self, key: &Bytes) -> bool {
+        self.sync() && arm(&mut self.fills.borrow_mut(), key)
+    }
+
+    /// Arms fills for the keys of one MGET; None when none could be armed.
+    pub fn begin_fills(&self, mut keys: Vec<Bytes>) -> Option<Vec<Bytes>> {
         if !self.sync() {
-            return false;
+            return None;
         }
-        match self.fills.borrow_mut().entry(key.clone()) {
-            hash_map::Entry::Occupied(_) => false,
-            hash_map::Entry::Vacant(v) => {
-                v.insert(Fill {
-                    ticket: true,
-                    writes: 0,
-                    poisoned: false,
-                });
-                true
-            }
-        }
+        let mut fills = self.fills.borrow_mut();
+        keys.retain(|k| arm(&mut fills, k));
+        (!keys.is_empty()).then_some(keys)
     }
 
     /// Caches an armed fill's reply unless an invalidation raced it.
     pub fn complete_fill(&self, key: &Bytes, frame: &[u8]) {
         self.sync();
-        if !self.settle_ticket(key)
-            || frame.first() != Some(&b'$')
-            || frame.len() > ENTRY_MAX_BYTES
-            || entry_size(key.len(), frame.len()) > self.max_bytes / 2
-        {
-            return;
-        }
-        // both copies unpin the socket read chunks the slices point into
-        self.insert_hot(
-            Box::from(&key[..]),
-            Entry {
-                frame: Bytes::copy_from_slice(frame),
-                at: self.clock.get(),
-            },
-        );
+        self.store(key, frame);
     }
 
     /// Forgets a fill whose reply will never be observed.
@@ -245,9 +233,10 @@ impl ReplyCache {
     /// Caches every key of an armed MGET fill from its array reply, or forgets them.
     pub fn complete_fills(&self, keys: &[Bytes], frame: &[u8]) {
         match multikey::split_array(frame) {
-            Some(items) if items.len() == keys.len() => {
+            Some((count, items)) if count == keys.len() => {
+                self.sync();
                 for (key, item) in keys.iter().zip(items) {
-                    self.complete_fill(key, item);
+                    self.store(key, item);
                 }
             }
             _ => self.abandon_fills(keys),
@@ -262,14 +251,26 @@ impl ReplyCache {
 
     /// Drops `key` from both generations and poisons its in-flight fill.
     pub fn invalidate(&self, key: &[u8]) {
-        self.evict(key);
-        if let Some(f) = self.fills.borrow_mut().get_mut(key) {
-            f.poisoned = true;
+        self.sync();
+        stats::bump(&self.wstats.cache_invalidations);
+        self.forget(key);
+    }
+
+    /// Invalidates every key of one push, syncing and counting once.
+    pub fn invalidate_all<'a>(&self, keys: impl IntoIterator<Item = &'a [u8]>) {
+        self.sync();
+        let mut n = 0;
+        for key in keys {
+            self.forget(key);
+            n += 1;
         }
+        stats::add(&self.wstats.cache_invalidations, n);
     }
 
     /// Invalidates `key` and blocks fills until [`ReplyCache::end_write`].
     pub fn begin_write(&self, key: &Bytes) {
+        self.sync();
+        stats::bump(&self.wstats.cache_invalidations);
         self.evict(key);
         let mut fills = self.fills.borrow_mut();
         let f = fills.entry(key.clone()).or_insert(Fill {
@@ -298,7 +299,6 @@ impl ReplyCache {
         for f in self.fills.borrow_mut().values_mut() {
             f.poisoned = true;
         }
-        self.publish_size();
     }
 
     /// Clears every cache in the scope.
@@ -306,30 +306,30 @@ impl ReplyCache {
         self.coverage(|_| true);
     }
 
-    // catches up with the scope's flush generation; returns whether fills may arm
-    fn sync(&self) -> bool {
-        match &self.scope {
-            Scope::Local { armed, .. } => armed.get(),
-            Scope::Shared(c) => {
-                let state = c.state.load(Ordering::Relaxed);
-                let generation = state & !ARMED_BIT;
-                if generation != self.seen_flushes.get() {
-                    self.seen_flushes.set(generation);
-                    self.clear();
-                }
-                state & ARMED_BIT != 0
-            }
+    fn fresh<R>(&self, key: &[u8], f: impl FnOnce(&Bytes) -> R) -> Option<R> {
+        let now = self.clock.get();
+        if let Some(e) = self.hot.map.borrow().get(key) {
+            return (now.wrapping_sub(e.at) <= self.max_age).then(|| f(&e.frame));
+        }
+        let (k, e) = self.prev.take(key)?;
+        if now.wrapping_sub(e.at) > self.max_age {
+            return None;
+        }
+        let r = f(&e.frame);
+        self.insert_hot(k, e);
+        Some(r)
+    }
+
+    fn forget(&self, key: &[u8]) {
+        self.evict(key);
+        if let Some(f) = self.fills.borrow_mut().get_mut(key) {
+            f.poisoned = true;
         }
     }
 
     fn evict(&self, key: &[u8]) {
-        self.sync();
-        stats::bump(&self.stats.workers[self.worker].cache_invalidations);
-        let in_hot = self.hot.take(key).is_some();
-        let in_prev = self.prev.take(key).is_some();
-        if in_hot || in_prev {
-            self.publish_size();
-        }
+        self.hot.take(key);
+        self.prev.take(key);
     }
 
     // true when the key's ticket settled unpoisoned; the entry goes once nothing is in flight
@@ -346,6 +346,24 @@ impl ReplyCache {
         clean
     }
 
+    fn store(&self, key: &Bytes, frame: &[u8]) {
+        if !self.settle_ticket(key)
+            || frame.first() != Some(&b'$')
+            || frame.len() > ENTRY_MAX_BYTES
+            || entry_size(key.len(), frame.len()) > self.max_bytes / 2
+        {
+            return;
+        }
+        // both copies unpin the socket read chunks the slices point into
+        self.insert_hot(
+            Box::from(&key[..]),
+            Entry {
+                frame: Bytes::copy_from_slice(frame),
+                at: self.clock.get(),
+            },
+        );
+    }
+
     fn insert_hot(&self, k: Box<[u8]>, e: Entry) {
         let klen = k.len();
         let size = entry_size(klen, e.frame.len());
@@ -354,47 +372,23 @@ impl ReplyCache {
             retire(std::mem::replace(&mut *self.prev.map.borrow_mut(), flipped));
             self.prev.bytes.set(self.hot.bytes.get());
             self.hot.bytes.set(0);
-            stats::bump(&self.stats.workers[self.worker].cache_flips);
+            stats::bump(&self.wstats.cache_flips);
         }
         let replaced = match self.hot.map.borrow_mut().insert(k, e) {
             Some(old) => entry_size(klen, old.frame.len()),
             None => 0,
         };
         self.hot.bytes.set(self.hot.bytes.get() + size - replaced);
-        self.publish_size();
-    }
-
-    fn publish_size(&self) {
-        let w = &self.stats.workers[self.worker];
-        let entries = self.hot.map.borrow().len() + self.prev.map.borrow().len();
-        w.cache_entries.store(entries as u64, Ordering::Relaxed);
-        w.cache_bytes.store(
-            (self.hot.bytes.get() + self.prev.bytes.get()) as u64,
-            Ordering::Relaxed,
-        );
     }
 
     // applies one coverage change; `f` says whether the scope must flush
     fn coverage(&self, f: impl FnOnce(&mut Sets) -> bool) {
-        let armed = match &self.scope {
-            Scope::Local { sets, armed } => {
-                let mut sets = sets.borrow_mut();
-                if f(&mut sets) {
-                    self.clear();
-                }
-                armed.set(sets.covered());
-                armed.get()
-            }
-            Scope::Shared(c) => {
-                let mut sets = c.lock();
-                let flush = f(&mut sets);
-                let armed = sets.covered();
-                c.publish(armed, flush);
-                drop(sets);
-                self.sync();
-                armed
-            }
-        };
+        let mut sets = self.coverage.lock();
+        let flush = f(&mut sets);
+        let armed = sets.covered();
+        self.coverage.publish(armed, flush);
+        drop(sets);
+        self.sync();
         self.publish_stat(armed);
     }
 
@@ -426,15 +420,12 @@ impl ReplyCache {
 
     fn publish_stat(&self, armed: bool) {
         let armed = u64::from(armed);
-        match &self.scope {
-            Scope::Local { .. } => self.stats.workers[self.worker]
-                .cache_armed
-                .store(armed, Ordering::Relaxed),
-            Scope::Shared(_) => {
-                for w in &self.stats.workers {
-                    w.cache_armed.store(armed, Ordering::Relaxed);
-                }
+        if self.process_wide {
+            for w in &self.stats.workers {
+                w.cache_armed.store(armed, Ordering::Relaxed);
             }
+        } else {
+            self.wstats.cache_armed.store(armed, Ordering::Relaxed);
         }
     }
 }
@@ -444,7 +435,7 @@ pub struct Wiring {
     pub cache: Rc<ReplyCache>,
     pub backends: Rc<Backends>,
     pub fabric: Option<Arc<Fabric>>,
-    pub cfg: Rc<Config>,
+    pub cfg: Arc<Config>,
 }
 
 impl Wiring {
@@ -484,11 +475,9 @@ impl Wiring {
                     self.cache.flush();
                 }
             }
-            None => {
-                for k in keys {
-                    self.cache.invalidate(&frame[k.start..k.end]);
-                }
-            }
+            None => self
+                .cache
+                .invalidate_all(keys.iter().map(|k| &frame[k.start..k.end])),
         }
     }
 }
@@ -577,15 +566,6 @@ enum Push {
     Keys(usize),
 }
 
-/// Which masters are tracked: per worker, or process-wide under sharding.
-enum Scope {
-    Local {
-        sets: RefCell<Sets>,
-        armed: Cell<bool>,
-    },
-    Shared(Arc<Coverage>),
-}
-
 // coverage accounting survives task aborts
 struct UpGuard {
     w: Rc<Wiring>,
@@ -635,6 +615,20 @@ pub async fn run_trackers(w: Rc<Wiring>, topo: Arc<ArcSwap<Topology>>) {
 
 fn shape(keys: u32) -> usize {
     (keys as usize - 1).min(FILL_SHAPES - 1)
+}
+
+fn arm(fills: &mut Fills, key: &Bytes) -> bool {
+    match fills.entry(key.clone()) {
+        hash_map::Entry::Occupied(_) => false,
+        hash_map::Entry::Vacant(v) => {
+            v.insert(Fill {
+                ticket: true,
+                writes: 0,
+                poisoned: false,
+            });
+            true
+        }
+    }
 }
 
 fn entry_size(key_len: usize, frame_len: usize) -> usize {

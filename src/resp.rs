@@ -52,7 +52,7 @@ pub struct Args<'a> {
 }
 
 impl<'a> Args<'a> {
-    /// Walks a request already validated by [`scan_request`].
+    /// Walks a request already validated by [`scan_request_at`].
     pub fn new(frame: &'a [u8], argc: usize) -> Self {
         let pos = frame
             .iter()

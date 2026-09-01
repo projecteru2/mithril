@@ -5,6 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io::IoSlice;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -14,7 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::cache::TrackingFrames;
 use crate::client::{Reply, ReplyQueue};
-use crate::config::Config;
+use crate::config::{Config, Sharding};
 use crate::log_debug;
 use crate::resp;
 
@@ -24,7 +25,7 @@ pub const READ_INIT: usize = 8 * 1024;
 pub const BATCH: usize = 256;
 pub const ASKING_FRAME: &[u8] = b"*1\r\n$6\r\nASKING\r\n";
 pub const ERR_BACKEND_LOST: &[u8] = b"-ERR mithril: backend connection lost\r\n";
-const IOV_STACK: usize = 16;
+const IOV_STACK: usize = 64;
 const MAX_EXCLUSIVE_PER_NODE: usize = 512;
 
 /// Where a backend reply is delivered.
@@ -108,7 +109,6 @@ impl Conn {
     }
 }
 
-/// Per-worker backend pools keyed by node address, split by readonly role.
 /// Frames per writev on this worker's own backend connections, for auto sharding.
 #[derive(Default)]
 pub struct BatchDepth {
@@ -131,8 +131,9 @@ impl BatchDepth {
     }
 }
 
+/// Per-worker backend pools keyed by node address, split by readonly role.
 pub struct Backends {
-    cfg: Rc<Config>,
+    cfg: Arc<Config>,
     pools: RefCell<HashMap<Box<str>, PoolPair>>,
     tracking: Option<TrackingFrames>,
     depth: Rc<BatchDepth>,
@@ -144,7 +145,7 @@ impl Backends {
         self.depth.take()
     }
 
-    pub fn new(cfg: Rc<Config>, tracking: Option<TrackingFrames>) -> Rc<Backends> {
+    pub fn new(cfg: Arc<Config>, tracking: Option<TrackingFrames>) -> Rc<Backends> {
         Rc::new(Backends {
             cfg,
             pools: RefCell::new(HashMap::new()),
@@ -310,18 +311,12 @@ impl Pool {
 
 /// Dials a raw authenticated backend connection for relays and the refresher.
 pub async fn dial_raw(addr: &str, cfg: &Config) -> std::io::Result<TcpStream> {
-    let stream = connect(addr, cfg.tcp_keepalive_secs).await?;
-    if cfg.backend_pass.is_empty() {
-        return Ok(stream);
-    }
-    let (mut r, mut w) = stream.into_split();
-    handshake(&mut r, &mut w, false, cfg, None)
+    let (r, w) = open(addr, false, cfg, None)
         .await
         .map_err(std::io::Error::other)?;
     r.reunite(w).map_err(std::io::Error::other)
 }
 
-/// Writes every slice fully, advancing across partial writes.
 /// Writes every frame with writev; small batches build the iovec on the stack.
 pub async fn write_frames<W: tokio::io::AsyncWrite + Unpin>(
     w: &mut W,
@@ -559,6 +554,29 @@ pub(crate) async fn read_reply<R: AsyncRead + Unpin>(
     }
 }
 
+pub(crate) async fn run_pipe<S, D: Fn(S, Bytes) + Copy>(
+    addr: &str,
+    readonly: bool,
+    cfg: &Config,
+    tracking: Option<&[u8]>,
+    rx: &mut mpsc::Receiver<Outbound<S>>,
+    (abort, depth): (Option<&tokio::sync::Notify>, Option<&BatchDepth>),
+    deliver: D,
+) {
+    let halves = tokio::select! {
+        _ = abort_signal(abort) => Err("aborted".to_string()),
+        r = open(addr, readonly, cfg, tracking) => r,
+    };
+    match halves {
+        Ok(halves) => pump(addr, rx, halves, abort, depth, deliver).await,
+        Err(e) => {
+            log_debug!("connect {addr}: {e}");
+            drain_channel(rx, deliver);
+        }
+    }
+}
+
+/// Writes every slice fully, advancing across partial writes.
 async fn write_slices<W: tokio::io::AsyncWrite + Unpin>(
     w: &mut W,
     slices: &mut [IoSlice<'_>],
@@ -584,20 +602,18 @@ async fn run_conn(
     depth: &BatchDepth,
 ) {
     let abort = (role == Role::Exclusive).then_some(&conn.abort);
-    let halves = tokio::select! {
-        _ = abort_signal(abort) => Err("aborted".to_string()),
-        r = open(addr, role == Role::Replica, cfg, tracking.as_deref()) => r,
-    };
-    match halves {
-        Ok(halves) => {
-            let depth = (role != Role::Exclusive).then_some(depth);
-            pump(addr, &mut rx, halves, abort, depth, deliver).await
-        }
-        Err(e) => {
-            log_debug!("connect {addr}: {e}");
-            drain_channel(&mut rx, deliver);
-        }
-    }
+    let depth =
+        (role != Role::Exclusive && cfg.backend_sharding == Sharding::Auto).then_some(depth);
+    run_pipe(
+        addr,
+        role == Role::Replica,
+        cfg,
+        tracking.as_deref(),
+        &mut rx,
+        (abort, depth),
+        deliver,
+    )
+    .await;
 }
 
 async fn abort_signal(abort: Option<&tokio::sync::Notify>) {

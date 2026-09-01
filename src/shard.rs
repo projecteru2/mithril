@@ -8,11 +8,10 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::backend::{OUTBOUND_QUEUE, Outbound, check_rearm, drain_channel, open, pump};
-use crate::cache::{ReplyCache, TrackingFrames};
+use crate::backend::{OUTBOUND_QUEUE, Outbound, check_rearm, run_pipe};
+use crate::cache::ReplyCache;
 use crate::client::{Reply, SharedQueue};
 use crate::config::Config;
-use crate::log_debug;
 
 /// A request crossing to a node-owner worker.
 pub type RemoteOutbound = Outbound<RemoteSink>;
@@ -138,12 +137,12 @@ pub async fn control_loop(
     fabric: Arc<Fabric>,
     cfg: Arc<Config>,
     cache: Option<Rc<ReplyCache>>,
-    tracking: Option<TrackingFrames>,
 ) {
+    let tracking = cache.as_ref().map(|c| c.tracking_frames());
     loop {
         tokio::select! {
             nc = ctl.recv() => {
-                let Some(nc) = nc else { return };
+                let Some(mut nc) = nc else { return };
                 let frame = match &tracking {
                     Some(t) if !nc.readonly => t.borrow().get(nc.addr.as_str()).cloned(),
                     _ => None,
@@ -151,16 +150,23 @@ pub async fn control_loop(
                 let fabric = fabric.clone();
                 let cfg = cfg.clone();
                 tokio::task::spawn_local(async move {
-                    run_shard_conn(&nc.addr, nc.readonly, nc.rx, frame, &cfg).await;
+                    run_pipe(
+                        &nc.addr,
+                        nc.readonly,
+                        &cfg,
+                        frame.as_deref(),
+                        &mut nc.rx,
+                        (None, None),
+                        deliver,
+                    )
+                    .await;
                     fabric.forget(&nc.addr, nc.readonly);
                 });
             }
             keys = invals.recv() => {
                 let Some(keys) = keys else { return };
                 if let Some(c) = &cache {
-                    for k in keys.iter() {
-                        c.invalidate(k);
-                    }
+                    c.invalidate_all(keys.iter().map(|k| &k[..]));
                 }
             }
         }
@@ -174,22 +180,6 @@ pub(crate) fn fnv(data: &[u8]) -> u64 {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
-}
-
-async fn run_shard_conn(
-    addr: &str,
-    readonly: bool,
-    mut rx: mpsc::Receiver<RemoteOutbound>,
-    tracking: Option<Bytes>,
-    cfg: &Config,
-) {
-    match open(addr, readonly, cfg, tracking.as_deref()).await {
-        Ok(halves) => pump(addr, &mut rx, halves, None, None, deliver).await,
-        Err(e) => {
-            log_debug!("shard connect {addr}: {e}");
-            drain_channel(&mut rx, deliver);
-        }
-    }
 }
 
 fn deliver(sink: RemoteSink, frame: Bytes) {

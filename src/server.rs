@@ -402,7 +402,6 @@ fn worker_thread(
     };
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
-        let local_cfg = Rc::new((*cfg).clone());
         let cache = cfg
             .reply_cache
             .then(|| crate::cache::ReplyCache::new(&cfg, stats.clone(), worker, coverage));
@@ -414,22 +413,21 @@ fn worker_thread(
                 fabric.clone(),
                 cfg.clone(),
                 cache.clone(),
-                tracking.clone(),
             ));
             fabric
         });
-        let backends = Backends::new(local_cfg.clone(), tracking);
+        let backends = Backends::new(cfg.clone(), tracking);
         if let Some(cache) = &cache {
             let wiring = Rc::new(crate::cache::Wiring {
                 cache: cache.clone(),
                 backends: backends.clone(),
                 fabric: fabric.clone(),
-                cfg: local_cfg.clone(),
+                cfg: cfg.clone(),
             });
             tokio::task::spawn_local(crate::cache::run_trackers(wiring, topo.clone()));
         }
         let shared = Rc::new(Shared {
-            cfg: local_cfg,
+            cfg,
             topo,
             backends,
             wstats: stats.workers[worker].clone(),
@@ -559,9 +557,8 @@ async fn fetch_topology<'a, I: Iterator<Item = &'a str>>(
 }
 
 async fn fetch_from(cfg: &Config, addr: &str) -> Result<Topology, String> {
-    let mut stream = tokio::time::timeout(FETCH_TIMEOUT, crate::backend::dial_raw(addr, cfg))
+    let mut stream = crate::backend::dial_raw(addr, cfg)
         .await
-        .map_err(|_| "dial timed out".to_string())?
         .map_err(|e| e.to_string())?;
     stream
         .write_all(b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nNODES\r\n")

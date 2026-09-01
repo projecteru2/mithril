@@ -9,6 +9,10 @@ pub const FLAG_TXN_CTRL: u8 = 1 << 3;
 pub const FLAG_CACHE: u8 = 1 << 4;
 /// Writes a destination key named by a STORE/STOREDIST option.
 pub const FLAG_STORE: u8 = 1 << 5;
+/// Accepted from a subscribed client.
+pub const FLAG_PUBSUB: u8 = 1 << 6;
+/// A multi-key reply that is one aggregate, never rebuilt from per-key resends.
+pub const FLAG_UNION: u8 = 1 << 7;
 const MAX_NAME: usize = 24;
 
 const PREFIX_LEN: usize = 8;
@@ -24,6 +28,8 @@ const C: u8 = FLAG_CACHE;
 const S: u8 = FLAG_STORE;
 const N: u8 = FLAG_NO_AUTH;
 const T: u8 = FLAG_TXN_CTRL;
+const P: u8 = FLAG_PUBSUB;
+const U: u8 = FLAG_UNION;
 
 static LUT: [u16; LUT_LEN] = build_lut();
 
@@ -110,19 +116,19 @@ static TABLE: &[Spec] = &[
     c("pexpire", 3, W, 1, 1, 1, Kind::Single),
     c("pexpireat", 3, W, 1, 1, 1, Kind::Single),
     c("pfadd", -2, W, 1, 1, 1, Kind::Single),
-    c("pfcount", -2, R, 1, -1, 1, Kind::MultiSum),
-    c("ping", -1, 0, 0, 0, 0, Kind::Local),
+    c("pfcount", -2, R | U, 1, -1, 1, Kind::MultiSum),
+    c("ping", -1, P, 0, 0, 0, Kind::Local),
     c("psetex", 4, W, 1, 1, 1, Kind::Single),
-    c("psubscribe", -2, 0, 0, 0, 0, Kind::Subscribe),
+    c("psubscribe", -2, P, 0, 0, 0, Kind::Subscribe),
     c("pttl", 2, R, 1, 1, 1, Kind::Single),
     c("publish", 3, 0, 0, 0, 0, Kind::AnyMaster),
     c("pubsub", -2, 0, 0, 0, 0, Kind::AnyMaster),
-    c("punsubscribe", -1, 0, 0, 0, 0, Kind::Subscribe),
-    c("quit", 1, N | T, 0, 0, 0, Kind::Local),
+    c("punsubscribe", -1, P, 0, 0, 0, Kind::Subscribe),
+    c("quit", 1, N | T | P, 0, 0, 0, Kind::Local),
     c("randomkey", 1, R, 0, 0, 0, Kind::AnyMaster),
     c("rename", 3, W, 1, 2, 1, Kind::Single),
     c("renamenx", 3, W, 1, 2, 1, Kind::Single),
-    c("reset", 1, N | T, 0, 0, 0, Kind::Local),
+    c("reset", 1, N | T | P, 0, 0, 0, Kind::Local),
     c("rpop", -2, W, 1, 1, 1, Kind::Single),
     c("rpoplpush", 3, W, 1, 2, 1, Kind::Single),
     c("rpush", -3, W, 1, 1, 1, Kind::Single),
@@ -149,7 +155,7 @@ static TABLE: &[Spec] = &[
     c("srem", -3, W, 1, 1, 1, Kind::Single),
     c("sscan", -3, R, 1, 1, 1, Kind::Single),
     c("strlen", 2, R, 1, 1, 1, Kind::Single),
-    c("subscribe", -2, 0, 0, 0, 0, Kind::Subscribe),
+    c("subscribe", -2, P, 0, 0, 0, Kind::Subscribe),
     c("sunion", -2, R, 1, -1, 1, Kind::Single),
     c("sunionstore", -3, W, 1, -1, 1, Kind::Single),
     c("time", 1, 0, 0, 0, 0, Kind::Local),
@@ -157,7 +163,7 @@ static TABLE: &[Spec] = &[
     c("ttl", 2, R, 1, 1, 1, Kind::Single),
     c("type", 2, R, 1, 1, 1, Kind::Single),
     c("unlink", -2, W, 1, -1, 1, Kind::MultiSum),
-    c("unsubscribe", -1, 0, 0, 0, 0, Kind::Subscribe),
+    c("unsubscribe", -1, P, 0, 0, 0, Kind::Subscribe),
     c("xadd", -5, W, 1, 1, 1, Kind::Single),
     c("xlen", 2, R, 1, 1, 1, Kind::Single),
     c("xpending", -3, R, 1, 1, 1, Kind::Single),

@@ -132,8 +132,8 @@ pub fn merge_mget(
         if reply.first() == Some(&b'-') {
             return Err(reply.clone());
         }
-        let items = split_array(reply).ok_or_else(|| reply.clone())?;
-        if items.len() != positions.len() {
+        let (count, items) = split_array(reply).ok_or_else(|| reply.clone())?;
+        if count != positions.len() {
             return Err(reply.clone());
         }
         for (i, item) in positions.iter().zip(items) {
@@ -195,13 +195,13 @@ pub fn unpack_cursor(cursor: u64) -> (usize, u64) {
 
 /// Extracts (cursor, keys-array frame) from a SCAN reply.
 pub fn parse_scan_reply(frame: &[u8]) -> Option<(u64, &[u8])> {
-    let items = split_array(frame)?;
-    if items.len() != 2 {
+    let (count, mut items) = split_array(frame)?;
+    if count != 2 {
         return None;
     }
-    let cursor_payload = resp::bulk_payload(items[0])?;
+    let cursor_payload = resp::bulk_payload(items.next()?)?;
     let cursor: u64 = std::str::from_utf8(cursor_payload).ok()?.parse().ok()?;
-    Some((cursor, items[1]))
+    Some((cursor, items.next()?))
 }
 
 /// Rebuilds a SCAN reply with a synthetic cursor.
@@ -224,7 +224,6 @@ pub(crate) fn parse_int(frame: &[u8]) -> Option<i64> {
     std::str::from_utf8(&frame[1..end]).ok()?.parse().ok()
 }
 
-/// Splits a multi-bulk reply into its top-level element frames.
 // the item of a one-element array reply; an error reply has none
 fn single_item(frame: &[u8]) -> Option<&[u8]> {
     frame
@@ -232,25 +231,24 @@ fn single_item(frame: &[u8]) -> Option<&[u8]> {
         .filter(|item| !item.is_empty())
 }
 
-pub(crate) fn split_array(frame: &[u8]) -> Option<Vec<&[u8]>> {
+/// Splits a multi-bulk reply into its element count and top-level element frames.
+pub(crate) fn split_array(frame: &[u8]) -> Option<(usize, impl Iterator<Item = &[u8]>)> {
     if frame.first() != Some(&b'*') {
         return None;
     }
     let (n, header_end) = resp::scan_int_line(frame, 1)?;
-    if n < 0 {
-        return None;
-    }
-    let count = n as usize;
-    let mut items = Vec::with_capacity(count);
+    let count = usize::try_from(n).ok()?;
     let mut pos = header_end;
-    for _ in 0..count {
+    let items = std::iter::from_fn(move || {
         let resp::Scan::Complete(len) = resp::scan_value(&frame[pos..]) else {
             return None;
         };
-        items.push(&frame[pos..pos + len]);
+        let item = &frame[pos..pos + len];
         pos += len;
-    }
-    Some(items)
+        Some(item)
+    })
+    .take(count);
+    Some((count, items))
 }
 
 #[cfg(test)]
