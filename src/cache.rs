@@ -295,6 +295,7 @@ impl ReplyCache {
         for f in self.fills.borrow_mut().values_mut() {
             f.poisoned = true;
         }
+        self.publish_size();
     }
 
     /// Clears every cache in the scope.
@@ -321,8 +322,9 @@ impl ReplyCache {
     fn evict(&self, key: &[u8]) {
         self.sync();
         stats::bump(&self.stats.workers[self.worker].cache_invalidations);
-        self.hot.take(key);
-        self.prev.take(key);
+        if self.hot.take(key).is_some() || self.prev.take(key).is_some() {
+            self.publish_size();
+        }
     }
 
     // true when the key's ticket settled unpoisoned; the entry goes once nothing is in flight
@@ -347,12 +349,24 @@ impl ReplyCache {
             retire(std::mem::replace(&mut *self.prev.map.borrow_mut(), flipped));
             self.prev.bytes.set(self.hot.bytes.get());
             self.hot.bytes.set(0);
+            stats::bump(&self.stats.workers[self.worker].cache_flips);
         }
         let replaced = match self.hot.map.borrow_mut().insert(k, e) {
             Some(old) => entry_size(klen, old.frame.len()),
             None => 0,
         };
         self.hot.bytes.set(self.hot.bytes.get() + size - replaced);
+        self.publish_size();
+    }
+
+    fn publish_size(&self) {
+        let w = &self.stats.workers[self.worker];
+        let entries = self.hot.map.borrow().len() + self.prev.map.borrow().len();
+        w.cache_entries.store(entries as u64, Ordering::Relaxed);
+        w.cache_bytes.store(
+            (self.hot.bytes.get() + self.prev.bytes.get()) as u64,
+            Ordering::Relaxed,
+        );
     }
 
     // applies one coverage change; `f` says whether the scope must flush

@@ -201,8 +201,8 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
          # Mithril\r\nworker_threads:{}\r\nbackend_conns_per_node:{}\r\n\
          backend_sharding:{}\r\nslave_mode:{}\r\nreply_cache:{}\r\n\
          cache_hits:{}\r\ncache_misses:{}\r\ncache_invalidations:{}\r\n\
-         cache_armed_workers:{}\r\n\
-         worker_commands:{}\r\n",
+         cache_armed_workers:{}\r\ncache_entries:{}\r\ncache_bytes:{}\r\n\
+         cache_flips:{}\r\nworker_commands:{}\r\n",
         crate::VERSION,
         std::process::id(),
         cfg.port,
@@ -229,6 +229,9 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
         stats.sum(|w| &w.cache_misses),
         stats.sum(|w| &w.cache_invalidations),
         stats.sum(|w| &w.cache_armed),
+        stats.sum(|w| &w.cache_entries),
+        stats.sum(|w| &w.cache_bytes),
+        stats.sum(|w| &w.cache_flips),
         stats
             .workers
             .iter()
@@ -394,6 +397,7 @@ mod tests {
         };
         assert_eq!(field("connected_clients").as_deref(), Some("7"));
         assert_eq!(field("mithril_version").as_deref(), Some(crate::VERSION));
+        assert_eq!(field("cache_flips").as_deref(), Some("0"));
         assert_eq!(
             field("worker_threads").as_deref(),
             Some(cfg.workers.to_string().as_str())

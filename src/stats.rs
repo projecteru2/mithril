@@ -25,6 +25,9 @@ pub struct WorkerStats {
     pub cache_misses: AtomicU64,
     pub cache_invalidations: AtomicU64,
     pub cache_armed: AtomicU64,
+    pub cache_entries: AtomicU64,
+    pub cache_bytes: AtomicU64,
+    pub cache_flips: AtomicU64,
 }
 
 /// What CLIENT LIST reports about one connection; touched only on connect,
