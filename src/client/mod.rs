@@ -1,12 +1,14 @@
 //! Client sessions: dispatch, ordered replies, MULTI, pubsub, redirects.
 
 mod blocking;
+mod broadcast;
 mod fanout;
 mod link;
 mod local;
 mod pipe;
 mod pubsub;
 mod queue;
+mod scripting;
 mod session;
 mod tuner;
 mod writer;
@@ -29,6 +31,7 @@ use crate::backend::Backends;
 use crate::cache::ReplyCache;
 use crate::config::Config;
 use crate::resp;
+use crate::script::Scripts;
 use crate::shard::Fabric;
 use crate::stats::{self, Stats};
 use crate::topology::Topology;
@@ -51,6 +54,7 @@ pub struct Shared {
     pub started: u64,
     pub fabric: Option<Arc<Fabric>>,
     pub cache: Option<Rc<ReplyCache>>,
+    pub scripts: Arc<Scripts>,
     pub inflight: Cell<u64>,
     pub prefer_shared: Cell<bool>,
 }

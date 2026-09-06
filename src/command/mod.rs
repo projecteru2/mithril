@@ -68,6 +68,8 @@ pub enum Kind {
     Local,
     /// MULTI queue flushed to the slot owner as one blob.
     Exec,
+    /// SCRIPT and FUNCTION management: broadcast, or answered by one master.
+    Script,
 }
 
 /// One command table entry: a key range at `first_key..=last_key` by `step`,

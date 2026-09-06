@@ -1,6 +1,6 @@
 # Compatibility
 
-The 63-test integration suite runs against each backend, in every mode
+The 66-test integration suite runs against each backend, in every mode
 combination (`backend-sharding`, `reply-cache`), with full cluster
 teardown/recreate between versions; it includes a live slot migration
 (CLUSTER SETSLOT MIGRATING/IMPORTING + MIGRATE) under multi-key commands:
@@ -26,9 +26,9 @@ memtier_benchmark, redis-benchmark.
 - Pubsub delivery to a slow subscriber is windowed (4096 pushes).
 - Config hot-reload covers `loglevel` only; CONFIG SET rejects every other
   parameter.
-- Scripts route (EVAL, EVALSHA, FCALL and the _RO forms) but SCRIPT and
-  FUNCTION management is not proxied: load scripts on the nodes, or let the
-  client reload on `NOSCRIPT`.
+- SCRIPT KILL, SCRIPT DEBUG and FUNCTION KILL are not proxied; a script the
+  proxy did not load itself is not reloaded on `NOSCRIPT` (the client's own
+  EVAL fallback still applies).
 - Shard pubsub (SSUBSCRIBE/SPUBLISH/SUNSUBSCRIBE) is not implemented.
 - Blocking commands (BLPOP, BRPOP, BRPOPLPUSH, BLMOVE, BLMPOP, BZPOPMAX,
   BZPOPMIN, BZMPOP, blocking XREAD) always run on the slot's master and

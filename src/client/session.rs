@@ -13,7 +13,8 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::{Notify, oneshot};
 
-use super::fanout::{Merge, write_keys};
+use super::broadcast::{Gather, Targets};
+use super::fanout::write_keys;
 use super::link::{Fill, InFlight, WriterLink};
 use super::local::{MultiState, display_name};
 use super::pipe::{ColdSend, Pipe, pipe_for, queue_on};
@@ -360,12 +361,17 @@ impl Session {
             }
             Kind::Dbsize => {
                 if Box::pin(self.gates_clear()).await {
-                    Box::pin(self.run_broadcast(frame, Merge::Sum)).await;
+                    Box::pin(self.run_broadcast(frame, Targets::Masters, Gather::Sum, None)).await;
                 }
             }
             Kind::Flushall => {
                 if Box::pin(self.gates_clear()).await {
-                    Box::pin(self.run_broadcast(frame, Merge::Ok)).await;
+                    Box::pin(self.run_broadcast(frame, Targets::Masters, Gather::Ok, None)).await;
+                }
+            }
+            Kind::Script => {
+                if Box::pin(self.gates_clear()).await {
+                    Box::pin(self.run_script(spec, frame, argc)).await;
                 }
             }
         }
@@ -406,7 +412,7 @@ impl Session {
         }
     }
 
-    async fn forward_any_master(&self, frame: Bytes) {
+    pub(super) async fn forward_any_master(&self, frame: Bytes) {
         let seq = self.alloc_seq();
         let pipe = {
             let topo = self.topo();

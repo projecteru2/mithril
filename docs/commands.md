@@ -22,9 +22,7 @@ PFMERGE, ...) route by their first key, and so do the numkeys forms (LMPOP,
 ZMPOP, ZUNION/ZINTER/ZDIFF and their STORE variants, ZINTERCARD,
 SINTERCARD, MSETEX); the owning node enforces same-slot, exactly as a
 direct cluster connection would. EVAL, EVALSHA, FCALL and their _RO forms
-route by their first key (or any master when they declare none); a script
-missing on the node answers `NOSCRIPT` to the client, which reloads it
-with EVAL as usual.
+route by their first key (or any master when they declare none).
 
 ## Fanned out per slot
 
@@ -49,6 +47,17 @@ routes as a single request with no merge step.
 SCAN iterates the whole cluster with synthetic cursors (master index packed
 into the cursor's high bits), DBSIZE sums the slot-owning masters, FLUSHALL
 broadcasts to them and requires every one to acknowledge.
+
+## Scripts and functions
+
+SCRIPT LOAD reaches every node (scripts do not replicate since Redis 7) and
+returns the sha once all agree; SCRIPT EXISTS answers true only for a sha
+every master holds; SCRIPT FLUSH clears every node. The proxy remembers the
+body of every script it loaded, so an EVALSHA that meets `NOSCRIPT` on a
+node — after a restart or a flush behind the proxy's back — reloads it there
+and reruns transparently. FUNCTION LOAD/DELETE/FLUSH/RESTORE broadcast to
+the masters (libraries replicate); FUNCTION LIST/DUMP/STATS answer from one
+master. SCRIPT KILL, FUNCTION KILL and SCRIPT DEBUG are not proxied.
 
 ## Transactions
 
@@ -81,8 +90,7 @@ cluster-aware clients treat the proxy as the whole cluster.
 Requests for these return unknown-command; none of them silently
 misbehaves:
 
-- SCRIPT and FUNCTION management (scripts and functions must be loaded
-  on the nodes directly)
+- SCRIPT KILL, SCRIPT DEBUG and FUNCTION KILL
 - shard pubsub: SSUBSCRIBE, SPUBLISH, SUNSUBSCRIBE
 - WATCH/UNWATCH, FLUSHDB, cluster-wide KEYS
 - server management: WAIT, DEBUG, LATENCY, MEMORY, SHUTDOWN,

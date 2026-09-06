@@ -181,6 +181,50 @@ pub fn merge_ok<'r>(parts: impl Iterator<Item = &'r Bytes>) -> Result<Bytes, Byt
     Ok(Bytes::from_static(crate::resp::OK))
 }
 
+/// Folds identical replies into one; nodes that disagree are reported as an error.
+pub fn merge_same<'r>(mut parts: impl Iterator<Item = &'r Bytes>) -> Result<Bytes, Bytes> {
+    let first = parts
+        .next()
+        .ok_or_else(|| Bytes::from_static(b"-CLUSTERDOWN Hash slot not served\r\n"))?;
+    if first.first() == Some(&b'-') {
+        return Err(first.clone());
+    }
+    for reply in parts {
+        if reply.first() == Some(&b'-') {
+            return Err(reply.clone());
+        }
+        if reply != first {
+            return Err(Bytes::from_static(b"-ERR nodes disagree on the reply\r\n"));
+        }
+    }
+    Ok(first.clone())
+}
+
+/// Folds integer arrays element-wise with AND, as SCRIPT EXISTS across masters.
+pub fn merge_every<'r>(parts: impl Iterator<Item = &'r Bytes>) -> Result<Bytes, Bytes> {
+    let mut all: Option<Vec<bool>> = None;
+    for reply in parts {
+        if reply.first() == Some(&b'-') {
+            return Err(reply.clone());
+        }
+        let (count, items) = split_array(reply).ok_or_else(|| reply.clone())?;
+        let acc = all.get_or_insert_with(|| vec![true; count]);
+        if acc.len() != count {
+            return Err(reply.clone());
+        }
+        for (slot, item) in acc.iter_mut().zip(items) {
+            *slot &= parse_int(item) == Some(1);
+        }
+    }
+    let acc = all.unwrap_or_default();
+    let mut out = Vec::with_capacity(4 + acc.len() * 4);
+    resp::array_header(&mut out, acc.len());
+    for hit in acc {
+        resp::integer(&mut out, i64::from(hit));
+    }
+    Ok(Bytes::from(out))
+}
+
 /// Packs (master index, node cursor) into one synthetic SCAN cursor.
 pub fn pack_cursor(master_idx: usize, node_cursor: u64) -> u64 {
     ((master_idx as u64) << SCAN_CURSOR_BITS) | (node_cursor & ((1 << SCAN_CURSOR_BITS) - 1))
@@ -254,6 +298,28 @@ fn single_item(frame: &[u8]) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_and_every_fold_broadcast_replies() {
+        let sha = Bytes::from_static(b"$3\r\nabc\r\n");
+        let other = Bytes::from_static(b"$3\r\nabd\r\n");
+        let err = Bytes::from_static(b"-ERR down\r\n");
+        assert_eq!(merge_same([&sha, &sha].into_iter()), Ok(sha.clone()));
+        assert_eq!(merge_same([&sha, &err].into_iter()), Err(err.clone()));
+        assert!(merge_same([&sha, &other].into_iter()).is_err());
+        assert!(merge_same(std::iter::empty()).is_err());
+        let yes_no = Bytes::from_static(b"*2\r\n:1\r\n:0\r\n");
+        let yes_yes = Bytes::from_static(b"*2\r\n:1\r\n:1\r\n");
+        assert_eq!(
+            merge_every([&yes_yes, &yes_no].into_iter())
+                .unwrap()
+                .as_ref(),
+            b"*2\r\n:1\r\n:0\r\n"
+        );
+        assert_eq!(merge_every([&yes_yes, &err].into_iter()), Err(err));
+        assert!(merge_every([&yes_yes, &sha].into_iter()).is_err());
+        assert_eq!(merge_every(std::iter::empty()).unwrap().as_ref(), b"*0\r\n");
+    }
 
     #[test]
     fn singles_keep_positions_and_values() {

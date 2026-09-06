@@ -69,6 +69,7 @@ struct WorkerCtx {
     worker: usize,
     started: u64,
     coverage: Option<Arc<crate::cache::Coverage>>,
+    scripts: Arc<crate::script::Scripts>,
 }
 
 struct Placer {
@@ -196,6 +197,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     };
     let coverage = (cfg.reply_cache && cfg.backend_sharding != Sharding::Off)
         .then(crate::cache::Coverage::new);
+    let scripts = crate::script::Scripts::new();
     let mut conn_txs = Vec::with_capacity(cfg.workers);
     for worker in 0..cfg.workers {
         let (conn_tx, conn_rx) = mpsc::channel::<Admitted>(ACCEPT_QUEUE);
@@ -216,6 +218,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
             worker,
             started,
             coverage: coverage.clone(),
+            scripts: scripts.clone(),
         };
         std::thread::Builder::new()
             .name(format!("mithril-{worker}"))
@@ -396,6 +399,7 @@ fn worker_thread(
         worker,
         started,
         coverage,
+        scripts,
     } = ctx;
     let Some(rt) = current_thread_rt("worker") else {
         return;
@@ -436,6 +440,7 @@ fn worker_thread(
             started,
             fabric,
             cache,
+            scripts,
             inflight: Cell::new(0),
             prefer_shared: Cell::new(false),
         });

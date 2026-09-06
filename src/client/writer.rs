@@ -13,6 +13,7 @@ use super::link::{Fill, InFlight, InflightRing, WriterLink, mark_closed};
 use super::pipe::{parse_redirect, pipe_for, queue_on};
 use super::pubsub::PUBSUB_PUSH_WINDOW;
 use super::queue::ReplyQueue;
+use super::scripting::evalsha_target;
 use super::{ERR_TRYAGAIN, Reply, Shared};
 use crate::backend::{ASKING_FRAME, BATCH, ERR_BACKEND_LOST, write_frames};
 use crate::resp;
@@ -186,6 +187,32 @@ pub(super) async fn write_loop(
                         }
                         // clients believe the proxy owns every slot: never leak redirects
                         frame = Bytes::from_static(ERR_TRYAGAIN);
+                    } else if frame.starts_with(b"-NOSCRIPT")
+                        && let Some((req, base_expect, fill)) = take_retry(&link, seq, false)
+                    {
+                        if let Some(fill) = fill
+                            && let Some(cache) = &shared.cache
+                        {
+                            fill.abandon(cache);
+                        }
+                        let topo = shared.topo.load_full();
+                        let reload = shared
+                            .scripts
+                            .load_frame(&req)
+                            .and_then(|load| Some((load, evalsha_target(&topo, &req)?)));
+                        if let Some((load, target)) = reload {
+                            let pipe =
+                                pipe_for(&shared, target, client_id, false, link.sharded.get());
+                            match queue_on(&pipe, &reply_q, seq, Some(load), req, base_expect + 1) {
+                                Ok(Some(cold)) => cold.flush().await,
+                                Ok(None) => {}
+                                Err(()) => {
+                                    let _ = reply_q
+                                        .send(Reply::At(seq, Bytes::from_static(ERR_BACKEND_LOST)));
+                                }
+                            }
+                            continue;
+                        }
                     } else if frame.starts_with(b"-TRYAGAIN")
                         && let Some((req, fill)) = take_degrade(&link, seq)
                     {

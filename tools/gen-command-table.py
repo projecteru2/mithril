@@ -28,6 +28,7 @@ KIND = {
     **{n: "Subscribe" for n in ["subscribe", "psubscribe", "unsubscribe", "punsubscribe"]},
     **{n: "AnyMaster" for n in ["publish", "pubsub", "randomkey"]},
     "scan": "Scan", "dbsize": "Dbsize", "flushall": "Flushall", "exec": "Exec",
+    "script": "Script", "function": "Script",
     **{n: "Local" for n in ["acl", "auth", "client", "cluster", "command", "config", "discard", "echo",
                             "hello", "info", "multi", "ping", "quit", "reset", "select", "time"]},
 }
@@ -41,9 +42,9 @@ SCAN_FROM = {"xread": 1, "xreadgroup": 4, "sort": 2, "georadius": 6, "georadiusb
 
 SKIP = {
     "asking", "bgrewriteaof", "bgsave", "clusterscan", "commandlog", "debug", "failover", "flushdb",
-    "function", "keys", "lastsave", "latency", "lolwut", "memory", "migrate", "module", "monitor",
+    "keys", "lastsave", "latency", "lolwut", "memory", "migrate", "module", "monitor",
     "move", "pfdebug", "pfselftest", "psync", "readonly", "readwrite", "replconf", "replicaof",
-    "restore-asking", "role", "save", "script", "shutdown", "slaveof", "slowlog", "spublish",
+    "restore-asking", "role", "save", "shutdown", "slaveof", "slowlog", "spublish",
     "ssubscribe", "sunsubscribe", "swapdb", "sync", "unwatch", "wait", "waitaof", "watch",
     "ts.mget", "ts.mrange", "ts.mrevrange", "ts.queryindex",
 }

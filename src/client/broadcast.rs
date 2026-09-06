@@ -1,0 +1,92 @@
+//! Cluster-wide commands: one request to every master or every node, the replies folded into one.
+
+use bytes::Bytes;
+
+use super::pipe::{recv_or_lost, scatter_one};
+use super::session::Session;
+use super::{Reply, Shared};
+use crate::multikey;
+use crate::resp;
+
+/// Which nodes a broadcast reaches.
+#[derive(Clone, Copy)]
+pub(super) enum Targets {
+    Masters,
+    AllNodes,
+}
+
+/// How the replies of a broadcast fold into one.
+#[derive(Clone, Copy)]
+pub(super) enum Gather {
+    Sum,
+    Ok,
+    Same,
+    Every,
+}
+
+/// What a successful broadcast leaves behind in the proxy.
+pub(super) enum Effect {
+    RememberScript(Bytes),
+    ForgetScripts,
+}
+
+impl Effect {
+    fn apply(self, shared: &Shared, reply: &Bytes) {
+        match self {
+            Effect::RememberScript(body) => {
+                if let Some(sha) = resp::bulk_payload(reply) {
+                    shared.scripts.remember(sha, body);
+                }
+            }
+            Effect::ForgetScripts => shared.scripts.forget_all(),
+        }
+    }
+}
+
+impl Session {
+    pub(super) async fn run_broadcast(
+        &self,
+        frame: Bytes,
+        targets: Targets,
+        gather: Gather,
+        effect: Option<Effect>,
+    ) {
+        let seq = self.alloc_seq();
+        let shared = self.shared.clone();
+        let reply_q = self.reply_q.clone();
+        let topo = shared.topo.load_full();
+        let sharded = self.link.sharded.get();
+        let all;
+        let nodes: &[u16] = match targets {
+            Targets::Masters => &topo.masters,
+            Targets::AllNodes => {
+                all = (0..topo.nodes.len() as u16)
+                    .filter(|&i| !topo.nodes[i as usize].fail)
+                    .collect::<Vec<_>>();
+                &all
+            }
+        };
+        let mut receivers = Vec::with_capacity(nodes.len());
+        for &i in nodes {
+            let addr = &topo.nodes[i as usize].addr;
+            receivers.push(scatter_one(&shared, addr, self.id, sharded, None, frame.clone()).await);
+        }
+        // detached deliberately: completion is bounded by backend replies
+        tokio::task::spawn_local(async move {
+            let mut replies: Vec<Bytes> = Vec::with_capacity(receivers.len());
+            for rx in receivers {
+                replies.push(recv_or_lost(rx).await);
+            }
+            let merged = match gather {
+                Gather::Sum => multikey::merge_sum(replies.iter(), 0),
+                Gather::Ok => multikey::merge_ok(replies.iter()),
+                Gather::Same => multikey::merge_same(replies.iter()),
+                Gather::Every => multikey::merge_every(replies.iter()),
+            };
+            if let (Ok(reply), Some(effect)) = (&merged, effect) {
+                effect.apply(&shared, reply);
+            }
+            let _ = reply_q.send(Reply::At(seq, merged.unwrap_or_else(|e| e)));
+        });
+    }
+}

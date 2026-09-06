@@ -253,31 +253,6 @@ impl Session {
         });
     }
 
-    pub(super) async fn run_broadcast(&self, frame: Bytes, merge: Merge) {
-        let seq = self.alloc_seq();
-        let shared = self.shared.clone();
-        let reply_q = self.reply_q.clone();
-        let topo = shared.topo.load_full();
-        let sharded = self.link.sharded.get();
-        let mut receivers = Vec::with_capacity(topo.masters.len());
-        for &midx in &topo.masters {
-            let addr = &topo.nodes[midx as usize].addr;
-            receivers.push(scatter_one(&shared, addr, self.id, sharded, None, frame.clone()).await);
-        }
-        // detached deliberately: completion is bounded by backend replies
-        tokio::task::spawn_local(async move {
-            let mut replies: Vec<Bytes> = Vec::with_capacity(receivers.len());
-            for rx in receivers {
-                replies.push(recv_or_lost(rx).await);
-            }
-            let merged = match merge {
-                Merge::Sum => multikey::merge_sum(replies.iter(), 0),
-                _ => multikey::merge_ok(replies.iter()),
-            };
-            let _ = reply_q.send(Reply::At(seq, merged.unwrap_or_else(|e| e)));
-        });
-    }
-
     async fn fan_out_resume(
         &self,
         plan: FanoutPlan,

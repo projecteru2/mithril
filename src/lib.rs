@@ -22,6 +22,7 @@ pub(crate) mod log;
 pub(crate) mod multikey;
 pub(crate) mod resp;
 pub(crate) mod route;
+pub(crate) mod script;
 pub(crate) mod shard;
 pub(crate) mod stats;
 pub(crate) mod topology;

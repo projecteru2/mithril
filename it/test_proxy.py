@@ -900,3 +900,44 @@ def test_numkeys_write_invalidates_cached_string(cache_proxy, cluster_direct, ke
     assert r.zunionstore(k, [z]) == 1
     with pytest.raises(redis.ResponseError):
         r.get(k)
+
+
+def test_script_management_through_proxy(r, cluster_direct, key_prefix):
+    key = f"{key_prefix}:script"
+    sha = r.script_load("return redis.call('set', KEYS[1], ARGV[1])")
+    assert r.script_exists(sha) == [True]
+    assert r.evalsha(sha, 1, key, "v1") == "OK"
+    cluster_direct.script_flush()
+    assert r.evalsha(sha, 1, key, "v2") == "OK"
+    assert r.get(key) == "v2"
+    assert r.script_flush()
+    assert r.script_exists(sha) == [False]
+    with pytest.raises(redis.exceptions.NoScriptError):
+        r.evalsha(sha, 1, key, "v3")
+    with pytest.raises(redis.exceptions.ResponseError):
+        r.execute_command("SCRIPT", "KILL")
+
+
+def test_register_script_round_trips(r, key_prefix):
+    key = f"{key_prefix}:reg"
+    script = r.register_script("return redis.call('incr', KEYS[1])")
+    assert script(keys=[key]) == 1
+    assert script(keys=[key]) == 2
+
+
+def test_functions_through_proxy(r, cluster_direct, key_prefix):
+    _needs(cluster_direct, (7, 0))
+    lib = f"lib{key_prefix[2:10]}"
+    code = (
+        f"#!lua name={lib}\n"
+        f"redis.register_function('{lib}_set', function(keys, args) "
+        "return redis.call('set', keys[1], args[1]) end)"
+    )
+    assert r.function_load(code, replace=True) == lib
+    key = f"{key_prefix}:fn"
+    assert r.fcall(f"{lib}_set", 1, key, "v") == "OK"
+    assert r.get(key) == "v"
+    assert lib in str(r.execute_command("FUNCTION", "LIST", "LIBRARYNAME", lib))
+    assert r.function_delete(lib)
+    with pytest.raises(redis.ResponseError):
+        r.fcall(f"{lib}_set", 1, key, "v")
