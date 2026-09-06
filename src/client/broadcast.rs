@@ -26,19 +26,18 @@ pub(super) enum Gather {
 
 /// What a successful broadcast leaves behind in the proxy.
 pub(super) enum Effect {
-    RememberScript(Bytes),
-    ForgetScripts,
+    /// The body a SCRIPT LOAD carried, and the flush count when it was dispatched.
+    RememberScript(Bytes, u64),
 }
 
 impl Effect {
     fn apply(self, shared: &Shared, reply: &Bytes) {
         match self {
-            Effect::RememberScript(body) => {
+            Effect::RememberScript(body, flushes) => {
                 if let Some(sha) = resp::bulk_payload(reply) {
-                    shared.scripts.remember(sha, body);
+                    shared.scripts.remember(sha, body, flushes);
                 }
             }
-            Effect::ForgetScripts => shared.scripts.forget_all(),
         }
     }
 }

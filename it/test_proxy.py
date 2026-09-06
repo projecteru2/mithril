@@ -910,10 +910,24 @@ def test_script_management_through_proxy(r, cluster_direct, key_prefix):
     cluster_direct.script_flush()
     assert r.evalsha(sha, 1, key, "v2") == "OK"
     assert r.get(key) == "v2"
-    assert r.script_flush()
+    cluster_direct.script_flush()
+    pipe = r.pipeline(transaction=False)
+    pipe.evalsha(sha, 1, key, "v3")
+    pipe.set(key, "v4")
+    first, second = pipe.execute(raise_on_error=False)
+    assert isinstance(first, redis.exceptions.NoScriptError) and second is True
+    assert r.get(key) == "v4"
+    assert r.evalsha(sha, 1, key, "v5") == "OK"
+    pipe = r.pipeline(transaction=False)
+    pipe.script_flush()
+    pipe.evalsha(sha, 1, key, "v6")
+    flushed, rerun = pipe.execute(raise_on_error=False)
+    assert flushed is True and isinstance(rerun, redis.exceptions.NoScriptError)
+    assert r.get(key) == "v5"
     assert r.script_exists(sha) == [False]
     with pytest.raises(redis.exceptions.NoScriptError):
-        r.evalsha(sha, 1, key, "v3")
+        r.evalsha(sha, 1, key, "v7")
+    assert any("SCRIPT" in line for line in r.execute_command("SCRIPT", "HELP"))
     with pytest.raises(redis.exceptions.ResponseError):
         r.execute_command("SCRIPT", "KILL")
 
@@ -938,6 +952,7 @@ def test_functions_through_proxy(r, cluster_direct, key_prefix):
     assert r.fcall(f"{lib}_set", 1, key, "v") == "OK"
     assert r.get(key) == "v"
     assert lib in str(r.execute_command("FUNCTION", "LIST", "LIBRARYNAME", lib))
+    assert any("FUNCTION" in line for line in r.execute_command("FUNCTION", "HELP"))
     assert r.function_delete(lib)
     with pytest.raises(redis.ResponseError):
         r.fcall(f"{lib}_set", 1, key, "v")

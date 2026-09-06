@@ -26,9 +26,13 @@ memtier_benchmark, redis-benchmark.
 - Pubsub delivery to a slow subscriber is windowed (4096 pushes).
 - Config hot-reload covers `loglevel` only; CONFIG SET rejects every other
   parameter.
-- SCRIPT KILL, SCRIPT DEBUG and FUNCTION KILL are not proxied; a script the
-  proxy did not load itself is not reloaded on `NOSCRIPT` (the client's own
-  EVAL fallback still applies).
+- SCRIPT KILL, SCRIPT DEBUG and FUNCTION KILL are not proxied. The
+  transparent reload on `NOSCRIPT` covers scripts the proxy loaded itself,
+  and only while nothing later from the same session is in flight (a
+  pipelined EVALSHA, or one that was already redirected, gets the
+  `NOSCRIPT` and the client's own EVAL fallback applies). FUNCTION
+  commands reach the masters that own slots; a node needs its libraries
+  loaded before slots move to it, as with any client.
 - Shard pubsub (SSUBSCRIBE/SPUBLISH/SUNSUBSCRIBE) is not implemented.
 - Blocking commands (BLPOP, BRPOP, BRPOPLPUSH, BLMOVE, BLMPOP, BZPOPMAX,
   BZPOPMIN, BZMPOP, blocking XREAD) always run on the slot's master and

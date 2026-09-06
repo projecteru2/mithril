@@ -24,22 +24,24 @@ impl Session {
                     self.emit_error("ERR wrong number of arguments for 'script|load' command");
                     return;
                 };
-                let body = Bytes::copy_from_slice(body);
-                (
-                    Targets::AllNodes,
-                    Gather::Same,
-                    Some(Effect::RememberScript(body)),
-                )
+                let effect =
+                    Effect::RememberScript(frame.slice_ref(body), self.shared.scripts.flushes());
+                (Targets::AllNodes, Gather::Same, Some(effect))
             }
             "script" if is(b"exists") => (Targets::Masters, Gather::Every, None),
             "script" if is(b"flush") => {
-                (Targets::AllNodes, Gather::Ok, Some(Effect::ForgetScripts))
+                // forgotten at dispatch: a pipelined EVALSHA behind the flush must not reload
+                self.shared.scripts.forget_all();
+                (Targets::AllNodes, Gather::Ok, None)
+            }
+            "script" if is(b"help") || is(b"show") => {
+                return self.forward_any_master(frame).await;
             }
             "function" if is(b"load") => (Targets::Masters, Gather::Same, None),
             "function" if is(b"delete") || is(b"flush") || is(b"restore") => {
                 (Targets::Masters, Gather::Ok, None)
             }
-            "function" if is(b"list") || is(b"dump") || is(b"stats") => {
+            "function" if is(b"list") || is(b"dump") || is(b"stats") || is(b"help") => {
                 return self.forward_any_master(frame).await;
             }
             _ => {

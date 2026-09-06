@@ -19,6 +19,9 @@ use crate::backend::{ASKING_FRAME, BATCH, ERR_BACKEND_LOST, write_frames};
 use crate::resp;
 use crate::stats;
 
+// the servers' own sentence; a script that returns a NOSCRIPT error of its own passes through
+const NOSCRIPT: &[u8] = b"-NOSCRIPT No matching script";
+
 // out-of-order replies by sequence distance; the back slot is always Some
 #[derive(Default)]
 struct ParkedRing {
@@ -187,7 +190,9 @@ pub(super) async fn write_loop(
                         }
                         // clients believe the proxy owns every slot: never leak redirects
                         frame = Bytes::from_static(ERR_TRYAGAIN);
-                    } else if frame.starts_with(b"-NOSCRIPT")
+                    } else if frame.starts_with(NOSCRIPT)
+                        // a later command already holds a sequence: a rerun would land out of order
+                        && seq + 1 == link.next_seq.get()
                         && let Some((req, base_expect, fill)) = take_retry(&link, seq, false)
                     {
                         if let Some(fill) = fill
