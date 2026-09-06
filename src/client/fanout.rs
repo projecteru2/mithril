@@ -276,7 +276,7 @@ impl Session {
         {
             return Planned::Single(slot);
         }
-        let nkeys = key_indices(spec, argc).len();
+        let nkeys = spec.key_range(argc).len();
         let mut keys: Vec<&[u8]> = Vec::with_capacity(nkeys);
         let mut slots: Vec<u16> = Vec::with_capacity(nkeys);
         let mut values: Option<Vec<&[u8]>> = (spec.step == 2).then(|| Vec::with_capacity(nkeys));
@@ -528,7 +528,7 @@ pub(super) fn key_pairs<'a>(
     let mut args = resp::Args::new(frame, argc);
     let mut cur = 0;
     let paired = spec.step == 2;
-    key_indices(spec, argc).map_while(move |want| {
+    spec.key_range(argc).map_while(move |want| {
         let key = args.nth(want - cur)?;
         cur = want + 1;
         let value = if paired { args.next() } else { None };
@@ -598,25 +598,9 @@ pub(super) fn multikey_plan(frame: &Bytes) -> Option<DegradePlan> {
         spec,
         argc,
         merge,
-        nkeys: key_indices(spec, argc).len(),
+        nkeys: spec.key_range(argc).len(),
         slot,
     })
-}
-
-// argument indices holding keys, per the spec's first/last/step triple
-fn key_indices(spec: &Spec, argc: usize) -> impl ExactSizeIterator<Item = usize> {
-    let first = spec.first_key as usize;
-    let last = if spec.last_key < 0 {
-        (argc as i64 + i64::from(spec.last_key)).max(0) as usize
-    } else {
-        spec.last_key as usize
-    };
-    let end = if first == 0 {
-        0
-    } else {
-        last.min(argc.saturating_sub(1)) + 1
-    };
-    (first..end).step_by((spec.step as usize).max(1))
 }
 
 // the head a part is sent with; None for a part the cache already answered
@@ -685,10 +669,6 @@ fn merge_for(kind: Kind) -> Option<Merge> {
 mod tests {
     use super::*;
 
-    fn spec(name: &str) -> &'static Spec {
-        command::lookup(name.as_bytes()).unwrap()
-    }
-
     #[test]
     fn singles_fold_sums_and_oks_and_keep_mget_items() {
         let mut s = Singles::new(Merge::Sum);
@@ -723,19 +703,5 @@ mod tests {
         assert!(multikey_plan(&frame(&[b"GET", b"a"])).is_none());
         assert!(multikey_plan(&frame(&[b"PFCOUNT", b"a", b"b"])).is_none());
         assert!(multikey_plan(&frame(&[b"SINTER", b"a", b"b"])).is_none());
-    }
-
-    #[test]
-    fn key_indices_honor_first_last_step() {
-        let set: Vec<usize> = key_indices(spec("set"), 3).collect();
-        assert_eq!(set, vec![1]);
-        let mset: Vec<usize> = key_indices(spec("mset"), 5).collect();
-        assert_eq!(mset, vec![1, 3]);
-        let del: Vec<usize> = key_indices(spec("del"), 4).collect();
-        assert_eq!(del, vec![1, 2, 3]);
-        let rename: Vec<usize> = key_indices(spec("rename"), 3).collect();
-        assert_eq!(rename, vec![1, 2]);
-        let ping: Vec<usize> = key_indices(spec("ping"), 1).collect();
-        assert!(ping.is_empty());
     }
 }

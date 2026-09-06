@@ -22,6 +22,9 @@ use crate::stats;
 // the servers' own sentence; a script that returns a NOSCRIPT error of its own passes through
 const NOSCRIPT: &[u8] = b"-NOSCRIPT No matching script";
 
+// a request taken back from the ring: frame, replies still expected, its cache ticket
+type Retry = (Bytes, u32, Option<Fill>);
+
 // out-of-order replies by sequence distance; the back slot is always Some
 #[derive(Default)]
 struct ParkedRing {
@@ -67,6 +70,48 @@ impl ParkedRing {
 
     fn is_empty(&self) -> bool {
         self.slots.is_empty()
+    }
+}
+
+/// Where a request taken back from the ring goes next.
+struct Resend<'a> {
+    shared: &'a Rc<Shared>,
+    reply_q: &'a Rc<ReplyQueue>,
+    link: &'a WriterLink,
+    client_id: u64,
+}
+
+impl Resend<'_> {
+    // the retry carries no CACHING opt-in: it cannot fill; a lost shard answers the client
+    async fn requeue(
+        &self,
+        target: &str,
+        seq: u64,
+        head: Option<Bytes>,
+        (req, base_expect, fill): Retry,
+        extra: u32,
+    ) {
+        if let Some(fill) = fill
+            && let Some(cache) = &self.shared.cache
+        {
+            fill.abandon(cache);
+        }
+        let pipe = pipe_for(
+            self.shared,
+            target,
+            self.client_id,
+            false,
+            self.link.sharded.get(),
+        );
+        match queue_on(&pipe, self.reply_q, seq, head, req, base_expect + extra) {
+            Ok(Some(cold)) => cold.flush().await,
+            Ok(None) => {}
+            Err(()) => {
+                let _ = self
+                    .reply_q
+                    .send(Reply::At(seq, Bytes::from_static(ERR_BACKEND_LOST)));
+            }
+        }
     }
 }
 
@@ -165,27 +210,19 @@ pub(super) async fn write_loop(
                 }
                 if frame.first() == Some(&b'-') {
                     if let Some((ask, target)) = parse_redirect(&frame) {
-                        if let Some((req, base_expect, fill)) = take_retry(&link, seq, ask) {
+                        if let Some(retry) = take_retry(&link, seq, ask) {
                             stats::bump(&shared.wstats.redirects);
-                            // the retry carries no CACHING opt-in: it cannot fill
-                            if let Some(fill) = fill
-                                && let Some(cache) = &shared.cache
-                            {
-                                fill.abandon(cache);
-                            }
                             let _ = shared.refresh.send(());
                             let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
-                            let expect = base_expect + u32::from(ask);
-                            let pipe =
-                                pipe_for(&shared, target, client_id, false, link.sharded.get());
-                            match queue_on(&pipe, &reply_q, seq, head, req, expect) {
-                                Ok(Some(cold)) => cold.flush().await,
-                                Ok(None) => {}
-                                Err(()) => {
-                                    let _ = reply_q
-                                        .send(Reply::At(seq, Bytes::from_static(ERR_BACKEND_LOST)));
-                                }
-                            }
+                            let resend = Resend {
+                                shared: &shared,
+                                reply_q: &reply_q,
+                                link: &link,
+                                client_id,
+                            };
+                            resend
+                                .requeue(target, seq, head, retry, u32::from(ask))
+                                .await;
                             continue;
                         }
                         // clients believe the proxy owns every slot: never leak redirects
@@ -193,29 +230,21 @@ pub(super) async fn write_loop(
                     } else if frame.starts_with(NOSCRIPT)
                         // a later command already holds a sequence: a rerun would land out of order
                         && seq + 1 == link.next_seq.get()
-                        && let Some((req, base_expect, fill)) = take_retry(&link, seq, false)
+                        && let Some(retry) = take_retry(&link, seq, false)
                     {
-                        if let Some(fill) = fill
-                            && let Some(cache) = &shared.cache
-                        {
-                            fill.abandon(cache);
-                        }
                         let topo = shared.topo.load_full();
                         let reload = shared
                             .scripts
-                            .load_frame(&req)
-                            .and_then(|load| Some((load, evalsha_target(&topo, &req)?)));
+                            .load_frame(&retry.0)
+                            .and_then(|load| Some((load, evalsha_target(&topo, &retry.0)?)));
                         if let Some((load, target)) = reload {
-                            let pipe =
-                                pipe_for(&shared, target, client_id, false, link.sharded.get());
-                            match queue_on(&pipe, &reply_q, seq, Some(load), req, base_expect + 1) {
-                                Ok(Some(cold)) => cold.flush().await,
-                                Ok(None) => {}
-                                Err(()) => {
-                                    let _ = reply_q
-                                        .send(Reply::At(seq, Bytes::from_static(ERR_BACKEND_LOST)));
-                                }
-                            }
+                            let resend = Resend {
+                                shared: &shared,
+                                reply_q: &reply_q,
+                                link: &link,
+                                client_id,
+                            };
+                            resend.requeue(target, seq, Some(load), retry, 1).await;
                             continue;
                         }
                     } else if frame.starts_with(b"-TRYAGAIN")
@@ -373,7 +402,7 @@ fn take_fill(link: &WriterLink, seq: u64) -> Option<Fill> {
 }
 
 // retryable redirects: single-reply requests always, multi-reply blobs only for MOVED
-fn take_retry(link: &WriterLink, seq: u64, ask: bool) -> Option<(Bytes, u32, Option<Fill>)> {
+fn take_retry(link: &WriterLink, seq: u64, ask: bool) -> Option<Retry> {
     let mut entry = entry_at(&link.inflight, seq)?;
     if entry.retried || (entry.expect > 1 && ask) {
         return None;

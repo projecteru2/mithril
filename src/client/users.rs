@@ -74,8 +74,8 @@ impl Session {
         }
         let mut channels = resp::Args::new(frame, argc).skip(1);
         let denied = match spec.name {
-            "publish" | "spublish" => channels.take(1).find(|c| !user.may_use_channel(c)),
-            "subscribe" | "ssubscribe" => channels.find(|c| !user.may_use_channel(c)),
+            "publish" => channels.take(1).find(|c| !user.may_use_channel(c)),
+            "subscribe" => channels.find(|c| !user.may_use_channel(c)),
             "psubscribe" => channels.find(|c| !user.may_use_pattern(c)),
             _ => None,
         };

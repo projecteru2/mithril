@@ -224,32 +224,14 @@ impl User {
                         self.nopass = false;
                         self.passwords.push(sha256(arg));
                     }
-                    b'<' => {
-                        let hash = sha256(arg);
-                        let n = self.passwords.len();
-                        self.passwords.retain(|h| *h != hash);
-                        if self.passwords.len() == n {
-                            return Err(format!(
-                                "Error in ACL SETUSER modifier '{}': The password you are trying to remove from the user does not exist",
-                                lossy(rule)
-                            ));
-                        }
-                    }
+                    b'<' => self.drop_password(sha256(arg), rule)?,
                     b'#' => {
                         self.nopass = false;
                         self.passwords
                             .push(parse_hash(arg).ok_or_else(|| bad_hash(rule))?);
                     }
                     b'!' => {
-                        let hash = parse_hash(arg).ok_or_else(|| bad_hash(rule))?;
-                        let n = self.passwords.len();
-                        self.passwords.retain(|h| *h != hash);
-                        if self.passwords.len() == n {
-                            return Err(format!(
-                                "Error in ACL SETUSER modifier '{}': The password you are trying to remove from the user does not exist",
-                                lossy(rule)
-                            ));
-                        }
+                        self.drop_password(parse_hash(arg).ok_or_else(|| bad_hash(rule))?, rule)?
                     }
                     b'~' => add_pattern(&mut self.keys, arg, "allkeys", "resetkeys", "patterns")
                         .map_err(|e| {
@@ -310,6 +292,18 @@ impl User {
                 self.set(spec.subcommand(sub).ok_or_else(unknown)?.id, allow);
                 self.sync_container(spec);
             }
+        }
+        Ok(())
+    }
+
+    fn drop_password(&mut self, hash: [u8; 32], rule: &[u8]) -> Result<(), String> {
+        let n = self.passwords.len();
+        self.passwords.retain(|h| *h != hash);
+        if self.passwords.len() == n {
+            return Err(format!(
+                "Error in ACL SETUSER modifier '{}': The password you are trying to remove from the user does not exist",
+                lossy(rule)
+            ));
         }
         Ok(())
     }

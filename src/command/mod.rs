@@ -135,8 +135,8 @@ impl Spec {
         args.next()
     }
 
-    /// Every key of a request, from arguments positioned after the name.
-    pub fn keys<'a, I: Iterator<Item = &'a [u8]>>(&self, args: I, argc: usize) -> Keys<'a, I> {
+    /// Argument indices of the declared key range for a request of `argc` arguments.
+    pub fn key_range(&self, argc: usize) -> std::iter::StepBy<std::ops::Range<usize>> {
         let first = self.first_key as usize;
         let last = if self.last_key < 0 {
             (argc as i64 + i64::from(self.last_key)).max(0) as usize
@@ -148,10 +148,15 @@ impl Spec {
         } else {
             last.min(argc.saturating_sub(1)) + 1
         };
+        (first..end).step_by((self.step as usize).max(1))
+    }
+
+    /// Every key of a request, from arguments positioned after the name.
+    pub fn keys<'a, I: Iterator<Item = &'a [u8]>>(&self, args: I, argc: usize) -> Keys<'a, I> {
         Keys {
             args,
             cur: 1,
-            range: (first..end).step_by((self.step as usize).max(1)),
+            range: self.key_range(argc),
             numkeys: self.numkeys as usize,
             step: (self.step as usize).max(1),
             block: None,
@@ -305,7 +310,6 @@ const fn build_lut() -> [u16; LUT_LEN] {
     lut
 }
 
-// the fold covers only the bytes a name has, so short names keep zero padding
 // the first half of what follows STREAMS, out of `count` arguments
 fn stream_keys<'a>(
     args: impl Iterator<Item = &'a [u8]>,
@@ -344,6 +348,7 @@ fn store_targets<'a>(mut args: impl Iterator<Item = &'a [u8]>) -> impl Iterator<
     })
 }
 
+// the fold covers only the bytes a name has, so short names keep zero padding
 const fn folded_prefix(name: &[u8]) -> u64 {
     let used = if name.len() < PREFIX_LEN {
         name.len()
@@ -488,6 +493,18 @@ mod tests {
         assert!(set.arity_ok(3));
         assert!(set.arity_ok(5));
         assert!(!set.arity_ok(2));
+    }
+
+    #[test]
+    fn key_range_honors_first_last_step() {
+        let range = |name: &str, argc: usize| -> Vec<usize> {
+            lookup(name.as_bytes()).unwrap().key_range(argc).collect()
+        };
+        assert_eq!(range("set", 3), [1]);
+        assert_eq!(range("mset", 5), [1, 3]);
+        assert_eq!(range("del", 4), [1, 2, 3]);
+        assert_eq!(range("rename", 3), [1, 2]);
+        assert!(range("ping", 1).is_empty());
     }
 
     #[test]
