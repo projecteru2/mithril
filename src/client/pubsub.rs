@@ -33,6 +33,11 @@ pub(super) struct PubsubSim {
 }
 
 impl PubsubSim {
+    /// Subscribed channels and patterns, as CLIENT INFO counts them.
+    pub(super) fn counts(&self) -> (usize, usize) {
+        (self.channels.len(), self.patterns.len())
+    }
+
     fn apply(&mut self, spec: &Spec, frame: &Bytes, argc: usize) {
         let target = match spec.name {
             "psubscribe" | "punsubscribe" => &mut self.patterns,

@@ -37,7 +37,9 @@
   restricted user is checked before dispatch: the command or its allowed
   subcommand, every key the request touches (the same walker the reply
   cache and MULTI use), and the channels of PUBLISH/SUBSCRIBE/PSUBSCRIBE.
-  A denial answers NOPERM, aborts an open MULTI and lands in ACL LOG. Rule
+  AUTH, HELLO, QUIT and RESET are never subject to rules (as in Redis), so
+  a restricted session can switch users with valid credentials. A denial
+  answers NOPERM, aborts an open MULTI and lands in ACL LOG. Rule
   changes reach connected sessions at their next command; a deleted user's
   sessions close.
 - `reply-cache yes` serves GET and MGET (up to 64 keys) from a worker-local cache. Coherence: every

@@ -288,9 +288,9 @@ impl Session {
             self.closing.set(true);
             return;
         }
-        // an unauthenticated session only reaches no-auth commands: AUTH and HELLO must always get through
-        if self.authed.get()
-            && !self.unrestricted.get()
+        // AUTH, HELLO, QUIT and RESET are never subject to rules, as in Redis
+        if !self.unrestricted.get()
+            && spec.flags & command::FLAG_NO_AUTH == 0
             && let Some(err) = self.acl_denies(spec, &frame, argc)
         {
             self.abort_multi();

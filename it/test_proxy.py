@@ -1024,6 +1024,9 @@ def test_acl_restricted_user_is_enforced(r, new_conn, key_prefix):
     assert {e[7] for e in log} >= {"del", "other:key", "sports", "acl"}
     assert {e[9] for e in log} == {name}
     assert "multi" in {e[5] for e in log}
+    parsed = r.acl_log()
+    assert parsed[0]["client-info"]["db"] == 0 and parsed[0]["client-info"]["user"] == name
+    assert c.execute_command("AUTH", name, "pw")
     assert len(r.execute_command("ACL", "LOG", "2")) == 2
     assert r.execute_command("ACL", "LOG", "RESET") == "OK"
     assert r.execute_command("ACL", "LOG") == []

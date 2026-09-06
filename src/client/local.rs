@@ -17,6 +17,12 @@ pub(super) struct MultiState {
     aborted: bool,
 }
 
+impl MultiState {
+    pub(super) fn queued(&self) -> usize {
+        self.frames.len()
+    }
+}
+
 impl Session {
     pub(super) fn queue_multi(&self, spec: &Spec, frame: Bytes, argc: usize) {
         let queueable = matches!(

@@ -27,7 +27,7 @@ impl Session {
                 true
             }
             _ => {
-                self.deny("auth", b"AUTH", Some(name));
+                self.deny("auth", "auth", b"AUTH", Some(name));
                 false
             }
         }
@@ -59,7 +59,7 @@ impl Session {
         let sub = resp::Args::new(frame, argc).nth(1);
         if !user.may_run(spec, sub) {
             drop(user);
-            self.deny("command", spec.name.as_bytes(), None);
+            self.deny("command", spec.name, spec.name.as_bytes(), None);
             return Some(error_frame(&format!(
                 "NOPERM this user has no permissions to run the '{}' command",
                 spec.name
@@ -68,7 +68,7 @@ impl Session {
         for key in spec.all_keys(resp::Args::new(frame, argc).skip(1), argc) {
             if !user.may_touch(key) {
                 drop(user);
-                self.deny("key", key, None);
+                self.deny("key", spec.name, key, None);
                 return Some(Bytes::from_static(ERR_NOPERM_KEY));
             }
         }
@@ -81,19 +81,38 @@ impl Session {
         };
         if let Some(channel) = denied {
             drop(user);
-            self.deny("channel", channel, None);
+            self.deny("channel", spec.name, channel, None);
             return Some(Bytes::from_static(ERR_NOPERM_CHANNEL));
         }
         None
     }
 
-    fn deny(&self, reason: &'static str, object: &[u8], username: Option<&[u8]>) {
+    fn deny(&self, reason: &'static str, cmd: &str, object: &[u8], username: Option<&[u8]>) {
         let clip = |v: &[u8]| {
             Box::from(String::from_utf8_lossy(&v[..v.len().min(LOG_FIELD_MAX)]).as_ref())
         };
         let username = match username {
             Some(name) => clip(name),
             None => clip(self.user.borrow().name.as_bytes()),
+        };
+        let (subs, patterns) = self.subs.borrow().counts();
+        let queued = self
+            .multi
+            .borrow()
+            .as_ref()
+            .map_or(-1, |m| m.queued() as i64);
+        let client = {
+            let registry = self.shared.stats.registry();
+            let info = registry.get(&self.id);
+            format!(
+                "id={} addr={} fd={} name={} age={} idle=0 flags=N db=0 sub={subs} psub={patterns} ssub=0 multi={queued} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={cmd} user={username} redir=-1 resp={}",
+                self.id,
+                info.map_or(String::new(), |i| i.addr.to_string()),
+                info.map_or(-1, |i| i.fd),
+                info.map_or("", |i| &i.name),
+                info.map_or(0, |i| i.since.elapsed().as_secs()),
+                self.proto.get(),
+            )
         };
         self.shared.acl.log_denial(LogEntry {
             reason,
@@ -104,7 +123,7 @@ impl Session {
             },
             object: clip(object),
             username,
-            client: Box::from(format!("id={}", self.id).as_str()),
+            client: Box::from(client.as_str()),
             at: Instant::now(),
         });
     }
