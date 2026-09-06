@@ -1,6 +1,6 @@
 # Compatibility
 
-The 48-test integration suite runs against each backend, in every mode
+The 58-test integration suite runs against each backend, in every mode
 combination (`backend-sharding`, `reply-cache`), with full cluster
 teardown/recreate between versions; it includes a live slot migration
 (CLUSTER SETSLOT MIGRATING/IMPORTING + MIGRATE) under multi-key commands:
@@ -26,12 +26,12 @@ memtier_benchmark, redis-benchmark.
 - Pubsub delivery to a slow subscriber is windowed (4096 pushes).
 - Config hot-reload covers `loglevel` only; CONFIG SET rejects every other
   parameter.
-- Scripting is bare EVAL only: EVALSHA, SCRIPT, FUNCTION and FCALL are not
-  implemented.
+- Scripts route (EVAL, EVALSHA, FCALL and the _RO forms) but SCRIPT and
+  FUNCTION management is not proxied: load scripts on the nodes, or let the
+  client reload on `NOSCRIPT`.
 - Shard pubsub (SSUBSCRIBE/SPUBLISH/SUNSUBSCRIBE) is not implemented.
-- Blocking commands are the five classic ones (BLPOP, BRPOP, BRPOPLPUSH,
-  BZPOPMAX, BZPOPMIN) plus blocking XREAD; BLMOVE, BLMPOP and BZMPOP are
-  not implemented. Blocking commands always run on the slot's master and
+- Blocking commands (BLPOP, BRPOP, BRPOPLPUSH, BLMOVE, BLMPOP, BZPOPMAX,
+  BZPOPMIN, BZMPOP, blocking XREAD) always run on the slot's master and
   never use replica routing.
 - FLUSHDB and cluster-wide KEYS are not implemented; RANDOMKEY samples one
   random master's keyspace, not the whole cluster.

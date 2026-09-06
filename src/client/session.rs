@@ -75,11 +75,6 @@ impl Session {
         self.topo_cache.borrow()
     }
 
-    pub(super) fn key_slot(&self, frame: &Bytes, argc: usize, key_index: usize) -> Option<u16> {
-        let mut it = resp::Args::new(frame, argc);
-        it.nth(key_index).map(crc16::slot)
-    }
-
     // one borrow and index per request once warm; re-resolves on epoch or death
     pub(super) fn cached_pipe(
         &self,
@@ -320,7 +315,7 @@ impl Session {
         }
         match spec.kind {
             Kind::Single => {
-                let Some(key) = it.nth(spec.first_key as usize - 1) else {
+                let Some(key) = spec.first_key(&mut it) else {
                     self.emit_error("ERR missing key");
                     return;
                 };

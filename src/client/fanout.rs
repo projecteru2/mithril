@@ -10,7 +10,7 @@ use super::local::collect_args;
 use super::pipe::{
     ColdSend, Pipe, Staged, parse_redirect, recv_or_lost, scatter_one, scatter_pipe, stage_one,
 };
-use super::session::{Session, eval_numkeys};
+use super::session::Session;
 use super::{Cold, ERR_NO_OWNER, Reply, Shared, error_frame};
 use crate::backend::{ASKING_FRAME, BATCH, ERR_BACKEND_LOST};
 use crate::cache::{CACHING_FRAME, ReplyCache};
@@ -541,25 +541,12 @@ impl Session {
 
 // keys a write mutates: the declared range, STORE destinations, script keys
 pub(super) fn write_keys(spec: &Spec, frame: &Bytes, argc: usize, mut f: impl FnMut(&[u8])) {
-    let mut args = resp::Args::new(frame, argc);
-    if spec.kind == Kind::Eval {
-        let numkeys = eval_numkeys(&mut args).map_or(0, |n| n.max(0) as usize);
-        for key in args.take(numkeys) {
-            f(key);
-        }
-        return;
-    }
-    let mut cur = 0;
-    for want in key_indices(spec, argc) {
-        let Some(key) = args.nth(want - cur) else {
-            return;
-        };
+    for key in spec.keys(resp::Args::new(frame, argc).skip(1), argc) {
         f(key);
-        cur = want + 1;
     }
     if spec.flags & command::FLAG_STORE != 0 {
         let mut dest_next = false;
-        for a in args {
+        for a in resp::Args::new(frame, argc).skip(2) {
             if dest_next {
                 f(a);
             }
@@ -641,7 +628,7 @@ pub(super) fn multikey_plan(frame: &Bytes) -> Option<DegradePlan> {
     let mut args = resp::Args::new(frame, argc);
     let spec = command::lookup(args.next()?)?;
     let merge = merge_for(spec.kind).filter(|_| degradable(spec))?;
-    let slot = crc16::slot(args.nth(spec.first_key as usize - 1)?);
+    let slot = crc16::slot(spec.first_key(&mut args)?);
     Some(DegradePlan {
         spec,
         argc,

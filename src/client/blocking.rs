@@ -32,7 +32,8 @@ impl Session {
         frame: Bytes,
         argc: usize,
     ) -> Option<Cold<'_>> {
-        let Some(slot) = self.key_slot(&frame, argc, spec.first_key as usize) else {
+        let mut args = resp::Args::new(&frame, argc).skip(1);
+        let Some(slot) = spec.first_key(&mut args).map(crc16::slot) else {
             self.emit_error("ERR missing key");
             return None;
         };

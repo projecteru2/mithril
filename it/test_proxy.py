@@ -669,3 +669,159 @@ def test_cache_mget_converges_after_external_write(cache_proxy, cluster_direct, 
     while r.mget(a, b) != ["x", "2"] and time.time() < deadline:
         time.sleep(0.05)
     assert r.mget(a, b) == ["x", "2"]
+
+
+def _server(cluster_direct):
+    info = cluster_direct.info("server")
+    info = next(iter(info.values())) if isinstance(info, dict) and "redis_version" not in info else info
+    if "valkey_version" in info:
+        return "valkey", tuple(int(x) for x in info["valkey_version"].split(".")[:2])
+    return "redis", tuple(int(x) for x in info["redis_version"].split(".")[:2])
+
+
+def _needs(cluster_direct, redis_min, valkey_min=(9, 0)):
+    name, ver = _server(cluster_direct)
+    floor = valkey_min if name == "valkey" else redis_min
+    if ver < floor:
+        pytest.skip(f"{name} {ver} lacks these commands")
+
+
+def test_list_and_zset_numkeys_commands(r, cluster_direct, key_prefix):
+    _needs(cluster_direct, (7, 0))
+    l1, l2, z1, z2, dst = (f"{{{key_prefix}}}:{n}" for n in ("l1", "l2", "z1", "z2", "dst"))
+    r.rpush(l1, "a", "b", "c")
+    assert r.lmove(l1, l2, "LEFT", "RIGHT") == "a"
+    assert r.lmpop(2, l1, l2, direction="RIGHT", count=2) == [l1, ["c", "b"]]
+    assert r.lmpop(2, l1, l2, direction="LEFT") == [l2, ["a"]]
+    r.zadd(z1, {"x": 1, "y": 2})
+    r.zadd(z2, {"y": 5, "z": 9})
+    assert r.zmpop(2, [z1, z2], min=True) == [z1, [["x", "1"]]]
+    assert set(r.zrandmember(z2, 2)) == {"y", "z"}
+    assert r.zrangestore(dst, z2, 0, -1) == 2
+    assert r.zunion([z1, z2], aggregate="MAX", withscores=True) == [("y", 5.0), ("z", 9.0)]
+    assert r.zinter([z1, z2]) == ["y"]
+    assert r.zdiff([z2, z1]) == ["z"]
+    assert r.zintercard(2, [z1, z2]) == 1
+    assert r.zmscore(z2, ["y", "missing"]) == [5.0, None]
+    assert r.zunionstore(dst, {z1: 1, z2: 2}) == 2
+    assert cluster_direct.zcard(dst) == 2
+
+
+def test_hash_and_set_extensions(r, cluster_direct, key_prefix):
+    _needs(cluster_direct, (7, 0))
+    h, s1, s2 = (f"{{{key_prefix}}}:{n}" for n in ("h", "s1", "s2"))
+    r.hset(h, mapping={"f1": "1", "f2": "2", "f3": "3"})
+    assert set(r.hrandfield(h, 2)) <= {"f1", "f2", "f3"}
+    r.sadd(s1, "a", "b", "c")
+    r.sadd(s2, "b", "c", "d")
+    assert r.smismember(s1, ["a", "d"]) == [1, 0]
+    assert r.sintercard(2, [s1, s2]) == 2
+    assert r.sintercard(2, [s1, s2], limit=1) == 1
+
+
+def test_hash_field_expiration(r, cluster_direct, key_prefix):
+    _needs(cluster_direct, (7, 4), (9, 0))
+    h = f"{key_prefix}:hx"
+    r.hset(h, mapping={"f1": "1", "f2": "2"})
+    assert r.execute_command("HEXPIRE", h, 100, "FIELDS", 1, "f1") == [1]
+    ttl = r.execute_command("HTTL", h, "FIELDS", 2, "f1", "f2")
+    assert 0 < ttl[0] <= 100 and ttl[1] == -1
+    assert r.execute_command("HPERSIST", h, "FIELDS", 1, "f1") == [1]
+    assert cluster_direct.execute_command("HTTL", h, "FIELDS", 1, "f1") == [-1]
+
+
+def test_blocking_new_forms(r, new_conn, cluster_direct, key_prefix):
+    _needs(cluster_direct, (7, 0))
+    src, dst, z = (f"{{{key_prefix}}}:{n}" for n in ("bsrc", "bdst", "bz"))
+    assert r.blmpop(0.3, 1, src, direction="LEFT") is None
+    pusher = new_conn()
+
+    def push():
+        time.sleep(0.3)
+        pusher.rpush(src, "v1")
+        pusher.zadd(z, {"m": 1})
+
+    t = threading.Thread(target=push)
+    t.start()
+    try:
+        assert r.blmove(src, dst, 5, "LEFT", "RIGHT") == "v1"
+        assert r.bzmpop(5, 1, [z], min=True) == [z, [["m", "1"]]]
+    finally:
+        t.join()
+    assert cluster_direct.lrange(dst, 0, -1) == ["v1"]
+
+
+def test_geo_stream_and_string_extensions(r, cluster_direct, key_prefix):
+    _needs(cluster_direct, (7, 0))
+    g, gdst, st, a, b, hll1, hll2, hdst = (
+        f"{{{key_prefix}}}:{n}" for n in ("g", "gdst", "st", "a", "b", "hll1", "hll2", "hdst")
+    )
+    r.geoadd(g, (13.361389, 38.115556, "Palermo", 15.087269, 37.502669, "Catania"))
+    assert set(r.geosearch(g, longitude=15, latitude=37, radius=200, unit="km")) == {"Palermo", "Catania"}
+    assert r.geosearchstore(gdst, g, longitude=15, latitude=37, radius=100, unit="km") == 1
+    entry = r.xadd(st, {"k": "v"})
+    assert r.xgroup_create(st, "g1", id="0")
+    got = r.xreadgroup("g1", "c1", {st: ">"}, count=1)
+    assert got[0][1][0][0] == entry
+    assert r.xack(st, "g1", entry) == 1
+    assert r.xinfo_groups(st)[0]["name"] == "g1"
+    assert r.xautoclaim(st, "g1", "c2", 0)[0] == "0-0"
+    assert r.xtrim(st, maxlen=0) == 1
+    assert r.xlen(st) == 0
+    r.set(a, "ohmytext")
+    r.set(b, "mynewtext")
+    assert r.lcs(a, b) == "mytext"
+    assert r.set(a, "v", ex=100)
+    assert r.expiretime(a) > time.time()
+    r.pfadd(hll1, "x", "y")
+    r.pfadd(hll2, "y", "z")
+    assert r.pfmerge(hdst, hll1, hll2)
+    assert r.pfcount(hdst) == 3
+    assert r.dump(a) is not None
+    assert r.getex(a, persist=True) == "v"
+    assert cluster_direct.ttl(a) == -1
+
+
+def test_command_info_shape_and_getkeys(r, raw_socket):
+    s = raw_socket()
+    reader = _RespReader(s)
+    s.sendall(_resp_encode(["COMMAND", "INFO", "get", "set", "nosuchcmd"]))
+    get, set_, nope = reader.read_reply()
+    assert get == ["get", 2, ["readonly", "fast"], 1, 1, 1, ["@read", "@string", "@fast"]]
+    assert set_ == ["set", -3, ["write", "denyoom"], 1, 1, 1, ["@write", "@string", "@slow"]]
+    assert nope is None
+    for cmd, keys in [
+        (["mset", "k1", "v1", "k2", "v2"], ["k1", "k2"]),
+        (["lmpop", "2", "l1", "l2", "LEFT"], ["l1", "l2"]),
+        (["zunionstore", "d", "2", "z1", "z2"], ["d", "z1", "z2"]),
+        (["eval", "return 1", "0"], []),
+    ]:
+        s.sendall(_resp_encode(["COMMAND", "GETKEYS", *cmd]))
+        assert reader.read_reply() == keys
+    s.sendall(_resp_encode(["COMMAND", "GETKEYS", "nosuchcmd", "k"]))
+    with pytest.raises(redis.exceptions.ResponseError):
+        reader.read_reply()
+    assert r.command_count() == len(r.execute_command("COMMAND"))
+
+
+def test_evalsha_routes_and_reports_noscript(r, cluster_direct, key_prefix):
+    key = f"{key_prefix}:sha"
+    sha = cluster_direct.script_load("return redis.call('set', KEYS[1], ARGV[1])")
+    assert r.evalsha(sha, 1, key, "v") == "OK"
+    assert r.get(key) == "v"
+    assert r.eval("return redis.call('get', KEYS[1])", 1, key) == "v"
+    with pytest.raises(redis.exceptions.NoScriptError):
+        r.evalsha("0" * 40, 1, key)
+
+
+def test_numkeys_write_invalidates_cached_string(cache_proxy, cluster_direct, key_prefix):
+    r = cache_proxy
+    _needs(cluster_direct, (6, 2))
+    k, z = (f"{{{key_prefix}}}:{n}" for n in ("k", "z"))
+    assert r.set(k, "plain")
+    assert r.get(k) == "plain"
+    assert r.get(k) == "plain"
+    r.zadd(z, {"m": 1})
+    assert r.zunionstore(k, [z]) == 1
+    with pytest.raises(redis.ResponseError):
+        r.get(k)

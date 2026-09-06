@@ -129,6 +129,19 @@ pub fn command_reply(args: &[&[u8]], proto: u8) -> Vec<u8> {
                 None => out.extend_from_slice(resp::NIL_ARRAY),
             }
         }
+    } else if sub(b"getkeys") {
+        let argc = args.len() - 2;
+        match args.get(2).and_then(|name| crate::command::lookup(name)) {
+            Some(spec) if spec.arity_ok(argc) => {
+                let keys: Vec<&[u8]> = spec.keys(args[3..].iter().copied(), argc).collect();
+                resp::array_header(&mut out, keys.len());
+                for key in keys {
+                    resp::bulk(&mut out, key);
+                }
+            }
+            Some(_) => resp::write_error(&mut out, "ERR Invalid arguments specified for command"),
+            None => resp::write_error(&mut out, "ERR Invalid command specified"),
+        }
     } else {
         resp::write_error(&mut out, "ERR unknown COMMAND subcommand");
     }
@@ -289,26 +302,23 @@ fn node_id(announce: &str) -> String {
 }
 
 fn command_entry(out: &mut Vec<u8>, spec: &Spec) {
-    out.extend_from_slice(b"*6\r\n");
+    out.extend_from_slice(b"*7\r\n");
     resp::bulk(out, spec.name.as_bytes());
     resp::integer(out, i64::from(spec.arity));
-    let mut flags: Vec<&[u8]> = Vec::new();
-    if spec.is_write() {
-        flags.push(b"write");
-        flags.push(b"denyoom");
-    }
-    if spec.is_readonly() {
-        flags.push(b"readonly");
-    }
-    resp::array_header(out, flags.len());
-    for f in flags {
-        out.push(b'+');
-        out.extend_from_slice(f);
-        out.extend_from_slice(b"\r\n");
-    }
+    status_array(out, spec.info.count_ones() as usize, spec.info_names());
     resp::integer(out, i64::from(spec.first_key));
     resp::integer(out, i64::from(spec.last_key));
     resp::integer(out, i64::from(spec.step));
+    status_array(out, spec.cats.count_ones() as usize, spec.cat_names());
+}
+
+fn status_array(out: &mut Vec<u8>, len: usize, items: impl Iterator<Item = &'static str>) {
+    resp::array_header(out, len);
+    for item in items {
+        out.push(b'+');
+        out.extend_from_slice(item.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
 }
 
 fn shard_node(out: &mut Vec<u8>, cfg: &Config, proto: u8) {
