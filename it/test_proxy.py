@@ -928,6 +928,11 @@ def test_script_management_through_proxy(r, cluster_direct, key_prefix):
     with pytest.raises(redis.exceptions.NoScriptError):
         r.evalsha(sha, 1, key, "v7")
     assert any("SCRIPT" in line for line in r.execute_command("SCRIPT", "HELP"))
+    sha2 = r.script_load("return 2")
+    with pytest.raises(redis.exceptions.ResponseError):
+        r.execute_command("SCRIPT", "FLUSH", "BAD")
+    cluster_direct.script_flush()
+    assert r.evalsha(sha2, 0) == 2
     with pytest.raises(redis.exceptions.ResponseError):
         r.execute_command("SCRIPT", "KILL")
 

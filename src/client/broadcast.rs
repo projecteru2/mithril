@@ -12,6 +12,9 @@ use crate::resp;
 #[derive(Clone, Copy)]
 pub(super) enum Targets {
     Masters,
+    /// Every node not flagged failed; a node that comes back is served by the NOSCRIPT reload.
+    LiveNodes,
+    /// Every known node; an unreachable one makes the broadcast report its loss.
     AllNodes,
 }
 
@@ -58,9 +61,10 @@ impl Session {
         let all;
         let nodes: &[u16] = match targets {
             Targets::Masters => &topo.masters,
-            Targets::AllNodes => {
+            Targets::LiveNodes | Targets::AllNodes => {
+                let live_only = matches!(targets, Targets::LiveNodes);
                 all = (0..topo.nodes.len() as u16)
-                    .filter(|&i| !topo.nodes[i as usize].fail)
+                    .filter(|&i| !(live_only && topo.nodes[i as usize].fail))
                     .collect::<Vec<_>>();
                 &all
             }
