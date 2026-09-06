@@ -859,6 +859,40 @@ mod tests {
     }
 
     #[test]
+    fn config_user_lines_build_the_table() {
+        let cfg = Config {
+            users: vec![
+                "app on >pw ~app:* &* -@all +@read".to_string(),
+                "parked off nopass".to_string(),
+            ],
+            ..Config::default()
+        };
+        let acl = Acl::new(&cfg).unwrap();
+        let app = acl.user(b"app").unwrap();
+        assert!(app.accepts(b"pw") && app.may_touch(b"app:1") && !app.may_touch(b"x"));
+        assert!(app.may_run(command::lookup(b"get").unwrap(), None));
+        assert!(!app.may_run(command::lookup(b"set").unwrap(), None));
+        assert!(!acl.user(b"parked").unwrap().accepts(b"anything"));
+        let bad = Config {
+            users: vec!["bad +nosuchcommand".to_string()],
+            ..Config::default()
+        };
+        assert!(Acl::new(&bad).is_err());
+    }
+
+    #[test]
+    fn a_failing_rule_leaves_the_user_untouched() {
+        let acl = acl();
+        acl.set_user("u", &rules("on >pw ~a:*")).unwrap();
+        assert!(
+            acl.set_user("u", &rules("~b:* +nosuchcommand off"))
+                .is_err()
+        );
+        let user = acl.user(b"u").unwrap();
+        assert!(user.enabled && user.may_touch(b"a:1") && !user.may_touch(b"b:1"));
+    }
+
+    #[test]
     fn passwords_add_remove_and_validate() {
         let acl = acl();
         acl.set_user("p", &rules("on >654321")).unwrap();
