@@ -133,7 +133,7 @@ pub fn command_reply(args: &[&[u8]], proto: u8) -> Vec<u8> {
         let argc = args.len() - 2;
         match args.get(2).and_then(|name| crate::command::lookup(name)) {
             Some(spec) if spec.arity_ok(argc) => {
-                let keys: Vec<&[u8]> = spec.keys(args[3..].iter().copied(), argc).collect();
+                let keys: Vec<&[u8]> = spec.all_keys(args[3..].iter().copied(), argc).collect();
                 resp::array_header(&mut out, keys.len());
                 for key in keys {
                     resp::bulk(&mut out, key);
@@ -308,7 +308,14 @@ fn command_entry(out: &mut Vec<u8>, spec: &Spec) {
     status_array(out, spec.info.count_ones() as usize, spec.info_names());
     resp::integer(out, i64::from(spec.first_key));
     resp::integer(out, i64::from(spec.last_key));
-    resp::integer(out, i64::from(spec.step));
+    resp::integer(
+        out,
+        if spec.first_key == 0 {
+            0
+        } else {
+            i64::from(spec.step)
+        },
+    );
     status_array(out, spec.cats.count_ones() as usize, spec.cat_names());
 }
 

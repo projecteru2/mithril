@@ -316,7 +316,8 @@ impl Session {
         match spec.kind {
             Kind::Single => {
                 let Some(key) = spec.first_key(&mut it) else {
-                    self.emit_error("ERR missing key");
+                    // a container command without its key: the engine answers HELP or the arity error
+                    self.forward_any_master(frame).await;
                     return;
                 };
                 let at = span(&frame, key);

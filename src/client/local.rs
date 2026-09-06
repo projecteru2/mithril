@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 
-use super::fanout::{key_pairs, write_keys};
+use super::fanout::write_keys;
 use super::session::Session;
 use super::{Cold, ERR_CROSSSLOT, error_frame};
 use crate::command::{Kind, Spec};
@@ -32,8 +32,9 @@ impl Session {
             return;
         }
         let current = self.multi.borrow().as_ref().and_then(|s| s.slot);
-        let new_slot = key_pairs(spec, &frame, argc)
-            .map(|(k, _)| crc16::slot(k))
+        let new_slot = spec
+            .all_keys(resp::Args::new(&frame, argc).skip(1), argc)
+            .map(crc16::slot)
             .try_fold(current, |acc, s| match acc {
                 Some(prev) if prev != s => None,
                 _ => Some(Some(s)),

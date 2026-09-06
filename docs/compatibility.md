@@ -1,6 +1,6 @@
 # Compatibility
 
-The 58-test integration suite runs against each backend, in every mode
+The 62-test integration suite runs against each backend, in every mode
 combination (`backend-sharding`, `reply-cache`), with full cluster
 teardown/recreate between versions; it includes a live slot migration
 (CLUSTER SETSLOT MIGRATING/IMPORTING + MIGRATE) under multi-key commands:
@@ -48,8 +48,8 @@ memtier_benchmark, redis-benchmark.
   `topology-refresh-secs` or the first redirect seen), a cluster-wide
   command may reach a demoted node and return `READONLY`.
 - Server-management commands are not proxied: WAIT, DEBUG, LATENCY, MEMORY,
-  SHUTDOWN, FAILOVER, REPLICAOF, SAVE/BGSAVE, DUMP/RESTORE, MIGRATE and
-  similar return unknown-command. OBJECT routes by its key.
+  SHUTDOWN, FAILOVER, REPLICAOF, SAVE/BGSAVE, MIGRATE and similar return
+  unknown-command. OBJECT routes by its key.
 - CLIENT supports ID, SETNAME, GETNAME and LIST (id, addr, fd, name, age).
 - No TLS, no unix-domain listener, no slowlog, no keyspace notifications,
   no Prometheus endpoint (stats via INFO).

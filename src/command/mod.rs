@@ -141,6 +141,18 @@ impl Spec {
         }
     }
 
+    /// Every key the request touches: the declared ranges, the STREAMS list and STORE targets.
+    pub fn all_keys<'a, I>(&self, args: I, argc: usize) -> impl Iterator<Item = &'a [u8]>
+    where
+        I: Iterator<Item = &'a [u8]> + Clone,
+    {
+        let streams = matches!(self.kind, Kind::Xread).then(|| stream_keys(args.clone(), argc));
+        let stores = (self.flags & FLAG_STORE != 0).then(|| store_targets(args.clone()));
+        self.keys(args, argc)
+            .chain(streams.into_iter().flatten())
+            .chain(stores.into_iter().flatten())
+    }
+
     /// Redis command flags, as COMMAND INFO names them.
     pub fn info_names(&self) -> impl Iterator<Item = &'static str> {
         bit_names(self.info, INFO_NAMES)
@@ -256,6 +268,29 @@ const fn build_lut() -> [u16; LUT_LEN] {
 }
 
 // the fold covers only the bytes a name has, so short names keep zero padding
+// the first half of what follows STREAMS
+fn stream_keys<'a>(
+    args: impl Iterator<Item = &'a [u8]>,
+    argc: usize,
+) -> impl Iterator<Item = &'a [u8]> {
+    let mut args = args.enumerate();
+    let after = args
+        .by_ref()
+        .find(|(_, a)| a.eq_ignore_ascii_case(b"streams"))
+        .map_or(0, |(i, _)| argc - i - 2);
+    args.map(|(_, a)| a).take(after / 2)
+}
+
+// the argument after each STORE or STOREDIST past the source key
+fn store_targets<'a>(args: impl Iterator<Item = &'a [u8]>) -> impl Iterator<Item = &'a [u8]> {
+    let mut dest_next = false;
+    args.skip(1).filter(move |a| {
+        let take = dest_next;
+        dest_next = a.eq_ignore_ascii_case(b"store") || a.eq_ignore_ascii_case(b"storedist");
+        take
+    })
+}
+
 const fn folded_prefix(name: &[u8]) -> u64 {
     let used = if name.len() < PREFIX_LEN {
         name.len()
@@ -413,6 +448,34 @@ mod tests {
             ["a", "b"]
         );
         assert_eq!(keys_of(&["lmpop", "0"]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn all_keys_add_stream_lists_and_store_targets() {
+        let all = |cmd: &[&str]| -> Vec<String> {
+            let spec = lookup(cmd[0].as_bytes()).unwrap();
+            spec.all_keys(cmd[1..].iter().map(|a| a.as_bytes()), cmd.len())
+                .map(|k| String::from_utf8_lossy(k).into_owned())
+                .collect()
+        };
+        assert_eq!(
+            all(&["xread", "count", "1", "streams", "s1", "s2", "0", "0"]),
+            ["s1", "s2"]
+        );
+        assert_eq!(all(&["xread", "streams", "s1"]), Vec::<String>::new());
+        assert_eq!(
+            all(&["sort", "src", "alpha", "store", "dst"]),
+            ["src", "dst"]
+        );
+        assert_eq!(all(&["sort", "store", "store", "dst"]), ["store", "dst"]);
+        assert_eq!(
+            all(&["georadius", "g", "0", "0", "1", "km", "storedist", "d"]),
+            ["g", "d"]
+        );
+        assert_eq!(all(&["eval", "return 1", "9", "a"]), ["a"]);
+        assert!(lookup(b"eval").unwrap().is_write());
+        assert!(lookup(b"fcall").unwrap().is_write());
+        assert!(!lookup(b"eval_ro").unwrap().is_write());
         assert_eq!(keys_of(&["lmpop", "x", "l1"]), Vec::<String>::new());
         assert_eq!(keys_of(&["ping"]), Vec::<String>::new());
     }

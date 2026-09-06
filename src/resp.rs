@@ -46,6 +46,7 @@ pub struct Cursor {
 }
 
 /// Iterator over argument payload slices of a scanned array-form request.
+#[derive(Clone)]
 pub struct Args<'a> {
     buf: &'a [u8],
     pos: usize,

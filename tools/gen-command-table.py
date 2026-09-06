@@ -32,7 +32,7 @@ KIND = {
                             "hello", "info", "multi", "ping", "quit", "reset", "select", "time"]},
 }
 MFLAGS = {
-    "get": "C", "mget": "C", "sort": "S", "georadius": "S", "georadiusbymember": "S", "pfcount": "U",
+    "get": "C", "mget": "C", "eval": "W", "evalsha": "W", "fcall": "W", "sort": "S", "georadius": "S", "georadiusbymember": "S", "pfcount": "U",
     **{n: "P" for n in ["ping", "quit", "reset", "subscribe", "psubscribe", "unsubscribe", "punsubscribe"]},
     **{n: "T" for n in ["multi", "exec", "discard", "quit", "reset"]},
 }

@@ -539,20 +539,10 @@ impl Session {
     }
 }
 
-// keys a write mutates: the declared range, STORE destinations, script keys
-pub(super) fn write_keys(spec: &Spec, frame: &Bytes, argc: usize, mut f: impl FnMut(&[u8])) {
-    for key in spec.keys(resp::Args::new(frame, argc).skip(1), argc) {
-        f(key);
-    }
-    if spec.flags & command::FLAG_STORE != 0 {
-        let mut dest_next = false;
-        for a in resp::Args::new(frame, argc).skip(2) {
-            if dest_next {
-                f(a);
-            }
-            dest_next = a.eq_ignore_ascii_case(b"store") || a.eq_ignore_ascii_case(b"storedist");
-        }
-    }
+// keys a write mutates, from the full request frame
+pub(super) fn write_keys(spec: &Spec, frame: &Bytes, argc: usize, f: impl FnMut(&[u8])) {
+    spec.all_keys(resp::Args::new(frame, argc).skip(1), argc)
+        .for_each(f);
 }
 
 pub(super) fn key_pairs<'a>(
@@ -772,34 +762,5 @@ mod tests {
         assert_eq!(rename, vec![1, 2]);
         let ping: Vec<usize> = key_indices(spec("ping"), 1).collect();
         assert!(ping.is_empty());
-    }
-
-    #[test]
-    fn write_keys_cover_ranges_store_targets_and_scripts() {
-        let keys = |cmd: &[&str]| {
-            let args: Vec<&[u8]> = cmd.iter().map(|a| a.as_bytes()).collect();
-            let mut raw = Vec::new();
-            resp::write_command(&mut raw, &args);
-            let frame = Bytes::from(raw);
-            let mut out: Vec<String> = Vec::new();
-            write_keys(spec(cmd[0]), &frame, cmd.len(), |k| {
-                out.push(String::from_utf8_lossy(k).into_owned())
-            });
-            out
-        };
-        assert_eq!(keys(&["set", "k", "v"]), ["k"]);
-        assert_eq!(keys(&["mset", "a", "1", "b", "2"]), ["a", "b"]);
-        assert_eq!(keys(&["rename", "a", "b"]), ["a", "b"]);
-        assert_eq!(
-            keys(&["sort", "src", "alpha", "STORE", "dst"]),
-            ["src", "dst"]
-        );
-        assert_eq!(
-            keys(&["georadius", "g", "0", "0", "1", "km", "storedist", "d"]),
-            ["g", "d"]
-        );
-        assert_eq!(keys(&["eval", "return 1", "2", "a", "b", "c"]), ["a", "b"]);
-        assert_eq!(keys(&["eval", "return 1", "0"]), Vec::<String>::new());
-        assert_eq!(keys(&["eval", "return 1", "9", "a"]), ["a"]);
     }
 }

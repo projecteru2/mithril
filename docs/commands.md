@@ -69,7 +69,8 @@ RESP3, subscribed clients may keep issuing regular commands.
 
 PING, ECHO, SELECT (db 0 only), TIME, AUTH, HELLO, RESET, QUIT, INFO,
 CONFIG (GET; SET accepts only `loglevel`), CLIENT (ID/SETNAME/GETNAME/LIST),
-COMMAND (COUNT, INFO with flags and ACL categories, GETKEYS), ACL WHOAMI,
+COMMAND (COUNT, INFO with flags and ACL categories, GETKEYS covering
+ranges, numkeys blocks, STREAMS lists and STORE targets), ACL WHOAMI,
 MULTI/EXEC/DISCARD, and the
 CLUSTER family. CLUSTER INFO/MYID/KEYSLOT/NODES/SLOTS/SHARDS describe a
 single virtual node owning slots 0-16383 — the emulation that lets

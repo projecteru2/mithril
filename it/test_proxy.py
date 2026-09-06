@@ -814,6 +814,67 @@ def test_evalsha_routes_and_reports_noscript(r, cluster_direct, key_prefix):
         r.evalsha("0" * 40, 1, key)
 
 
+def test_multi_checks_numkeys_and_store_slots(r, cluster_direct, key_prefix):
+    _needs(cluster_direct, (7, 0))
+    k = f"{{{key_prefix}}}:lm"
+    pipe = r.pipeline(transaction=True)
+    pipe.rpush(k, "a", "b")
+    pipe.execute_command("LMPOP", 1, k, "LEFT")
+    pushed, popped = pipe.execute()
+    assert pushed == 2 and popped[0] == k
+    near, far = _cross_slot_pair(key_prefix)
+    pipe = r.pipeline(transaction=True)
+    pipe.set(near, "1")
+    pipe.execute_command("LMPOP", 1, far, "LEFT")
+    with pytest.raises(redis.exceptions.ResponseError, match=r"(?i)crossslot"):
+        pipe.execute()
+    pipe = r.pipeline(transaction=True)
+    pipe.rpush(near, "b", "a")
+    pipe.sort(near, store=far)
+    with pytest.raises(redis.exceptions.ResponseError, match=r"(?i)crossslot"):
+        pipe.execute()
+
+
+def test_command_getkeys_keyword_specs(raw_socket):
+    s = raw_socket()
+    reader = _RespReader(s)
+    for cmd, keys in [
+        (["xread", "COUNT", "1", "STREAMS", "s1", "s2", "0", "0"], ["s1", "s2"]),
+        (["sort", "src", "ALPHA", "STORE", "dst"], ["src", "dst"]),
+        (["georadius", "g", "0", "0", "1", "km", "STOREDIST", "d"], ["g", "d"]),
+        (["lmpop", "1", "l", "LEFT"], ["l"]),
+    ]:
+        s.sendall(_resp_encode(["COMMAND", "GETKEYS", *cmd]))
+        assert reader.read_reply() == keys
+    s.sendall(_resp_encode(["COMMAND", "INFO", "lmpop", "xread", "eval"]))
+    for entry in reader.read_reply():
+        assert entry[3:6] == [0, 0, 0], entry
+
+
+def test_container_help_is_answered_by_the_engine(raw_socket):
+    s = raw_socket()
+    reader = _RespReader(s)
+    s.sendall(_resp_encode(["OBJECT", "HELP"]))
+    assert any("OBJECT" in line for line in reader.read_reply())
+    s.sendall(_resp_encode(["XINFO", "HELP"]))
+    assert any("XINFO" in line for line in reader.read_reply())
+    s.sendall(_resp_encode(["OBJECT", "ENCODING"]))
+    with pytest.raises(redis.exceptions.ResponseError, match=r"(?i)wrong number of arguments"):
+        reader.read_reply()
+
+
+def test_script_write_invalidates_cached_string(cache_proxy, key_prefix):
+    r = cache_proxy
+    k = f"{key_prefix}:ev"
+    assert r.set(k, "old")
+    assert r.get(k) == "old"
+    assert r.get(k) == "old"
+    pipe = r.pipeline(transaction=False)
+    pipe.eval("return redis.call('set', KEYS[1], ARGV[1])", 1, k, "new")
+    pipe.get(k)
+    assert pipe.execute() == ["OK", "new"]
+
+
 def test_numkeys_write_invalidates_cached_string(cache_proxy, cluster_direct, key_prefix):
     r = cache_proxy
     _needs(cluster_direct, (6, 2))
