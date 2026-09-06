@@ -215,7 +215,7 @@ impl Session {
                 return;
             }
         };
-        if self.login(name, password) {
+        if self.login("auth", name, password) {
             self.emit_local(Bytes::from_static(resp::OK));
         } else {
             self.emit_error("WRONGPASS invalid username-password pair or user is disabled.");
@@ -245,7 +245,7 @@ impl Session {
                     self.emit_error("ERR syntax error in HELLO");
                     return;
                 }
-                if !self.login(args[i + 1], args[i + 2]) {
+                if !self.login("hello", args[i + 1], args[i + 2]) {
                     self.emit_error(
                         "WRONGPASS invalid username-password pair or user is disabled.",
                     );

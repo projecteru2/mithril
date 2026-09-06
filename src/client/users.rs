@@ -17,8 +17,8 @@ const LOG_DEFAULT_COUNT: usize = 10;
 const LOG_FIELD_MAX: usize = 128;
 
 impl Session {
-    /// Authenticates as `name`; a failure lands in the ACL log.
-    pub(super) fn login(&self, name: &[u8], password: &[u8]) -> bool {
+    /// Authenticates as `name` on behalf of `cmd` (AUTH or HELLO); a failure lands in the ACL log.
+    pub(super) fn login(&self, cmd: &str, name: &[u8], password: &[u8]) -> bool {
         let generation = self.shared.acl.generation();
         match self.shared.acl.user(name) {
             Some(user) if user.accepts(password) => {
@@ -27,7 +27,7 @@ impl Session {
                 true
             }
             _ => {
-                self.deny("auth", "auth", b"AUTH", Some(name));
+                self.deny("auth", cmd, b"AUTH", Some(name));
                 false
             }
         }
@@ -91,10 +91,13 @@ impl Session {
         let clip = |v: &[u8]| {
             Box::from(String::from_utf8_lossy(&v[..v.len().min(LOG_FIELD_MAX)]).as_ref())
         };
-        let username = match username {
-            Some(name) => clip(name),
-            None => clip(self.user.borrow().name.as_bytes()),
-        };
+        let current = clip(self.user.borrow().name.as_bytes());
+        let username = username.map_or_else(|| current.clone(), clip);
+        // the info line is space-delimited: the session user's name must stay one token
+        let user_token: String = current
+            .chars()
+            .map(|c| if c.is_whitespace() { '_' } else { c })
+            .collect();
         let (subs, patterns) = self.subs.borrow().counts();
         let queued = self
             .multi
@@ -105,7 +108,7 @@ impl Session {
             let registry = self.shared.stats.registry();
             let info = registry.get(&self.id);
             format!(
-                "id={} addr={} fd={} name={} age={} idle=0 flags=N db=0 sub={subs} psub={patterns} ssub=0 multi={queued} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={cmd} user={username} redir=-1 resp={}",
+                "id={} addr={} fd={} name={} age={} idle=0 flags=N db=0 sub={subs} psub={patterns} ssub=0 multi={queued} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={cmd} user={user_token} redir=-1 resp={}",
                 self.id,
                 info.map_or(String::new(), |i| i.addr.to_string()),
                 info.map_or(-1, |i| i.fd),
