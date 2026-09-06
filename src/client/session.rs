@@ -414,20 +414,32 @@ impl Session {
 
     pub(super) async fn forward_any_master(&self, frame: Bytes) {
         let seq = self.alloc_seq();
-        let pipe = {
-            let topo = self.topo();
-            let picked = self.with_rng(|r| route::any_master(&topo, r));
-            let Some(idx) = picked else {
-                self.emit_at(seq, Bytes::from_static(ERR_NO_OWNER));
-                return;
-            };
-            let Some(pipe) = self.cached_pipe(&topo, idx, false) else {
-                self.emit_at(seq, Bytes::from_static(ERR_BACKEND_LOST));
-                return;
-            };
-            pipe.clone()
+        if let Some(pipe) = self.any_master_pipe(seq) {
+            self.send_at(&pipe, seq, frame, 1).await;
+        }
+    }
+
+    // a keyless script runs on any master; its ring entry lets a NOSCRIPT reload it there
+    async fn forward_keyless_script(&self, frame: Bytes) {
+        let seq = self.alloc_seq();
+        if let Some(pipe) = self.any_master_pipe(seq) {
+            self.track_inflight(seq, &frame, 1, None);
+            self.send_at(&pipe, seq, frame, 1).await;
+        }
+    }
+
+    // None once the error reply for `seq` went out
+    fn any_master_pipe(&self, seq: u64) -> Option<Pipe> {
+        let topo = self.topo();
+        let Some(idx) = self.with_rng(|r| route::any_master(&topo, r)) else {
+            self.emit_at(seq, Bytes::from_static(ERR_NO_OWNER));
+            return None;
         };
-        self.send_at(&pipe, seq, frame, 1).await;
+        let Some(pipe) = self.cached_pipe(&topo, idx, false) else {
+            self.emit_at(seq, Bytes::from_static(ERR_BACKEND_LOST));
+            return None;
+        };
+        Some(pipe.clone())
     }
 
     async fn send_at(&self, pipe: &Pipe, seq: u64, frame: Bytes, expect: u32) {
@@ -461,7 +473,7 @@ impl Session {
             return None;
         }
         if numkeys == 0 {
-            return Some(Box::pin(self.forward_any_master(frame)));
+            return Some(Box::pin(self.forward_keyless_script(frame)));
         }
         let Some(slot) = slot else {
             self.emit_error("ERR missing key");
