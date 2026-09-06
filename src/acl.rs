@@ -57,14 +57,13 @@ impl User {
         self.enabled && (self.nopass || self.passwords.contains(&sha256(password)))
     }
 
-    /// Whether the command is allowed: a known subcommand by its own bit, a container
-    /// without one when any of its subcommands is, anything else by the command bit.
+    /// Whether the command is allowed: a known subcommand by its own bit, anything else
+    /// (including a subcommand the table does not know) by the command's bit.
     pub fn may_run(&self, spec: &Spec, sub: Option<&[u8]>) -> bool {
-        match sub.and_then(|s| spec.subcommand(s)) {
-            Some(sub) => self.has(sub.id),
-            None if spec.subs.is_empty() => self.has(spec.id),
-            None => spec.subs.iter().any(|s| self.has(s.id)),
-        }
+        let id = sub
+            .and_then(|s| spec.subcommand(s))
+            .map_or(spec.id, |s| s.id);
+        self.has(id)
     }
 
     fn has(&self, id: u16) -> bool {
@@ -851,6 +850,9 @@ mod tests {
         acl.set_user("u", &rules("+config -config|set")).unwrap();
         let user = acl.user(b"u").unwrap();
         assert!(user.may_run(config, Some(b"get")) && !user.may_run(config, Some(b"set")));
+        assert!(!user.may_run(config, Some(b"nosuch")));
+        acl.set_user("u", &rules("+config")).unwrap();
+        assert!(acl.user(b"u").unwrap().may_run(config, Some(b"nosuch")));
         assert!(acl.set_user("u", &rules("+config|nosuch")).is_err());
         assert!(acl.set_user("u", &[b""]).is_err());
         acl.set_user("b", &[b"on", b"~\xff\x00k"]).unwrap();

@@ -93,7 +93,7 @@ impl Session {
         };
         let username = match username {
             Some(name) => clip(name),
-            None => self.user.borrow().name.clone(),
+            None => clip(self.user.borrow().name.as_bytes()),
         };
         self.shared.acl.log_denial(LogEntry {
             reason,
