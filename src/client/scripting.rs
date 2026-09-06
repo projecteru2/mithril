@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 
-use super::broadcast::{Effect, Gather, Targets};
+use super::broadcast::{Gather, Targets};
 use super::local::display_name;
 use super::session::Session;
 use crate::command::{self, Spec};
@@ -18,7 +18,7 @@ impl Session {
             return;
         };
         let is = |name: &[u8]| sub.eq_ignore_ascii_case(name);
-        let (targets, gather, effect) = match spec.name {
+        let (targets, gather, remember) = match spec.name {
             "script" if is(b"load") => {
                 let Some(body) = args.next() else {
                     self.emit_error("ERR wrong number of arguments for 'script|load' command");
@@ -26,8 +26,8 @@ impl Session {
                 };
                 // copied: the request frame is a slice of the session's read buffer
                 let body = Bytes::copy_from_slice(body);
-                let effect = Effect::RememberScript(body, self.shared.scripts.flushes());
-                (Targets::LiveNodes, Gather::Same, Some(effect))
+                let remember = Some((body, self.shared.scripts.flushes()));
+                (Targets::LiveNodes, Gather::Same, remember)
             }
             "script" if is(b"exists") => (Targets::Masters, Gather::Every, None),
             "script" if is(b"flush") => {
@@ -60,7 +60,7 @@ impl Session {
                 return;
             }
         };
-        self.run_broadcast(frame, targets, gather, effect).await;
+        self.run_broadcast(frame, targets, gather, remember).await;
     }
 }
 

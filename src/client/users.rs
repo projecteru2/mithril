@@ -167,17 +167,11 @@ impl Session {
                 Err(e) => resp::write_error(&mut out, e),
             }
         } else if sub(b"users") && n == 2 {
-            let users = acl.users();
-            resp::array_header(&mut out, users.len());
-            for user in users {
-                resp::bulk(&mut out, user.name.as_bytes());
-            }
+            acl_users(&mut out, acl, |out, user| {
+                resp::bulk(out, user.name.as_bytes())
+            });
         } else if sub(b"list") && n == 2 {
-            let users = acl.users();
-            resp::array_header(&mut out, users.len());
-            for user in users {
-                resp::bulk(&mut out, &user.describe());
-            }
+            acl_users(&mut out, acl, |out, user| resp::bulk(out, &user.describe()));
         } else if sub(b"genpass") && n <= 3 {
             let bits = match args.get(2) {
                 Some(arg) => command::arg_int(arg)
@@ -244,6 +238,14 @@ fn acl_cat(out: &mut Vec<u8>, category: Option<&[u8]>) {
     resp::array_header(out, members.len());
     for name in &members {
         resp::bulk(out, name);
+    }
+}
+
+fn acl_users(out: &mut Vec<u8>, acl: &acl::Acl, mut render: impl FnMut(&mut Vec<u8>, &User)) {
+    let users = acl.users();
+    resp::array_header(out, users.len());
+    for user in users {
+        render(out, &user);
     }
 }
 

@@ -2,9 +2,9 @@
 
 use bytes::Bytes;
 
+use super::Reply;
 use super::pipe::{recv_or_lost, scatter_one};
 use super::session::Session;
-use super::{Reply, Shared};
 use crate::multikey;
 use crate::resp;
 
@@ -27,31 +27,14 @@ pub(super) enum Gather {
     Every,
 }
 
-/// What a successful broadcast leaves behind in the proxy.
-pub(super) enum Effect {
-    /// The body a SCRIPT LOAD carried, and the flush count when it was dispatched.
-    RememberScript(Bytes, u64),
-}
-
-impl Effect {
-    fn apply(self, shared: &Shared, reply: &Bytes) {
-        match self {
-            Effect::RememberScript(body, flushes) => {
-                if let Some(sha) = resp::bulk_payload(reply) {
-                    shared.scripts.remember(sha, body, flushes);
-                }
-            }
-        }
-    }
-}
-
 impl Session {
     pub(super) async fn run_broadcast(
         &self,
         frame: Bytes,
         targets: Targets,
         gather: Gather,
-        effect: Option<Effect>,
+        // a SCRIPT LOAD body with the flush count at its dispatch, remembered under the returned sha
+        remember: Option<(Bytes, u64)>,
     ) {
         let seq = self.alloc_seq();
         let shared = self.shared.clone();
@@ -86,8 +69,10 @@ impl Session {
                 Gather::Same => multikey::merge_same(replies.iter()),
                 Gather::Every => multikey::merge_every(replies.iter()),
             };
-            if let (Ok(reply), Some(effect)) = (&merged, effect) {
-                effect.apply(&shared, reply);
+            if let (Ok(reply), Some((body, flushes))) = (&merged, remember)
+                && let Some(sha) = resp::bulk_payload(reply)
+            {
+                shared.scripts.remember(sha, body, flushes);
             }
             let _ = reply_q.send(Reply::At(seq, merged.unwrap_or_else(|e| e)));
         });
