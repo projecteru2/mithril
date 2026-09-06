@@ -14,8 +14,12 @@ for tag, raw in (("redis", sys.argv[1]), ("valkey", sys.argv[2])):
         specs = []
         for k in x[8]:
             b, f = k["begin_search"], k["find_keys"]
-            specs.append({"begin": b["type"], "at": b["spec"].get("index", b["spec"].get("keyword")), "find": f["type"], "spec": f["spec"]})
+            spec = {"begin": b["type"], "at": b["spec"].get("index", b["spec"].get("keyword")), "find": f["type"], "spec": f["spec"]}
+            if b["type"] == "keyword":
+                spec["from"] = b["spec"]["startfrom"]
+            specs.append(spec)
         rows.append({"name": x[0], "arity": x[1], "flags": x[2], "first": x[3], "last": x[4], "step": x[5], "cats": x[6], "keys": specs})
+    rows.sort(key=lambda r: r["name"])
     out[tag] = rows
 json.dump(out, open("command-info.json", "w"), separators=(",", ":"), sort_keys=True)
 PY

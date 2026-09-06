@@ -40,13 +40,13 @@ const A_DANGEROUS: u32 = 1 << 17;
 const A_CONNECTION: u32 = 1 << 18;
 const A_TRANSACTION: u32 = 1 << 19;
 const A_SCRIPTING: u32 = 1 << 20;
-const A_TDIGEST: u32 = 1 << 21;
-const A_BLOOM: u32 = 1 << 22;
-const A_TIMESERIES: u32 = 1 << 23;
+const A_BLOOM: u32 = 1 << 21;
+const A_CUCKOO: u32 = 1 << 22;
+const A_CMS: u32 = 1 << 23;
 const A_JSON: u32 = 1 << 24;
-const A_TOPK: u32 = 1 << 25;
-const A_CMS: u32 = 1 << 26;
-const A_CUCKOO: u32 = 1 << 27;
+const A_TDIGEST: u32 = 1 << 25;
+const A_TOPK: u32 = 1 << 26;
+const A_TIMESERIES: u32 = 1 << 27;
 
 pub(super) static INFO_NAMES: &[&str] = &[
     "write",
@@ -98,13 +98,13 @@ pub(super) static CAT_NAMES: &[&str] = &[
     "@connection",
     "@transaction",
     "@scripting",
-    "@tdigest",
     "@bloom",
-    "@timeseries",
-    "@json",
-    "@topk",
-    "@cms",
     "@cuckoo",
+    "@cms",
+    "@json",
+    "@tdigest",
+    "@topk",
+    "@timeseries",
 ];
 
 pub(super) const ENTRIES: usize = 426;

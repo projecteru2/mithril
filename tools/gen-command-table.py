@@ -33,12 +33,13 @@ KIND = {
                             "hello", "info", "multi", "ping", "quit", "reset", "select", "time"]},
 }
 MFLAGS = {
-    "get": "C", "mget": "C", "eval": "W", "evalsha": "W", "fcall": "W", "sort": "S", "georadius": "S", "georadiusbymember": "S", "pfcount": "U",
-    **{n: "P" for n in ["ping", "quit", "reset", "subscribe", "psubscribe", "unsubscribe", "punsubscribe"]},
-    **{n: "T" for n in ["multi", "exec", "discard", "quit", "reset"]},
+    "get": ["C"], "mget": ["C"], "eval": ["W"], "evalsha": ["W"], "fcall": ["W"], "sort": ["S"], "georadius": ["S"], "georadiusbymember": ["S"], "pfcount": ["U"],
+    **{n: ["P"] for n in ["ping", "subscribe", "psubscribe", "unsubscribe", "punsubscribe"]},
+    **{n: ["T"] for n in ["multi", "exec", "discard"]},
+    "quit": ["T", "P"], "reset": ["T", "P"],
 }
-# argv index where option scanning starts for STREAMS / STORE keyword specs (Redis begin_search startfrom)
-SCAN_FROM = {"xread": 1, "xreadgroup": 4, "sort": 2, "georadius": 6, "georadiusbymember": 5}
+# SORT reports its STORE spec as unknown; its options begin after the key
+SCAN_FROM = {"sort": 2}
 
 SKIP = {
     "asking", "bgrewriteaof", "bgsave", "clusterscan", "commandlog", "debug", "failover", "flushdb",
@@ -78,6 +79,10 @@ def keyspec(name, specs):
         assert not ranges or step == kstep, name
         step = kstep
     return first, last, step, numkeys
+
+
+def scan_from(name, specs):
+    return SCAN_FROM.get(name) or max((s["from"] for s in specs if s["begin"] == "keyword"), default=0)
 
 
 def entries():
@@ -133,9 +138,7 @@ def main():
             m.append("R")
         if "no_auth" in flags:
             m.append("N")
-        m += [MFLAGS[name]] if name in MFLAGS else []
-        if name in ("quit", "reset"):
-            m = ["N", "T", "P"]
+        m += MFLAGS.get(name, [])
         info = " | ".join(f"I_{f.upper()}" for f in STD_FLAGS if f in flags) or "0"
         cats = []
         for c in r["cats"]:
@@ -145,7 +148,7 @@ def main():
             cats.append(c)
         cats = " | ".join(f"A_{c.upper()}" for c in cats_order if c in cats) or "0"
         key = (prefix64(name), len(name), name.encode()[8:])
-        table.append((key, f'"{name}", {r["arity"]}, {" | ".join(m) or "0"}, {first}, {last}, {step}, {numkeys}, {SCAN_FROM.get(name, 0)}, Kind::{kind}, {info}, {cats}),'))
+        table.append((key, f'"{name}", {r["arity"]}, {" | ".join(m) or "0"}, {first}, {last}, {step}, {numkeys}, {scan_from(name, keys)}, Kind::{kind}, {info}, {cats}),'))
     table.sort()
     subs_of = {}
     for tag in ("redis", "valkey"):
