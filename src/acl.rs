@@ -398,8 +398,7 @@ impl Acl {
         self.read().get(name).cloned()
     }
 
-    /// Bumps after every change; a session that read it before looking its user up
-    /// re-resolves on the next command whenever it moved.
+    /// Bumps after every change; a session re-resolves its user once it sees it move.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }

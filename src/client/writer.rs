@@ -228,8 +228,7 @@ pub(super) async fn write_loop(
                         // clients believe the proxy owns every slot: never leak redirects
                         frame = Bytes::from_static(ERR_TRYAGAIN);
                     } else if frame.starts_with(NOSCRIPT)
-                        // a later command already holds a sequence: a rerun would land out of order
-                        && seq + 1 == link.next_seq.get()
+                        && rerunnable(&link, seq)
                         && let Some(retry) = take_retry(&link, seq, false)
                     {
                         let topo = shared.topo.load_full();
@@ -259,10 +258,8 @@ pub(super) async fn write_loop(
                         if let Some(plan) = multikey_plan(&req) {
                             let (merge, nkeys, slot) = (plan.merge, plan.nkeys, plan.slot);
                             link.mark_migrating(slot);
-                            // any later command already holds a sequence: a re-run would land
-                            // out of order, so the client retries and this slot takes the
-                            // gated path from now on
-                            if seq + 1 == link.next_seq.get() {
+                            // otherwise the client retries and this slot takes the gated path
+                            if rerunnable(&link, seq) {
                                 let gate = Rc::new(Notify::new());
                                 link.gate_slots(&[slot], &gate);
                                 let (shared, reply_q, link) =
@@ -399,6 +396,11 @@ fn entry_at(inflight: &InflightRing, seq: u64) -> Option<RefMut<'_, InFlight>> {
 fn take_fill(link: &WriterLink, seq: u64) -> Option<Fill> {
     let mut entry = entry_at(&link.inflight, seq)?;
     link.detach_fill(&mut entry)
+}
+
+// a request may run again only while no later command of the session holds a sequence
+fn rerunnable(link: &WriterLink, seq: u64) -> bool {
+    seq + 1 == link.next_seq.get()
 }
 
 // retryable redirects: single-reply requests always, multi-reply blobs only for MOVED

@@ -76,9 +76,7 @@ pub enum Kind {
     Script,
 }
 
-/// One command table entry: a key range at `first_key..=last_key` by `step`,
-/// `numkeys` more keys counted by argv[`numkeys`] right after it, and for the
-/// STREAMS/STORE forms the argv index `scan_from` where their options begin.
+/// One table row: keys at `first_key..=last_key` by `step`, then `numkeys` counted ones; `scan_from` starts the option scan.
 #[derive(Debug, Clone, Copy)]
 pub struct Spec {
     pub id: u16,
