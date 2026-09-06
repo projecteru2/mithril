@@ -153,7 +153,7 @@ impl Session {
         self.link.proto_switches.push(self.link.next_seq.get(), 2);
         let generation = self.shared.acl.generation();
         let user = self.shared.acl.default_user();
-        self.authed.set(user.nopass);
+        self.authed.set(user.enabled && user.nopass);
         self.adopt(user, generation);
     }
 

@@ -2,7 +2,7 @@
 
 mod table;
 
-use table::{CAT_NAMES, INFO_NAMES, TABLE};
+use table::{CAT_NAMES, ENTRIES, INFO_NAMES, TABLE};
 
 const FLAG_WRITE: u8 = 1;
 const FLAG_READONLY: u8 = 1 << 1;
@@ -18,8 +18,9 @@ pub const FLAG_PUBSUB: u8 = 1 << 6;
 /// A multi-key reply that is one aggregate, never rebuilt from per-key resends.
 pub const FLAG_UNION: u8 = 1 << 7;
 
-/// Upper bound on table rows; ACL command bitmaps are sized by it.
+/// Upper bound on commands plus subcommands; ACL bitmaps are sized by it.
 pub const MAX_COMMANDS: usize = 512;
+const _: () = assert!(ENTRIES <= MAX_COMMANDS);
 
 const MAX_NAME: usize = 24;
 
@@ -93,9 +94,17 @@ pub struct Spec {
     pub kind: Kind,
     pub info: u32,
     pub cats: u32,
+    pub subs: &'static [Sub],
 }
 
 impl Spec {
+    /// The subcommand `name` of a container command, when the table knows it.
+    pub fn subcommand(&self, name: &[u8]) -> Option<&'static Sub> {
+        self.subs
+            .iter()
+            .find(|s| s.name.as_bytes().eq_ignore_ascii_case(name))
+    }
+
     pub fn is_write(&self) -> bool {
         self.flags & FLAG_WRITE != 0
     }
@@ -175,6 +184,14 @@ impl Spec {
     }
 }
 
+/// A subcommand of a container command, with its own ACL categories and bitmap id.
+#[derive(Debug)]
+pub struct Sub {
+    pub id: u16,
+    pub name: &'static str,
+    pub cats: u32,
+}
+
 /// Iterator over the keys of one request.
 pub struct Keys<'a, I: Iterator<Item = &'a [u8]>> {
     args: I,
@@ -214,6 +231,11 @@ impl<'a, I: Iterator<Item = &'a [u8]>> Iterator for Keys<'a, I> {
 
 pub fn table() -> &'static [Spec] {
     TABLE
+}
+
+/// Commands plus subcommands: the ids `0..entries()` are dense.
+pub fn entries() -> usize {
+    ENTRIES
 }
 
 /// ACL category names in Redis order, `@` included.
@@ -355,6 +377,7 @@ const fn c(
     kind: Kind,
     info: u32,
     cats: u32,
+    subs: &'static [Sub],
 ) -> Spec {
     Spec {
         id,
@@ -370,7 +393,12 @@ const fn c(
         kind,
         info,
         cats,
+        subs,
     }
+}
+
+const fn s(id: u16, name: &'static str, cats: u32) -> Sub {
+    Sub { id, name, cats }
 }
 
 #[cfg(test)]
@@ -387,9 +415,13 @@ mod tests {
 
     #[test]
     fn every_entry_resolves_through_the_lut() {
-        assert!(TABLE.len() <= MAX_COMMANDS);
+        let mut next = TABLE.len() as u16;
         for (i, spec) in TABLE.iter().enumerate() {
             assert_eq!(spec.id as usize, i, "{}", spec.name);
+            for sub in spec.subs {
+                assert_eq!(sub.id, next, "{}|{}", spec.name, sub.name);
+                next += 1;
+            }
             assert_eq!(
                 lookup(spec.name.as_bytes()).map(|s| s.name),
                 Some(spec.name)

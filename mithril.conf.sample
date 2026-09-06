@@ -26,6 +26,10 @@ backend-conns 1
 
 # client auth (empty = no auth) and backend auth
 # requirepass secret
+# ACL users in Redis ACL SETUSER syntax (repeatable), the channels a new user starts with, the ACL LOG size
+# user app on >secret ~app:* &* -@all +@read +@string
+# acl-pubsub-default allchannels
+# acllog-max-len 128
 # backend-auth-user default
 # backend-auth-pass secret
 

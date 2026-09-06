@@ -13,6 +13,8 @@ use crate::resp;
 
 const STANDARD_CATEGORIES: usize = 21;
 const LOG_DEFAULT_COUNT: usize = 10;
+// what a log entry keeps of a client-supplied name or key
+const LOG_FIELD_MAX: usize = 128;
 
 impl Session {
     /// Authenticates as `name`; a failure lands in the ACL log.
@@ -86,8 +88,11 @@ impl Session {
     }
 
     fn deny(&self, reason: &'static str, object: &[u8], username: Option<&[u8]>) {
+        let clip = |v: &[u8]| {
+            Box::from(String::from_utf8_lossy(&v[..v.len().min(LOG_FIELD_MAX)]).as_ref())
+        };
         let username = match username {
-            Some(name) => Box::from(String::from_utf8_lossy(name).as_ref()),
+            Some(name) => clip(name),
             None => self.user.borrow().name.clone(),
         };
         self.shared.acl.log_denial(LogEntry {
@@ -97,7 +102,7 @@ impl Session {
             } else {
                 "toplevel"
             },
-            object: Box::from(String::from_utf8_lossy(object).as_ref()),
+            object: clip(object),
             username,
             client: Box::from(format!("id={}", self.id).as_str()),
             at: Instant::now(),
@@ -107,12 +112,13 @@ impl Session {
     pub(super) fn handle_acl(&self, args: &[&[u8]]) -> Bytes {
         let acl = &self.shared.acl;
         let mut out = Vec::new();
+        let n = args.len();
         let sub = |name: &[u8]| args.get(1).is_some_and(|s| s.eq_ignore_ascii_case(name));
-        if sub(b"whoami") {
+        if sub(b"whoami") && n == 2 {
             resp::bulk(&mut out, self.user.borrow().name.as_bytes());
-        } else if sub(b"cat") {
+        } else if sub(b"cat") && n <= 3 {
             acl_cat(&mut out, args.get(2).copied());
-        } else if sub(b"setuser") && args.len() >= 3 {
+        } else if sub(b"setuser") && n >= 3 {
             match std::str::from_utf8(args[2]) {
                 Ok(name) => match acl.set_user(name, &args[3..]) {
                     Ok(()) => out.extend_from_slice(resp::OK),
@@ -120,29 +126,29 @@ impl Session {
                 },
                 Err(_) => resp::write_error(&mut out, "ERR Usernames must be UTF-8"),
             }
-        } else if sub(b"getuser") && args.len() == 3 {
+        } else if sub(b"getuser") && n == 3 {
             match acl.user(args[2]) {
                 Some(user) => acl_getuser(&mut out, &user),
                 None => out.extend_from_slice(resp::NIL_BULK),
             }
-        } else if sub(b"deluser") && args.len() >= 3 {
+        } else if sub(b"deluser") && n >= 3 {
             match acl.del_users(&args[2..]) {
                 Ok(n) => resp::integer(&mut out, n as i64),
                 Err(e) => resp::write_error(&mut out, e),
             }
-        } else if sub(b"users") {
+        } else if sub(b"users") && n == 2 {
             let users = acl.users();
             resp::array_header(&mut out, users.len());
             for user in users {
                 resp::bulk(&mut out, user.name.as_bytes());
             }
-        } else if sub(b"list") {
+        } else if sub(b"list") && n == 2 {
             let users = acl.users();
             resp::array_header(&mut out, users.len());
             for user in users {
-                resp::bulk(&mut out, user.describe().as_bytes());
+                resp::bulk(&mut out, &user.describe());
             }
-        } else if sub(b"genpass") {
+        } else if sub(b"genpass") && n <= 3 {
             let bits = match args.get(2) {
                 Some(arg) => command::arg_int(arg)
                     .filter(|b| *b > 0)
@@ -153,7 +159,7 @@ impl Session {
                 Ok(pass) => resp::bulk(&mut out, pass.as_bytes()),
                 Err(e) => resp::write_error(&mut out, e),
             }
-        } else if sub(b"log") {
+        } else if sub(b"log") && n <= 3 {
             acl_log(&mut out, acl, args.get(2).copied());
         } else if sub(b"load") || sub(b"save") {
             resp::write_error(
@@ -193,13 +199,21 @@ fn acl_cat(out: &mut Vec<u8>, category: Option<&[u8]>) {
         );
         return;
     };
-    let members: Vec<&Spec> = command::table()
+    let members: Vec<Vec<u8>> = command::table()
         .iter()
-        .filter(|s| s.cats & (1 << bit) != 0)
+        .flat_map(|spec| {
+            let own = (spec.cats & (1 << bit) != 0).then(|| spec.name.as_bytes().to_vec());
+            own.into_iter().chain(
+                spec.subs
+                    .iter()
+                    .filter(|s| s.cats & (1 << bit) != 0)
+                    .map(|s| [spec.name.as_bytes(), b"|", s.name.as_bytes()].concat()),
+            )
+        })
         .collect();
     resp::array_header(out, members.len());
-    for spec in members {
-        resp::bulk(out, spec.name.as_bytes());
+    for name in &members {
+        resp::bulk(out, name);
     }
 }
 

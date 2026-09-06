@@ -1076,3 +1076,39 @@ def test_hello_auth_and_acl_config(r, new_conn, raw_socket):
         r.config_set("acl-pubsub-default", "sometimes")
     assert r.execute_command("ACL", "DELUSER", name) == 1
 
+
+def test_acl_categories_reach_subcommands(r, new_conn):
+    name = "it_acl_nodanger"
+    rules = ["reset", "on", ">pw", "~*", "&*", "+@all", "-@dangerous"]
+    assert r.execute_command("ACL", "SETUSER", name, *rules) == "OK"
+    c = new_conn()
+    assert c.execute_command("AUTH", name, "pw")
+    with pytest.raises(redis.exceptions.NoPermissionError):
+        c.execute_command("ACL", "SETUSER", name, "+@all")
+    assert c.execute_command("ACL", "WHOAMI") == name
+    with pytest.raises(redis.exceptions.NoPermissionError):
+        c.execute_command("CONFIG", "GET", "loglevel")
+    assert r.execute_command("ACL", "SETUSER", name, "+config", "-config|set") == "OK"
+    assert c.config_get("loglevel")
+    with pytest.raises(redis.exceptions.NoPermissionError):
+        c.config_set("loglevel", "notice")
+    assert "acl|setuser" in r.execute_command("ACL", "CAT", "dangerous")
+    with pytest.raises(redis.exceptions.ResponseError):
+        r.execute_command("ACL", "SETUSER", name, "")
+    with pytest.raises(redis.exceptions.ResponseError):
+        r.execute_command("ACL", "WHOAMI", "extra")
+    assert r.execute_command("ACL", "DELUSER", name) == 1
+
+
+def test_default_user_off_requires_another_login(r, new_conn):
+    assert r.execute_command("ACL", "SETUSER", "it_acl_alt", "reset", "on", ">pw", "~*", "&*", "+@all") == "OK"
+    assert r.execute_command("ACL", "SETUSER", "default", "off") == "OK"
+    try:
+        c = new_conn()
+        with pytest.raises(redis.exceptions.AuthenticationError):
+            c.ping()
+        assert c.execute_command("AUTH", "it_acl_alt", "pw")
+        assert c.ping()
+    finally:
+        assert r.execute_command("ACL", "SETUSER", "default", "on") == "OK"
+        r.execute_command("ACL", "DELUSER", "it_acl_alt")

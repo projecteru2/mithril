@@ -25,8 +25,8 @@ pub struct User {
     pub enabled: bool,
     pub nopass: bool,
     passwords: Vec<[u8; 32]>,
+    // one bit per command or subcommand id
     allowed: [u64; WORDS],
-    subs: HashMap<u16, Vec<Box<[u8]>>>,
     keys: Vec<Box<[u8]>>,
     channels: Vec<Box<[u8]>>,
 }
@@ -39,7 +39,6 @@ impl User {
             nopass: false,
             passwords: Vec::new(),
             allowed: [0; WORDS],
-            subs: HashMap::new(),
             keys: Vec::new(),
             channels: if all_channels {
                 vec![Box::from(&b"*"[..])]
@@ -58,14 +57,18 @@ impl User {
         self.enabled && (self.nopass || self.passwords.contains(&sha256(password)))
     }
 
-    /// Whether the command, or the named subcommand of it, is allowed.
+    /// Whether the command is allowed: a known subcommand by its own bit, a container
+    /// without one when any of its subcommands is, anything else by the command bit.
     pub fn may_run(&self, spec: &Spec, sub: Option<&[u8]>) -> bool {
-        self.allowed[spec.id as usize / 64] & (1 << (spec.id % 64)) != 0
-            || sub.is_some_and(|sub| {
-                self.subs
-                    .get(&spec.id)
-                    .is_some_and(|subs| subs.iter().any(|s| s.eq_ignore_ascii_case(sub)))
-            })
+        match sub.and_then(|s| spec.subcommand(s)) {
+            Some(sub) => self.has(sub.id),
+            None if spec.subs.is_empty() => self.has(spec.id),
+            None => spec.subs.iter().any(|s| self.has(s.id)),
+        }
+    }
+
+    fn has(&self, id: u16) -> bool {
+        self.allowed[id as usize / 64] & (1 << (id % 64)) != 0
     }
 
     pub fn may_touch(&self, key: &[u8]) -> bool {
@@ -118,63 +121,72 @@ impl User {
         let table = command::table();
         let mut out = String::from("-@all");
         let mut covered = [0u64; WORDS];
+        let is_covered =
+            |covered: &[u64; WORDS], id: u16| covered[id as usize / 64] & (1 << (id % 64)) != 0;
         for (bit, cat) in command::cat_names().iter().enumerate() {
-            let members: Vec<&Spec> = table.iter().filter(|s| s.cats & (1 << bit) != 0).collect();
-            if members.is_empty() || !members.iter().all(|s| self.may_run(s, None)) {
+            let members: Vec<u16> = table
+                .iter()
+                .flat_map(|s| {
+                    std::iter::once((s.id, s.cats)).chain(s.subs.iter().map(|x| (x.id, x.cats)))
+                })
+                .filter(|(_, cats)| cats & (1 << bit) != 0)
+                .map(|(id, _)| id)
+                .collect();
+            if members.is_empty() || !members.iter().all(|&id| self.has(id)) {
                 continue;
             }
             out.push_str(" +");
             out.push_str(cat);
-            for s in members {
-                covered[s.id as usize / 64] |= 1 << (s.id % 64);
+            for id in members {
+                covered[id as usize / 64] |= 1 << (id % 64);
             }
         }
         for spec in table {
-            let id = spec.id as usize;
-            if self.allowed[id / 64] & (1 << (id % 64)) != 0
-                && covered[id / 64] & (1 << (id % 64)) == 0
-            {
-                out.push_str(" +");
-                out.push_str(spec.name);
+            let whole = self.has(spec.id) && spec.subs.iter().all(|s| self.has(s.id));
+            if whole {
+                if !is_covered(&covered, spec.id)
+                    || spec.subs.iter().any(|s| !is_covered(&covered, s.id))
+                {
+                    out.push_str(" +");
+                    out.push_str(spec.name);
+                }
+                continue;
             }
-        }
-        let mut subs: Vec<(&u16, &Vec<Box<[u8]>>)> = self.subs.iter().collect();
-        subs.sort_by_key(|(id, _)| **id);
-        for (id, names) in subs {
-            for sub in names {
-                out.push_str(" +");
-                out.push_str(table[*id as usize].name);
-                out.push('|');
-                out.push_str(&String::from_utf8_lossy(sub));
+            for sub in spec.subs {
+                if self.has(sub.id) && !is_covered(&covered, sub.id) {
+                    out.push_str(" +");
+                    out.push_str(spec.name);
+                    out.push('|');
+                    out.push_str(sub.name);
+                }
             }
         }
         out
     }
 
-    /// Renders the user as one ACL LIST line.
-    pub fn describe(&self) -> String {
-        let mut out = format!(
-            "user {} {}",
-            self.name,
-            if self.enabled { "on" } else { "off" }
-        );
+    /// Renders the user as one ACL LIST line; patterns keep their bytes.
+    pub fn describe(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"user ");
+        out.extend_from_slice(self.name.as_bytes());
+        out.extend_from_slice(if self.enabled { b" on" } else { b" off" });
         if self.nopass {
-            out.push_str(" nopass");
+            out.extend_from_slice(b" nopass");
         }
         for hash in self.password_hashes() {
-            out.push_str(" #");
-            out.push_str(&hash);
+            out.extend_from_slice(b" #");
+            out.extend_from_slice(hash.as_bytes());
         }
         for key in &self.keys {
-            out.push_str(" ~");
-            out.push_str(&String::from_utf8_lossy(key));
+            out.extend_from_slice(b" ~");
+            out.extend_from_slice(key);
         }
         for channel in &self.channels {
-            out.push_str(" &");
-            out.push_str(&String::from_utf8_lossy(channel));
+            out.extend_from_slice(b" &");
+            out.extend_from_slice(channel);
         }
-        out.push(' ');
-        out.push_str(&self.describe_commands());
+        out.push(b' ');
+        out.extend_from_slice(self.describe_commands().as_bytes());
         out
     }
 
@@ -205,6 +217,7 @@ impl User {
             b"reset" => {
                 *self = User::new(&self.name, all_channels);
             }
+            b"" => return Err(syntax()),
             _ => {
                 let (op, arg) = rule.split_at(1);
                 match op[0] {
@@ -273,8 +286,12 @@ impl User {
                 .ok_or_else(unknown)?;
             for spec in command::table() {
                 if spec.cats & (1 << bit) != 0 {
-                    self.set_command(spec, allow);
+                    self.set(spec.id, allow);
                 }
+                for sub in spec.subs.iter().filter(|s| s.cats & (1 << bit) != 0) {
+                    self.set(sub.id, allow);
+                }
+                self.sync_container(spec);
             }
             return Ok(());
         }
@@ -284,44 +301,43 @@ impl User {
         };
         let spec = command::lookup(name).ok_or_else(unknown)?;
         match sub {
-            None => self.set_command(spec, allow),
-            Some(sub) if allow => {
-                if !self.may_run(spec, None) {
-                    let subs = self.subs.entry(spec.id).or_default();
-                    if !subs.iter().any(|s| s.eq_ignore_ascii_case(sub)) {
-                        subs.push(sub.to_ascii_lowercase().into_boxed_slice());
-                    }
+            None => {
+                self.set(spec.id, allow);
+                for sub in spec.subs {
+                    self.set(sub.id, allow);
                 }
             }
-            Some(_) => {
-                return Err(format!(
-                    "Error in ACL SETUSER modifier '{}': Removing a subcommand is not supported",
-                    lossy(rule)
-                ));
+            Some(sub) => {
+                self.set(spec.subcommand(sub).ok_or_else(unknown)?.id, allow);
+                self.sync_container(spec);
             }
         }
         Ok(())
     }
 
-    fn set_command(&mut self, spec: &Spec, allow: bool) {
-        let (word, bit) = (spec.id as usize / 64, 1u64 << (spec.id % 64));
+    // a container's own bit means "every subcommand": kept derived
+    fn sync_container(&mut self, spec: &Spec) {
+        if !spec.subs.is_empty() {
+            let all = spec.subs.iter().all(|s| self.has(s.id));
+            self.set(spec.id, all);
+        }
+    }
+
+    fn set(&mut self, id: u16, allow: bool) {
+        let (word, bit) = (id as usize / 64, 1u64 << (id % 64));
         if allow {
             self.allowed[word] |= bit;
-            self.subs.remove(&spec.id);
         } else {
             self.allowed[word] &= !bit;
-            self.subs.remove(&spec.id);
         }
     }
 
     fn set_all(&mut self, allow: bool) {
-        for spec in command::table() {
-            self.set_command(spec, allow);
-        }
+        self.allowed = if allow { full_words() } else { [0; WORDS] };
     }
 
     fn all_commands(&self) -> bool {
-        command::table().iter().all(|s| self.may_run(s, None))
+        self.allowed == full_words()
     }
 }
 
@@ -398,7 +414,9 @@ impl Acl {
     /// Applies `rules` to `name`, creating it; nothing changes when a rule fails.
     pub fn set_user(&self, name: &str, rules: &[&[u8]]) -> Result<(), String> {
         let all_channels = self.all_channels.load(Ordering::Relaxed);
-        let mut user = match self.read().get(name) {
+        // clone, apply and swap under the one write lock: two SETUSERs never lose each other
+        let mut users = self.write();
+        let mut user = match users.get(name) {
             Some(u) => (**u).clone(),
             None => User::new(name, all_channels),
         };
@@ -406,7 +424,8 @@ impl Acl {
             user.apply(rule, all_channels)
                 .map_err(|e| format!("ERR {e}"))?;
         }
-        self.write().insert(Box::from(name), Arc::new(user));
+        users.insert(Box::from(name), Arc::new(user));
+        drop(users);
         self.generation.fetch_add(1, Ordering::Release);
         Ok(())
     }
@@ -453,8 +472,8 @@ impl Acl {
     }
 
     pub fn log_denial(&self, entry: LogEntry) {
-        let max = self.log_max();
         let mut log = self.lock_log();
+        let max = self.log_max();
         log.push_front(entry);
         while log.len() > max {
             log.pop_back();
@@ -671,6 +690,21 @@ fn bad_hash(rule: &[u8]) -> String {
     )
 }
 
+// every command and subcommand id set, the rest of the bitmap clear
+fn full_words() -> [u64; WORDS] {
+    let n = command::entries();
+    let mut words = [0u64; WORDS];
+    for (i, word) in words.iter_mut().enumerate() {
+        let have = n.saturating_sub(i * 64).min(64);
+        *word = if have == 64 {
+            u64::MAX
+        } else {
+            (1 << have) - 1
+        };
+    }
+    words
+}
+
 fn has_star(patterns: &[Box<[u8]>]) -> bool {
     patterns.iter().any(|p| &**p == b"*")
 }
@@ -752,7 +786,7 @@ mod tests {
         let user = open.user(b"default").unwrap();
         assert!(user.nopass && user.enabled && user.unrestricted());
         assert!(user.accepts(b"anything"));
-        assert_eq!(user.describe(), "user default on nopass ~* &* +@all");
+        assert_eq!(user.describe(), b"user default on nopass ~* &* +@all");
         let cfg = Config {
             requirepass: "secret".to_string(),
             ..Config::default()
@@ -775,7 +809,7 @@ mod tests {
         assert_eq!(user.describe_commands(), "-@all +@set +@string +config|set");
         assert_eq!(
             user.describe(),
-            "user test_on on #8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92 ~* &* -@all +@set +@string +config|set"
+            b"user test_on on #8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92 ~* &* -@all +@set +@string +config|set"
         );
         assert!(user.accepts(b"123456"));
         let set = command::lookup(b"set").unwrap();
@@ -796,6 +830,37 @@ mod tests {
         acl.set_all_channels_default(false);
         acl.set_user("test_on", &rules("reset")).unwrap();
         assert_eq!(acl.user(b"test_on").unwrap().flags(), ["off"]);
+    }
+
+    #[test]
+    fn categories_and_rules_reach_subcommands() {
+        let acl = acl();
+        let acl_cmd = command::lookup(b"acl").unwrap();
+        let config = command::lookup(b"config").unwrap();
+        acl.set_user("u", &rules("on +@all -@dangerous")).unwrap();
+        let user = acl.user(b"u").unwrap();
+        assert!(!user.may_run(acl_cmd, Some(b"setuser")));
+        assert!(user.may_run(acl_cmd, Some(b"whoami")));
+        assert!(!user.may_run(config, Some(b"get")));
+        assert!(user.may_run(command::lookup(b"get").unwrap(), None));
+        let described: String = user.describe_commands();
+        assert!(!described.contains("acl|setuser") && described.contains("+acl|whoami"));
+        acl.set_user("rt", &rules(&format!("on {described}")))
+            .unwrap();
+        assert_eq!(acl.user(b"rt").unwrap().allowed, user.allowed);
+        acl.set_user("u", &rules("+config -config|set")).unwrap();
+        let user = acl.user(b"u").unwrap();
+        assert!(user.may_run(config, Some(b"get")) && !user.may_run(config, Some(b"set")));
+        assert!(acl.set_user("u", &rules("+config|nosuch")).is_err());
+        assert!(acl.set_user("u", &[b""]).is_err());
+        acl.set_user("b", &[b"on", b"~\xff\x00k"]).unwrap();
+        assert!(
+            acl.user(b"b")
+                .unwrap()
+                .describe()
+                .windows(4)
+                .any(|w| w == b"~\xff\x00k")
+        );
     }
 
     #[test]

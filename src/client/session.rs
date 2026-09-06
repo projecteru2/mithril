@@ -288,7 +288,9 @@ impl Session {
             self.closing.set(true);
             return;
         }
-        if !self.unrestricted.get()
+        // an unauthenticated session only reaches no-auth commands: AUTH and HELLO must always get through
+        if self.authed.get()
+            && !self.unrestricted.get()
             && let Some(err) = self.acl_denies(spec, &frame, argc)
         {
             self.abort_multi();
@@ -630,7 +632,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: SocketAddr, id: 
         reply_q: reply_q.clone(),
         link: link.clone(),
         proto: Cell::new(2),
-        authed: Cell::new(user.nopass),
+        authed: Cell::new(user.enabled && user.nopass),
         unrestricted: Cell::new(user.unrestricted()),
         acl_gen: Cell::new(acl_gen),
         user: RefCell::new(user),
