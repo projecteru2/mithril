@@ -91,7 +91,7 @@ impl Session {
         let clip = |v: &[u8]| {
             Box::from(String::from_utf8_lossy(&v[..v.len().min(LOG_FIELD_MAX)]).as_ref())
         };
-        let current = clip(self.user.borrow().name.as_bytes());
+        let current: Box<str> = clip(self.user.borrow().name.as_bytes());
         let username = username.map_or_else(|| current.clone(), clip);
         // the info line is space-delimited: the session user's name must stay one token
         let user_token: String = current
