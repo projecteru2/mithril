@@ -487,12 +487,7 @@ fn scan_inline(buf: &[u8]) -> ReqScan {
 }
 
 fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+    (b as char).to_digit(16).map(|d| d as u8)
 }
 
 fn trim_crlf(mut line: &[u8]) -> &[u8] {
