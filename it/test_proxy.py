@@ -1100,15 +1100,19 @@ def test_acl_categories_reach_subcommands(r, new_conn):
     assert r.execute_command("ACL", "DELUSER", name) == 1
 
 
-def test_default_user_off_requires_another_login(r, new_conn):
+def test_default_user_off_requires_another_login(r, raw_socket):
     assert r.execute_command("ACL", "SETUSER", "it_acl_alt", "reset", "on", ">pw", "~*", "&*", "+@all") == "OK"
     assert r.execute_command("ACL", "SETUSER", "default", "off") == "OK"
     try:
-        c = new_conn()
-        with pytest.raises(redis.exceptions.AuthenticationError):
-            c.ping()
-        assert c.execute_command("AUTH", "it_acl_alt", "pw")
-        assert c.ping()
+        s = raw_socket()
+        reader = _RespReader(s)
+        s.sendall(_resp_encode(["PING"]))
+        with pytest.raises(redis.exceptions.ResponseError, match="NOAUTH"):
+            reader.read_reply()
+        s.sendall(_resp_encode(["AUTH", "it_acl_alt", "pw"]))
+        assert reader.read_reply() == "OK"
+        s.sendall(_resp_encode(["PING"]))
+        assert reader.read_reply() == "PONG"
     finally:
         assert r.execute_command("ACL", "SETUSER", "default", "on") == "OK"
         r.execute_command("ACL", "DELUSER", "it_acl_alt")
