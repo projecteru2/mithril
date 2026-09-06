@@ -833,6 +833,17 @@ def test_multi_checks_numkeys_and_store_slots(r, cluster_direct, key_prefix):
     pipe.sort(near, store=far)
     with pytest.raises(redis.exceptions.ResponseError, match=r"(?i)crossslot"):
         pipe.execute()
+    pipe = r.pipeline(transaction=True)
+    pipe.rpush(near, "b", "a")
+    pipe.execute_command("SORT", near, "BY", "STORE", "ALPHA")
+    assert len(pipe.execute()[1]) == 2
+
+
+def test_xreadgroup_consumer_named_streams(r, key_prefix):
+    stream = f"{key_prefix}:xs"
+    assert r.execute_command("XGROUP", "CREATE", stream, "g", "$", "MKSTREAM") == "OK"
+    read = r.execute_command("XREADGROUP", "GROUP", "g", "STREAMS", "COUNT", "1", "STREAMS", stream, ">")
+    assert read in (None, [])
 
 
 def test_command_getkeys_keyword_specs(raw_socket):
@@ -843,6 +854,9 @@ def test_command_getkeys_keyword_specs(raw_socket):
         (["sort", "src", "ALPHA", "STORE", "dst"], ["src", "dst"]),
         (["georadius", "g", "0", "0", "1", "km", "STOREDIST", "d"], ["g", "d"]),
         (["lmpop", "1", "l", "LEFT"], ["l"]),
+        (["xreadgroup", "GROUP", "g", "STREAMS", "STREAMS", "s1", ">"], ["s1"]),
+        (["sort", "{STORE}", "BY", "STORE", "ALPHA"], ["{STORE}"]),
+        (["georadiusbymember", "g", "STORE", "1", "km"], ["g"]),
     ]:
         s.sendall(_resp_encode(["COMMAND", "GETKEYS", *cmd]))
         assert reader.read_reply() == keys

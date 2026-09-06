@@ -15,7 +15,7 @@ use crate::resp;
 
 impl Session {
     pub(super) fn forward_xread(&self, spec: &Spec, frame: Bytes, argc: usize) -> Option<Cold<'_>> {
-        let Some((slot, blocking)) = xread_slot(&frame, argc) else {
+        let Some((slot, blocking)) = xread_slot(&frame, argc, spec.scan_from as usize) else {
             self.emit_error("ERR Unbalanced XREAD list of streams");
             return None;
         };
@@ -62,10 +62,10 @@ impl Session {
 }
 
 // the first stream key's slot and whether BLOCK precedes STREAMS; None when unbalanced
-fn xread_slot(frame: &Bytes, argc: usize) -> Option<(u16, bool)> {
+fn xread_slot(frame: &Bytes, argc: usize, start: usize) -> Option<(u16, bool)> {
     let mut blocking = false;
     let mut streams = None;
-    for (i, a) in resp::Args::new(frame, argc).enumerate() {
+    for (i, a) in resp::Args::new(frame, argc).enumerate().skip(start) {
         match streams {
             None if a.eq_ignore_ascii_case(b"streams") => streams = Some(i),
             None => blocking |= a.eq_ignore_ascii_case(b"block"),

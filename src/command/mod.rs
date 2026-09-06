@@ -70,8 +70,9 @@ pub enum Kind {
     Exec,
 }
 
-/// One command table entry: a key range at `first_key..=last_key` by `step`, and
-/// `numkeys` more keys counted by argv[`numkeys`] right after it.
+/// One command table entry: a key range at `first_key..=last_key` by `step`,
+/// `numkeys` more keys counted by argv[`numkeys`] right after it, and for the
+/// STREAMS/STORE forms the argv index `scan_from` where their options begin.
 #[derive(Debug, Clone, Copy)]
 pub struct Spec {
     pub name: &'static str,
@@ -82,6 +83,7 @@ pub struct Spec {
     pub last_key: i8,
     pub step: u8,
     pub numkeys: u8,
+    pub scan_from: u8,
     pub kind: Kind,
     pub info: u32,
     pub cats: u32,
@@ -146,8 +148,11 @@ impl Spec {
     where
         I: Iterator<Item = &'a [u8]> + Clone,
     {
-        let streams = matches!(self.kind, Kind::Xread).then(|| stream_keys(args.clone(), argc));
-        let stores = (self.flags & FLAG_STORE != 0).then(|| store_targets(args.clone()));
+        let options = (self.scan_from as usize).saturating_sub(1);
+        let streams = matches!(self.kind, Kind::Xread)
+            .then(|| stream_keys(args.clone().skip(options), argc.saturating_sub(options + 1)));
+        let stores =
+            (self.flags & FLAG_STORE != 0).then(|| store_targets(args.clone().skip(options)));
         self.keys(args, argc)
             .chain(streams.into_iter().flatten())
             .chain(stores.into_iter().flatten())
@@ -268,26 +273,41 @@ const fn build_lut() -> [u16; LUT_LEN] {
 }
 
 // the fold covers only the bytes a name has, so short names keep zero padding
-// the first half of what follows STREAMS
+// the first half of what follows STREAMS, out of `count` arguments
 fn stream_keys<'a>(
     args: impl Iterator<Item = &'a [u8]>,
-    argc: usize,
+    count: usize,
 ) -> impl Iterator<Item = &'a [u8]> {
     let mut args = args.enumerate();
     let after = args
         .by_ref()
         .find(|(_, a)| a.eq_ignore_ascii_case(b"streams"))
-        .map_or(0, |(i, _)| argc - i - 2);
+        .map_or(0, |(i, _)| count - i - 1);
     args.map(|(_, a)| a).take(after / 2)
 }
 
-// the argument after each STORE or STOREDIST past the source key
-fn store_targets<'a>(args: impl Iterator<Item = &'a [u8]>) -> impl Iterator<Item = &'a [u8]> {
-    let mut dest_next = false;
-    args.skip(1).filter(move |a| {
-        let take = dest_next;
-        dest_next = a.eq_ignore_ascii_case(b"store") || a.eq_ignore_ascii_case(b"storedist");
-        take
+// walks the options past the fixed arguments; STORE and STOREDIST name a destination
+fn store_targets<'a>(mut args: impl Iterator<Item = &'a [u8]>) -> impl Iterator<Item = &'a [u8]> {
+    std::iter::from_fn(move || {
+        loop {
+            let opt = args.next()?;
+            if opt.eq_ignore_ascii_case(b"store") || opt.eq_ignore_ascii_case(b"storedist") {
+                return args.next();
+            }
+            let operands = if opt.eq_ignore_ascii_case(b"limit") {
+                2
+            } else if [&b"by"[..], b"get", b"count"]
+                .iter()
+                .any(|o| opt.eq_ignore_ascii_case(o))
+            {
+                1
+            } else {
+                0
+            };
+            if operands > 0 {
+                args.nth(operands - 1)?;
+            }
+        }
     })
 }
 
@@ -319,6 +339,7 @@ const fn c(
     last_key: i8,
     step: u8,
     numkeys: u8,
+    scan_from: u8,
     kind: Kind,
     info: u32,
     cats: u32,
@@ -332,6 +353,7 @@ const fn c(
         last_key,
         step,
         numkeys,
+        scan_from,
         kind,
         info,
         cats,
@@ -468,6 +490,35 @@ mod tests {
             ["src", "dst"]
         );
         assert_eq!(all(&["sort", "store", "store", "dst"]), ["store", "dst"]);
+        assert_eq!(
+            all(&["sort", "{STORE}", "by", "STORE", "alpha"]),
+            ["{STORE}"]
+        );
+        assert_eq!(
+            all(&[
+                "sort", "k", "by", "p", "get", "#", "limit", "0", "1", "alpha", "store", "d"
+            ]),
+            ["k", "d"]
+        );
+        assert_eq!(
+            all(&["xreadgroup", "group", "g", "STREAMS", "streams", "s1", ">"]),
+            ["s1"]
+        );
+        assert_eq!(all(&["georadiusbymember", "g", "STORE", "1", "km"]), ["g"]);
+        assert_eq!(
+            all(&[
+                "georadiusbymember",
+                "g",
+                "m",
+                "1",
+                "km",
+                "store",
+                "d",
+                "storedist",
+                "e"
+            ]),
+            ["g", "d", "e"]
+        );
         assert_eq!(
             all(&["georadius", "g", "0", "0", "1", "km", "storedist", "d"]),
             ["g", "d"]
