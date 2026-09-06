@@ -5,6 +5,7 @@ use std::fmt::Write;
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::acl::Acl;
 use crate::command::Spec;
 use crate::config::Config;
 use crate::crc16::{self, SLOTS};
@@ -20,7 +21,7 @@ const CLUSTER_INFO: &str = "cluster_enabled:1\r\ncluster_state:ok\r\ncluster_slo
      cluster_slots_ok:16384\r\ncluster_slots_pfail:0\r\ncluster_slots_fail:0\r\n\
      cluster_known_nodes:1\r\ncluster_size:1\r\n";
 
-const CONFIG_KEYS: [&str; 18] = [
+const CONFIG_KEYS: [&str; 20] = [
     "bind",
     "port",
     "announce-addr",
@@ -39,6 +40,8 @@ const CONFIG_KEYS: [&str; 18] = [
     "query-buffer-limit",
     "topology-refresh-secs",
     "loglevel",
+    "acl-pubsub-default",
+    "acllog-max-len",
 ];
 
 pub fn ping(args: &[&[u8]]) -> Vec<u8> {
@@ -260,7 +263,7 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
     out
 }
 
-pub fn config_cmd(args: &[&[u8]], cfg: &Config) -> Vec<u8> {
+pub fn config_cmd(args: &[&[u8]], cfg: &Config, acl: &Acl) -> Vec<u8> {
     let mut out = Vec::new();
     if sub_is(args, 1, b"get") && args.len() == 3 {
         let want = args[2];
@@ -268,19 +271,12 @@ pub fn config_cmd(args: &[&[u8]], cfg: &Config) -> Vec<u8> {
         resp::array_header(&mut out, CONFIG_KEYS.iter().filter(wanted).count() * 2);
         for k in CONFIG_KEYS.iter().filter(wanted) {
             resp::bulk(&mut out, k.as_bytes());
-            resp::bulk(&mut out, config_value(cfg, k).as_bytes());
+            resp::bulk(&mut out, config_value(cfg, acl, k).as_bytes());
         }
     } else if sub_is(args, 1, b"set") && args.len() == 4 {
-        if !sub_is(args, 2, b"loglevel") {
-            resp::write_error(&mut out, "ERR unsupported CONFIG SET parameter");
-        } else {
-            match crate::log::parse_level(&String::from_utf8_lossy(args[3])) {
-                Ok(level) => {
-                    crate::log::set_level(level);
-                    out.extend_from_slice(resp::OK);
-                }
-                Err(e) => resp::write_error(&mut out, &format!("ERR {e}")),
-            }
+        match config_set(acl, args[2], args[3]) {
+            Ok(()) => out.extend_from_slice(resp::OK),
+            Err(e) => resp::write_error(&mut out, &e),
         }
     } else {
         resp::write_error(&mut out, "ERR unsupported CONFIG subcommand");
@@ -370,7 +366,27 @@ fn yesno(v: bool) -> &'static str {
     if v { "yes" } else { "no" }
 }
 
-fn config_value<'a>(cfg: &'a Config, key: &str) -> Cow<'a, str> {
+fn config_set(acl: &Acl, key: &[u8], value: &[u8]) -> Result<(), String> {
+    let value = String::from_utf8_lossy(value);
+    if key.eq_ignore_ascii_case(b"loglevel") {
+        crate::log::set_level(crate::log::parse_level(&value).map_err(|e| format!("ERR {e}"))?);
+    } else if key.eq_ignore_ascii_case(b"acl-pubsub-default") {
+        acl.set_all_channels_default(match &*value {
+            "allchannels" => true,
+            "resetchannels" => false,
+            _ => return Err("ERR CONFIG SET failed (possibly related to argument 'acl-pubsub-default') - argument must be one of the following: allchannels, resetchannels".into()),
+        });
+    } else if key.eq_ignore_ascii_case(b"acllog-max-len") {
+        acl.set_log_max(value.parse().map_err(|_| {
+            "ERR CONFIG SET failed (possibly related to argument 'acllog-max-len') - argument couldn't be parsed into an integer".to_string()
+        })?);
+    } else {
+        return Err("ERR unsupported CONFIG SET parameter".into());
+    }
+    Ok(())
+}
+
+fn config_value<'a>(cfg: &'a Config, acl: &Acl, key: &str) -> Cow<'a, str> {
     match key {
         "bind" => Cow::Borrowed(&cfg.bind),
         "port" => cfg.port.to_string().into(),
@@ -391,6 +407,9 @@ fn config_value<'a>(cfg: &'a Config, key: &str) -> Cow<'a, str> {
         "query-buffer-limit" => cfg.query_buffer_limit.to_string().into(),
         "topology-refresh-secs" => cfg.topology_refresh_secs.to_string().into(),
         "loglevel" => crate::log::level_name(crate::log::level()).into(),
+        "acl-pubsub-default" if acl.all_channels_default() => "allchannels".into(),
+        "acl-pubsub-default" => "resetchannels".into(),
+        "acllog-max-len" => acl.log_max().to_string().into(),
         _ => Cow::Borrowed(""),
     }
 }
@@ -408,10 +427,11 @@ mod tests {
     fn every_config_key_has_a_value() {
         let mut cfg = test_cfg();
         cfg.requirepass = "x".to_string();
+        let acl = Acl::new(&cfg).unwrap();
         for key in CONFIG_KEYS {
-            assert!(!config_value(&cfg, key).is_empty(), "{key}");
+            assert!(!config_value(&cfg, &acl, key).is_empty(), "{key}");
         }
-        assert!(config_value(&cfg, "no-such-key").is_empty());
+        assert!(config_value(&cfg, &acl, "no-such-key").is_empty());
     }
 
     #[test]
@@ -473,7 +493,8 @@ mod tests {
     fn config_get_redacts_requirepass() {
         let mut cfg = test_cfg();
         cfg.requirepass = "secret".to_string();
-        let reply = config_cmd(&[b"config", b"get", b"requirepass"], &cfg);
+        let acl = Acl::new(&cfg).unwrap();
+        let reply = config_cmd(&[b"config", b"get", b"requirepass"], &cfg, &acl);
         let text = String::from_utf8_lossy(&reply);
         assert!(!text.contains("secret"), "{text}");
     }

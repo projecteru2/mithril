@@ -1,6 +1,6 @@
 # Compatibility
 
-The 66-test integration suite runs against each backend, in every mode
+The 70-test integration suite runs against each backend, in every mode
 combination (`backend-sharding`, `reply-cache`), with full cluster
 teardown/recreate between versions; it includes a live slot migration
 (CLUSTER SETSLOT MIGRATING/IMPORTING + MIGRATE) under multi-key commands:
@@ -18,7 +18,12 @@ memtier_benchmark, redis-benchmark.
 
 ## Known limitations
 
-- AUTH is single-password (`requirepass`, default user); no ACL user table.
+- ACL: users, passwords, command/category/subcommand rules, key and
+  channel patterns, ACL LOG. Not supported: selectors, ACL LOAD/SAVE (no
+  ACL file), removing a single subcommand (`-cmd|sub`), the
+  `sanitize-payload` flags, and `CONFIG SET requirepass` at runtime. ACL
+  GETUSER and ACL LOG use the Redis 6.2 reply shapes; GETUSER renders
+  command rules in canonical form (`-@all +@cat... +cmd... +cmd|sub`).
 - MULTI queues key-addressed commands only (EVAL/PING inside MULTI are
   rejected; real Redis queues them). WATCH is not supported.
 - Aggregate replies to RESP3 clients keep RESP2 shape (flat arrays, not

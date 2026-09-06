@@ -11,6 +11,7 @@ mod queue;
 mod scripting;
 mod session;
 mod tuner;
+mod users;
 mod writer;
 
 pub use queue::{ReplyQueue, SharedQueue};
@@ -27,6 +28,7 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
+use crate::acl::Acl;
 use crate::backend::Backends;
 use crate::cache::ReplyCache;
 use crate::config::Config;
@@ -55,6 +57,7 @@ pub struct Shared {
     pub fabric: Option<Arc<Fabric>>,
     pub cache: Option<Rc<ReplyCache>>,
     pub scripts: Arc<Scripts>,
+    pub acl: Arc<Acl>,
     pub inflight: Cell<u64>,
     pub prefer_shared: Cell<bool>,
 }

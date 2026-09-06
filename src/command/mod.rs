@@ -18,6 +18,9 @@ pub const FLAG_PUBSUB: u8 = 1 << 6;
 /// A multi-key reply that is one aggregate, never rebuilt from per-key resends.
 pub const FLAG_UNION: u8 = 1 << 7;
 
+/// Upper bound on table rows; ACL command bitmaps are sized by it.
+pub const MAX_COMMANDS: usize = 512;
+
 const MAX_NAME: usize = 24;
 
 const PREFIX_LEN: usize = 8;
@@ -77,6 +80,7 @@ pub enum Kind {
 /// STREAMS/STORE forms the argv index `scan_from` where their options begin.
 #[derive(Debug, Clone, Copy)]
 pub struct Spec {
+    pub id: u16,
     pub name: &'static str,
     pub prefix: u64,
     pub arity: i8,
@@ -212,6 +216,11 @@ pub fn table() -> &'static [Spec] {
     TABLE
 }
 
+/// ACL category names in Redis order, `@` included.
+pub fn cat_names() -> &'static [&'static str] {
+    CAT_NAMES
+}
+
 /// Case-insensitive lookup; the u64-prefix key makes a probe one integer compare.
 pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
     if name.is_empty() || name.len() > MAX_NAME {
@@ -334,6 +343,7 @@ const fn prefix64(name: &[u8]) -> u64 {
 
 #[allow(clippy::too_many_arguments)]
 const fn c(
+    id: u16,
     name: &'static str,
     arity: i8,
     flags: u8,
@@ -347,6 +357,7 @@ const fn c(
     cats: u32,
 ) -> Spec {
     Spec {
+        id,
         name,
         prefix: folded_prefix(name.as_bytes()),
         arity,
@@ -376,7 +387,9 @@ mod tests {
 
     #[test]
     fn every_entry_resolves_through_the_lut() {
-        for spec in TABLE {
+        assert!(TABLE.len() <= MAX_COMMANDS);
+        for (i, spec) in TABLE.iter().enumerate() {
+            assert_eq!(spec.id as usize, i, "{}", spec.name);
             assert_eq!(
                 lookup(spec.name.as_bytes()).map(|s| s.name),
                 Some(spec.name)

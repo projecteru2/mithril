@@ -4,6 +4,7 @@ Everything runs against the live containers on the `mithnet` docker network;
 see conftest.py for connection fixtures and defaults.
 """
 
+import hashlib
 import threading
 import time
 
@@ -961,3 +962,117 @@ def test_functions_through_proxy(r, cluster_direct, key_prefix):
     assert r.function_delete(lib)
     with pytest.raises(redis.ResponseError):
         r.fcall(f"{lib}_set", 1, key, "v")
+
+
+def test_acl_users_are_managed_at_runtime(r):
+    name = "it_acl_user"
+    r.execute_command("ACL", "DELUSER", name)
+    rules = ["on", ">pw", "~it:*", "resetchannels", "&chan*", "-@all", "+@string", "+acl|whoami"]
+    assert r.execute_command("ACL", "SETUSER", name, *rules) == "OK"
+    assert name in r.execute_command("ACL", "USERS")
+    line = next(l for l in r.execute_command("ACL", "LIST") if l.startswith(f"user {name} "))
+    digest = hashlib.sha256(b"pw").hexdigest()
+    assert line == f"user {name} on #{digest} ~it:* &chan* -@all +@string +acl|whoami"
+    got = r.execute_command("ACL", "GETUSER", name)
+    assert got[:4] == ["flags", ["on"], "passwords", [digest]]
+    assert got[4:] == ["commands", "-@all +@string +acl|whoami", "keys", ["it:*"], "channels", ["chan*"]]
+    assert r.execute_command("ACL", "GETUSER", "it_no_such_user") is None
+    assert len(r.execute_command("ACL", "CAT")) == 21
+    assert "get" in r.execute_command("ACL", "CAT", "string")
+    with pytest.raises(redis.exceptions.ResponseError, match="Unknown category"):
+        r.execute_command("ACL", "CAT", "nosuch")
+    with pytest.raises(redis.exceptions.ResponseError, match="Unknown command or category"):
+        r.execute_command("ACL", "SETUSER", name, "+nosuchcommand")
+    with pytest.raises(redis.exceptions.ResponseError, match="after the \\* pattern"):
+        r.execute_command("ACL", "SETUSER", name, "~*", "~more")
+    assert len(r.execute_command("ACL", "GENPASS")) == 64
+    assert len(r.execute_command("ACL", "GENPASS", "32")) == 8
+    assert r.execute_command("ACL", "DELUSER", name, "it_no_such_user") == 1
+    with pytest.raises(redis.exceptions.ResponseError, match="default"):
+        r.execute_command("ACL", "DELUSER", "default")
+
+
+def test_acl_restricted_user_is_enforced(r, new_conn, key_prefix):
+    name = "it_acl_limited"
+    rules = ["reset", "on", ">pw", f"~{key_prefix}:*", "resetchannels", "&news:*", "-@all", "+get", "+set",
+             "+publish", "+multi", "+exec", "+acl|whoami"]
+    assert r.execute_command("ACL", "SETUSER", name, *rules) == "OK"
+    r.execute_command("ACL", "LOG", "RESET")
+    c = new_conn()
+    assert c.execute_command("AUTH", name, "pw")
+    assert c.execute_command("ACL", "WHOAMI") == name
+    k = f"{key_prefix}:acl"
+    assert c.set(k, "v")
+    assert c.get(k) == "v"
+    with pytest.raises(redis.exceptions.NoPermissionError, match="run the 'del' command"):
+        c.delete(k)
+    with pytest.raises(redis.exceptions.NoPermissionError, match="access one of the keys"):
+        c.get("other:key")
+    with pytest.raises(redis.exceptions.NoPermissionError, match="access one of the channels"):
+        c.publish("sports", "x")
+    assert c.publish("news:1", "x") == 0
+    with pytest.raises(redis.exceptions.NoPermissionError, match="run the 'acl' command"):
+        c.execute_command("ACL", "LOG")
+    pipe = c.pipeline(transaction=True)
+    pipe.set(k, "changed")
+    pipe.delete(k)
+    with pytest.raises(redis.exceptions.NoPermissionError):
+        pipe.execute()
+    assert c.get(k) == "v"
+    log = r.execute_command("ACL", "LOG")
+    assert {e[3] for e in log} == {"command", "key", "channel"}
+    assert {e[7] for e in log} >= {"del", "other:key", "sports", "acl"}
+    assert {e[9] for e in log} == {name}
+    assert "multi" in {e[5] for e in log}
+    assert len(r.execute_command("ACL", "LOG", "2")) == 2
+    assert r.execute_command("ACL", "LOG", "RESET") == "OK"
+    assert r.execute_command("ACL", "LOG") == []
+    assert r.execute_command("ACL", "DELUSER", name) == 1
+
+
+def test_acl_changes_reach_live_sessions(r, new_conn, key_prefix):
+    name = "it_acl_live"
+    assert r.execute_command("ACL", "SETUSER", name, "reset", "on", ">pw", "~*", "&*", "+@all") == "OK"
+    c = new_conn()
+    assert c.execute_command("AUTH", name, "pw")
+    k = f"{key_prefix}:live"
+    assert c.set(k, "1")
+    assert r.execute_command("ACL", "SETUSER", name, "-set") == "OK"
+    with pytest.raises(redis.exceptions.NoPermissionError, match="run the 'set' command"):
+        c.set(k, "2")
+    assert c.get(k) == "1"
+    assert r.execute_command("ACL", "SETUSER", name, "off") == "OK"
+    with pytest.raises(redis.exceptions.AuthenticationError):
+        new_conn().execute_command("AUTH", name, "pw")
+    assert c.get(k) == "1"
+    assert r.execute_command("ACL", "DELUSER", name) == 1
+    with pytest.raises(redis.exceptions.ConnectionError):
+        c.get(k)
+
+
+def test_hello_auth_and_acl_config(r, new_conn, raw_socket):
+    name = "it_acl_hello"
+    assert r.execute_command("ACL", "SETUSER", name, "reset", "on", ">pw", "~*", "&*", "+@all") == "OK"
+    s = raw_socket()
+    reader = _RespReader(s)
+    s.sendall(_resp_encode(["HELLO", "2", "AUTH", name, "bad"]))
+    with pytest.raises(redis.exceptions.ResponseError, match="WRONGPASS"):
+        reader.read_reply()
+    s.sendall(_resp_encode(["HELLO", "2", "AUTH", name, "pw"]))
+    assert "proto" in reader.read_reply()
+    s.sendall(_resp_encode(["ACL", "WHOAMI"]))
+    assert reader.read_reply() == name
+    assert r.config_get("acl-pubsub-default") == {"acl-pubsub-default": "allchannels"}
+    assert r.config_set("acllog-max-len", 2)
+    assert r.config_get("acllog-max-len") == {"acllog-max-len": "2"}
+    r.execute_command("ACL", "LOG", "RESET")
+    for _ in range(3):
+        with pytest.raises(redis.exceptions.AuthenticationError):
+            new_conn().execute_command("AUTH", name, "nope")
+    log = r.execute_command("ACL", "LOG")
+    assert len(log) == 2 and {e[3] for e in log} == {"auth"}
+    assert r.config_set("acllog-max-len", 128)
+    with pytest.raises(redis.exceptions.ResponseError, match="acl-pubsub-default"):
+        r.config_set("acl-pubsub-default", "sometimes")
+    assert r.execute_command("ACL", "DELUSER", name) == 1
+

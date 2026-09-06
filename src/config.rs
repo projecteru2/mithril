@@ -85,6 +85,9 @@ pub struct Config {
     pub reply_cache_max_bytes: usize,
     pub reply_cache_max_age_secs: u64,
     pub requirepass: String,
+    pub users: Vec<String>,
+    pub acl_pubsub_default_all: bool,
+    pub acllog_max_len: usize,
     pub backend_user: String,
     pub backend_pass: String,
     pub slave_mode: SlaveMode,
@@ -111,6 +114,9 @@ impl Default for Config {
             reply_cache_max_bytes: 64 << 20,
             reply_cache_max_age_secs: 10,
             requirepass: String::new(),
+            users: Vec::new(),
+            acl_pubsub_default_all: true,
+            acllog_max_len: crate::acl::default_log_max(),
             backend_user: String::new(),
             backend_pass: String::new(),
             slave_mode: SlaveMode::Off,
@@ -164,6 +170,15 @@ impl Config {
                 self.reply_cache_max_age_secs = parse_bounded(key, value, 1, 3600)? as u64;
             }
             "requirepass" => self.requirepass = value.to_string(),
+            "user" => self.users.push(value.to_string()),
+            "acl-pubsub-default" => {
+                self.acl_pubsub_default_all = match value {
+                    "allchannels" => true,
+                    "resetchannels" => false,
+                    _ => return Err(format!("{key}: expected allchannels or resetchannels")),
+                }
+            }
+            "acllog-max-len" => self.acllog_max_len = parse_bounded(key, value, 0, 1_000_000)?,
             "backend-auth-user" => self.backend_user = value.to_string(),
             "backend-auth-pass" => self.backend_pass = value.to_string(),
             "slave-mode" => self.slave_mode = parse_slave_mode(value)?,

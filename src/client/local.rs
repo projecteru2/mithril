@@ -151,7 +151,10 @@ impl Session {
         self.store_name("");
         self.proto.set(2);
         self.link.proto_switches.push(self.link.next_seq.get(), 2);
-        self.authed.set(self.shared.cfg.requirepass.is_empty());
+        let generation = self.shared.acl.generation();
+        let user = self.shared.acl.default_user();
+        self.authed.set(user.nopass);
+        self.adopt(user, generation);
     }
 
     pub(super) fn abort_multi(&self) {
@@ -165,7 +168,11 @@ impl Session {
             "ping" => Some(Bytes::from(admin::ping(args))),
             "echo" => Some(Bytes::from(admin::echo(args))),
             "select" => Some(Bytes::from(admin::select(args))),
-            "config" => Some(Bytes::from(admin::config_cmd(args, &self.shared.cfg))),
+            "config" => Some(Bytes::from(admin::config_cmd(
+                args,
+                &self.shared.cfg,
+                &self.shared.acl,
+            ))),
             "cluster" => Some(Bytes::from(admin::cluster(
                 args,
                 &self.shared.cfg,
@@ -180,14 +187,7 @@ impl Session {
                 self.handle_hello(args);
                 None
             }
-            "acl" => match args.get(1) {
-                Some(sub) if sub.eq_ignore_ascii_case(b"whoami") => {
-                    let mut out = Vec::new();
-                    resp::bulk(&mut out, b"default");
-                    Some(Bytes::from(out))
-                }
-                _ => Some(error_frame("ERR unsupported ACL subcommand")),
-            },
+            "acl" => Some(self.handle_acl(args)),
             "client" => {
                 self.handle_client_cmd(args);
                 None
@@ -197,18 +197,19 @@ impl Session {
     }
 
     fn handle_auth(&self, args: &[&[u8]]) {
-        let pass = self.shared.cfg.requirepass.as_bytes();
-        if pass.is_empty() {
-            self.emit_error("ERR Client sent AUTH, but no password is set");
-            return;
-        }
-        let given = match args.len() {
-            2 => Some(args[1]),
-            3 if args[1] == b"default" => Some(args[2]),
-            _ => None,
+        let (name, password) = match args {
+            [_, _] if self.shared.acl.default_user().nopass => {
+                self.emit_error("ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?");
+                return;
+            }
+            [_, password] => (&b"default"[..], *password),
+            [_, name, password] => (*name, *password),
+            _ => {
+                self.emit_error("ERR wrong number of arguments for 'auth' command");
+                return;
+            }
         };
-        if given == Some(pass) {
-            self.authed.set(true);
+        if self.login(name, password) {
             self.emit_local(Bytes::from_static(resp::OK));
         } else {
             self.emit_error("WRONGPASS invalid username-password pair or user is disabled.");
@@ -238,11 +239,7 @@ impl Session {
                     self.emit_error("ERR syntax error in HELLO");
                     return;
                 }
-                let (user, pass) = (args[i + 1], args[i + 2]);
-                let expected = self.shared.cfg.requirepass.as_bytes();
-                if expected.is_empty() || (user == b"default" && pass == expected) {
-                    self.authed.set(true);
-                } else {
+                if !self.login(args[i + 1], args[i + 2]) {
                     self.emit_error(
                         "WRONGPASS invalid username-password pair or user is disabled.",
                     );

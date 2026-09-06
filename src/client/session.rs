@@ -23,6 +23,7 @@ use super::queue::ReplyQueue;
 use super::tuner::PIPELINED_LOCAL;
 use super::writer::write_loop;
 use super::{Cold, ERR_NO_OWNER, ERR_NOAUTH, MAX_INFLIGHT, Reply, Shared, error_frame};
+use crate::acl::User;
 use crate::backend::{ERR_BACKEND_LOST, ensure_read_room};
 use crate::cache::CACHING_FRAME;
 use crate::command::{self, Kind, Spec};
@@ -42,6 +43,10 @@ pub(super) struct Session {
     pub(super) link: Rc<WriterLink>,
     pub(super) proto: Cell<u8>,
     pub(super) authed: Cell<bool>,
+    pub(super) user: RefCell<Arc<User>>,
+    // mirrors the user: a session no rule can deny skips the permission check
+    pub(super) unrestricted: Cell<bool>,
+    pub(super) acl_gen: Cell<u64>,
     rng: Cell<u64>,
     pub(super) multi: RefCell<Option<MultiState>>,
     pub(super) in_multi: Cell<bool>,
@@ -277,6 +282,17 @@ impl Session {
         }
         if !self.authed.get() && spec.flags & command::FLAG_NO_AUTH == 0 {
             self.emit_error_frame(Bytes::from_static(ERR_NOAUTH));
+            return;
+        }
+        if self.acl_gen.get() != self.shared.acl.generation() && !self.refresh_user() {
+            self.closing.set(true);
+            return;
+        }
+        if !self.unrestricted.get()
+            && let Some(err) = self.acl_denies(spec, &frame, argc)
+        {
+            self.abort_multi();
+            self.emit_error_frame(err);
             return;
         }
         if self.auto {
@@ -606,13 +622,18 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: SocketAddr, id: 
     link.sharded
         .set(shared.cfg.backend_sharding == Sharding::On);
 
+    let acl_gen = shared.acl.generation();
+    let user = shared.acl.default_user();
     let session = Session {
         shared: shared.clone(),
         id,
         reply_q: reply_q.clone(),
         link: link.clone(),
         proto: Cell::new(2),
-        authed: Cell::new(shared.cfg.requirepass.is_empty()),
+        authed: Cell::new(user.nopass),
+        unrestricted: Cell::new(user.unrestricted()),
+        acl_gen: Cell::new(acl_gen),
+        user: RefCell::new(user),
         rng: Cell::new(id | 1),
         multi: RefCell::new(None),
         in_multi: Cell::new(false),

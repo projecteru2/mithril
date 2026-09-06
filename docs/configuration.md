@@ -18,7 +18,10 @@ See [`mithril.conf.sample`](https://github.com/projecteru2/mithril/blob/master/m
 | `reply-cache` | `yes`/`no` | `no` | worker-local GET/MGET reply cache; the servers track the keys the proxy caches (redirected opt-in RESP3 tracking) and invalidate them on change, so hits skip the backend round trip and a session reads its own writes |
 | `reply-cache-max-bytes` | bytes | `64mb` | per-worker budget for the two cache generations; the live generation holds half of it, so a worker's hot set must fit in half the budget to keep hitting (see operations.md for sizing and the RSS to expect) |
 | `reply-cache-max-age-secs` | 1..3600 | `10` | staleness backstop for missed invalidations; entries older than this never serve |
-| `requirepass` | string | empty | client password (default user); empty disables AUTH |
+| `requirepass` | string | empty | password of the `default` ACL user; empty leaves it passwordless (`nopass`) |
+| `user` | line | none | an ACL user, repeatable: `user <name> <rules...>` in Redis ACL SETUSER syntax (`user app on >secret ~app:* &* -@all +@read +@string`); applied at startup, editable afterwards with ACL SETUSER |
+| `acl-pubsub-default` | enum | `allchannels` | channels a new or `reset` user starts with: `allchannels` or `resetchannels`; changeable at runtime via `CONFIG SET` |
+| `acllog-max-len` | 0..1000000 | `128` | entries kept by ACL LOG; changeable at runtime via `CONFIG SET` |
 | `backend-auth-user` | string | empty | username sent to backends (`AUTH user pass`) |
 | `backend-auth-pass` | string | empty | password sent to backends |
 | `slave-mode` | enum | `off` | replica read splitting: `off`, `master_readwrite`, `master_writeonly` |
@@ -26,7 +29,7 @@ See [`mithril.conf.sample`](https://github.com/projecteru2/mithril/blob/master/m
 | `tcp-keepalive` | seconds | `300` | keepalive on backend connections |
 | `query-buffer-limit` | bytes | `1gb` | per-client input cap; accepts `kb`/`mb`/`gb` suffixes; also bounds queued MULTI bytes |
 | `topology-refresh-secs` | 1..3600 | `15` | periodic CLUSTER NODES refresh; redirects trigger one immediately (debounced 100ms) |
-| `loglevel` | enum | `notice` | `debug`, `verbose`, `notice`, `warning`; the only key changeable at runtime via `CONFIG SET` |
+| `loglevel` | enum | `notice` | `debug`, `verbose`, `notice`, `warning`; changeable at runtime via `CONFIG SET` |
 
 ## Replica read splitting
 

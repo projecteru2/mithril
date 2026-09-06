@@ -12,6 +12,7 @@ pub const REVISION: &str = match option_env!("MITHRIL_REVISION") {
 pub mod config;
 pub mod server;
 
+pub(crate) mod acl;
 pub(crate) mod admin;
 pub(crate) mod backend;
 pub(crate) mod cache;

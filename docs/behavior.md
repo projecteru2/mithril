@@ -30,7 +30,16 @@
   nulls convert to `_`; pubsub frames convert to push type. Aggregate replies
   keep RESP2 shape (flat arrays, not maps) — every mainstream client parses
   by wire type and accepts this.
-- AUTH is single-password (`requirepass`, default user). No ACL user table.
+- AUTH and `HELLO ... AUTH` resolve users from the proxy's ACL table:
+  `requirepass` is the `default` user's password, `user` lines and ACL
+  SETUSER define the rest. An unrestricted user (all commands, keys and
+  channels — the default user as configured) costs nothing per command; a
+  restricted user is checked before dispatch: the command or its allowed
+  subcommand, every key the request touches (the same walker the reply
+  cache and MULTI use), and the channels of PUBLISH/SUBSCRIBE/PSUBSCRIBE.
+  A denial answers NOPERM, aborts an open MULTI and lands in ACL LOG. Rule
+  changes reach connected sessions at their next command; a deleted user's
+  sessions close.
 - `reply-cache yes` serves GET and MGET (up to 64 keys) from a worker-local cache. Coherence: every
   backend connection redirects RESP3 key tracking to a per-worker tracker
   connection and opts each cached read in (`CLIENT CACHING YES`), so a server
