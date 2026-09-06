@@ -93,11 +93,18 @@ impl Session {
         };
         let current: Box<str> = clip(self.user.borrow().name.as_bytes());
         let username = username.map_or_else(|| current.clone(), clip);
-        // the info line is space-delimited: the session user's name must stay one token
-        let user_token: String = current
-            .chars()
-            .map(|c| if c.is_whitespace() { '_' } else { c })
-            .collect();
+        // the info line is space-delimited key=value pairs: names must stay one plain token
+        let token = |v: &str| -> String {
+            v.chars()
+                .map(|c| {
+                    if c.is_whitespace() || c == '=' {
+                        '_'
+                    } else {
+                        c
+                    }
+                })
+                .collect()
+        };
         let (subs, patterns) = self.subs.borrow().counts();
         let queued = self
             .multi
@@ -108,12 +115,13 @@ impl Session {
             let registry = self.shared.stats.registry();
             let info = registry.get(&self.id);
             format!(
-                "id={} addr={} fd={} name={} age={} idle=0 flags=N db=0 sub={subs} psub={patterns} ssub=0 multi={queued} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={cmd} user={user_token} redir=-1 resp={}",
+                "id={} addr={} fd={} name={} age={} idle=0 flags=N db=0 sub={subs} psub={patterns} ssub=0 multi={queued} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={cmd} user={} redir=-1 resp={}",
                 self.id,
                 info.map_or(String::new(), |i| i.addr.to_string()),
                 info.map_or(-1, |i| i.fd),
-                info.map_or("", |i| &i.name),
+                info.map_or(String::new(), |i| token(&i.name)),
                 info.map_or(0, |i| i.since.elapsed().as_secs()),
+                token(&current),
                 self.proto.get(),
             )
         };
