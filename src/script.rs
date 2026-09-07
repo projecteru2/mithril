@@ -12,11 +12,6 @@ pub struct Scripts {
     inner: Mutex<Inner>,
 }
 
-struct Inner {
-    flushes: u64,
-    bodies: HashMap<Box<[u8]>, Bytes>,
-}
-
 impl Scripts {
     pub fn new() -> Arc<Scripts> {
         Arc::new(Scripts {
@@ -59,6 +54,11 @@ impl Scripts {
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+struct Inner {
+    flushes: u64,
+    bodies: HashMap<Box<[u8]>, Bytes>,
 }
 
 #[cfg(test)]

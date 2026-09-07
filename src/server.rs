@@ -228,11 +228,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
             .spawn(move || worker_thread(ctx, conn_rx, shard))
             .map_err(|e| format!("spawn worker: {e}"))?;
     }
-    let acceptor_cfg = cfg.clone();
     let acceptor_stats = stats.clone();
     std::thread::Builder::new()
         .name("mithril-accept".to_string())
-        .spawn(move || acceptor_thread(listener, acceptor_cfg, acceptor_stats, conn_txs))
+        .spawn(move || acceptor_thread(listener, cfg, acceptor_stats, conn_txs))
         .map_err(|e| format!("spawn acceptor: {e}"))?;
 
     wait_for_signal();
