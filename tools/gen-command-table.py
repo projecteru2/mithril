@@ -14,8 +14,9 @@ OUT = os.path.join(HERE, "..", "src", "command", "table.rs")
 STD_FLAGS = ["write", "readonly", "denyoom", "module", "admin", "pubsub", "noscript", "blocking",
              "loading", "stale", "skip_monitor", "skip_slowlog", "asking", "fast", "no_auth",
              "may_replicate", "sentinel", "only_sentinel", "no_mandatory_keys", "protected",
-             "no_async_loading", "no_multi", "movablekeys", "allow_busy", "touches_arbitrary_keys"]
-STD_CATS = ["keyspace", "read", "write", "set", "sortedset", "list", "hash", "string", "bitmap",
+             "no_async_loading", "no_multi", "movablekeys", "allow_busy", "touches_arbitrary_keys",
+             "script_runner"]
+STD_CATS = ["keyspace", "read", "write", "set", "sortedset", "list", "hash", "string", "array", "bitmap",
             "hyperloglog", "geo", "stream", "pubsub", "admin", "fast", "slow", "blocking",
             "dangerous", "connection", "transaction", "scripting"]
 
@@ -40,6 +41,8 @@ MFLAGS = {
 }
 # SORT reports its STORE spec as unknown; its options begin after the key
 SCAN_FROM = {"sort": 2}
+# key positions of commands whose only key spec is keyword-based: (first, last, step, numkeys)
+KEYS = {"json.debug": (2, 2, 1, 0)}
 
 SKIP = {
     "asking", "bgrewriteaof", "bgsave", "clusterscan", "commandlog", "debug", "failover", "flushdb",
@@ -51,10 +54,12 @@ SKIP = {
 }
 SKIP_PREFIX = ("ft.", "_ft.", "search.", "timeseries.")
 # commands plus subcommands must fit the ACL bitmap (src/command/mod.rs MAX_COMMANDS)
-MAX_ENTRIES = 512
+MAX_ENTRIES = 640
 
 
 def keyspec(name, specs):
+    if name in KEYS:
+        return KEYS[name]
     ranges, knum = [], None
     for s in specs:
         if s["begin"] != "index":
@@ -130,7 +135,7 @@ def main():
         if kind is None:
             if first == 0 and numkeys == 0:
                 continue
-            kind = "Single"
+            kind = "Blocking" if "blocking" in flags else "Single"
         m = []
         if "write" in flags:
             m.append("W")

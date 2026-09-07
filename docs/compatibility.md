@@ -1,6 +1,6 @@
 # Compatibility
 
-The 72-test integration suite runs against each backend, in every mode
+The 76-test integration suite runs against each backend, in every mode
 combination (`backend-sharding`, `reply-cache`), with full cluster
 teardown/recreate between versions; it includes a live slot migration
 (CLUSTER SETSLOT MIGRATING/IMPORTING + MIGRATE) under multi-key commands:
@@ -10,7 +10,8 @@ teardown/recreate between versions; it includes a live slot migration
 | redis:6.2 | 6.2.24 | pass |
 | redis:7.4 | 7.4.11 | pass |
 | redis:8.2 | 8.2.9 | pass |
-| valkey/valkey:9.1 | 9.1.1 | pass |
+| redis:8.10 | 8.10.1 | pass |
+| valkey/valkey:9.1 | 9.1.2 | pass |
 | redis-stable (source) | 8.10.1 | pass |
 
 Clients verified: redis-py (cluster and standalone mode), redis-cli,
@@ -41,8 +42,8 @@ memtier_benchmark, redis-benchmark.
   commands reach the masters that own slots; a node needs its libraries
   loaded before slots move to it, as with any client.
 - Shard pubsub (SSUBSCRIBE/SPUBLISH/SUNSUBSCRIBE) is not implemented.
-- Blocking commands (BLPOP, BRPOP, BRPOPLPUSH, BLMOVE, BLMPOP, BZPOPMAX,
-  BZPOPMIN, BZMPOP, blocking XREAD) always run on the slot's master and
+- Blocking commands (BLPOP, BRPOP, BRPOPLPUSH, BLMOVE, BLMOVEM, BLMPOP,
+  BZPOPMAX, BZPOPMIN, BZMPOP, blocking XREAD) always run on the slot's master and
   never use replica routing.
 - FLUSHDB and cluster-wide KEYS are not implemented; RANDOMKEY samples one
   random master's keyspace, not the whole cluster.

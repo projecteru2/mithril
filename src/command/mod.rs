@@ -19,7 +19,7 @@ pub const FLAG_PUBSUB: u8 = 1 << 6;
 pub const FLAG_UNION: u8 = 1 << 7;
 
 /// Upper bound on commands plus subcommands; ACL bitmaps are sized by it.
-pub const MAX_COMMANDS: usize = 512;
+pub const MAX_COMMANDS: usize = 640;
 const _: () = assert!(ENTRIES <= MAX_COMMANDS);
 
 const MAX_NAME: usize = 24;

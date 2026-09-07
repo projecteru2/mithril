@@ -11,7 +11,7 @@ use crate::acl::{self, ERR_NOPERM_CHANNEL, ERR_NOPERM_KEY, LogEntry, User};
 use crate::command::{self, Spec};
 use crate::resp;
 
-const STANDARD_CATEGORIES: usize = 21;
+const STANDARD_CATEGORIES: usize = 22;
 const LOG_DEFAULT_COUNT: usize = 10;
 // what a log entry keeps of a client-supplied name or key
 const LOG_FIELD_MAX: usize = 128;
@@ -200,7 +200,7 @@ impl Session {
     }
 }
 
-// the 21 Redis categories; module categories stay reachable through +@read/+@write and by name
+// the 22 Redis categories; module categories stay reachable through +@read/+@write and by name
 fn acl_cat(out: &mut Vec<u8>, category: Option<&[u8]>) {
     let names = &command::cat_names()[..STANDARD_CATEGORIES.min(command::cat_names().len())];
     let Some(category) = category else {

@@ -977,7 +977,7 @@ def test_acl_users_are_managed_at_runtime(r):
     assert got[:4] == ["flags", ["on"], "passwords", [digest]]
     assert got[4:] == ["commands", "-@all +@string +acl|whoami", "keys", ["it:*"], "channels", ["chan*"]]
     assert r.execute_command("ACL", "GETUSER", "it_no_such_user") is None
-    assert len(r.execute_command("ACL", "CAT")) == 21
+    assert len(r.execute_command("ACL", "CAT")) == 22
     assert "get" in r.execute_command("ACL", "CAT", "string")
     with pytest.raises(redis.exceptions.ResponseError, match="Unknown category"):
         r.execute_command("ACL", "CAT", "nosuch")
@@ -1119,3 +1119,46 @@ def test_default_user_off_requires_another_login(r, raw_socket):
     finally:
         assert r.execute_command("ACL", "SETUSER", "default", "on") == "OK"
         r.execute_command("ACL", "DELUSER", "it_acl_alt")
+
+
+def test_redis84_delex_digest_msetex(r, cluster_direct, key_prefix):
+    _needs(cluster_direct, (8, 4), (99, 0))
+    k = f"{key_prefix}:dx"
+    assert r.set(k, "v")
+    assert len(r.execute_command("DIGEST", k)) == 16
+    assert r.execute_command("DELEX", k, "IFEQ", "nope") == 0
+    assert r.execute_command("DELEX", k, "IFEQ", "v") == 1
+    assert r.get(k) is None
+
+
+def test_msetex_shares_one_expiry(r, cluster_direct, key_prefix):
+    _needs(cluster_direct, (8, 4), (9, 0))
+    a, b = (f"{{{key_prefix}}}:m{i}" for i in (1, 2))
+    assert r.execute_command("MSETEX", 2, a, "1", b, "2", "EX", 100) == 1
+    assert r.get(a) == "1" and 0 < r.ttl(b) <= 100
+
+
+def test_redis88_increx_and_arrays(r, cluster_direct, key_prefix):
+    _needs(cluster_direct, (8, 8), (99, 0))
+    c, arr = f"{key_prefix}:ix", f"{key_prefix}:ar"
+    assert r.execute_command("INCREX", c, "EX", 50)[0] == 1
+    assert r.execute_command("INCREX", c, "EX", 50)[0] == 2
+    assert 0 < r.ttl(c) <= 50
+    assert r.execute_command("ARSET", arr, 0, "hello", "world") == 2
+    assert r.execute_command("ARGET", arr, 1) == "world"
+    assert r.execute_command("ARLEN", arr) == 2
+
+
+def test_redis810_lmovem_and_set_cardinalities(r, cluster_direct, key_prefix):
+    _needs(cluster_direct, (8, 10), (99, 0))
+    src, dst = (f"{{{key_prefix}}}:l{i}" for i in (1, 2))
+    assert r.rpush(src, "1", "2", "3", "4") == 4
+    assert r.execute_command("LMOVEM", src, dst, "LEFT", "RIGHT", "COUNT", 2, "OBO") == ["1", "2"]
+    assert r.execute_command("BLMOVEM", src, dst, "LEFT", "RIGHT", 0.1, "COUNT", 5, "OBO") == ["3", "4"]
+    assert r.execute_command("BLMOVEM", src, dst, "LEFT", "RIGHT", 0.1) is None
+    assert r.lrange(dst, 0, -1) == ["1", "2", "3", "4"]
+    s1, s2 = (f"{{{key_prefix}}}:s{i}" for i in (1, 2))
+    r.sadd(s1, "a", "b", "c")
+    r.sadd(s2, "a")
+    assert r.execute_command("SDIFFCARD", 2, s1, s2) == 2
+    assert r.execute_command("SUNIONCARD", 2, s1, s2) == 3
