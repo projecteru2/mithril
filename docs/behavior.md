@@ -8,7 +8,24 @@
   double-counts elements shared across slots — inherent to fan-out).
 - MULTI/EXEC: queued locally, all keys must hash to one slot (checked at
   queue time), executed as one native transaction on the owning master.
-  WATCH is not supported.
+  WATCH holds its keys on an exclusive connection to the slot's master;
+  every command whose keys all live in that slot, and the EXEC, run there
+  too (uncached, never on a replica). The WATCH takes effect once every
+  earlier request of the session has answered (blocking commands, fan-outs
+  and redirect retries included), so the optimistic-locking pattern works
+  unchanged; the session keeps reading meanwhile, and requests for the
+  slot queue behind the WATCH. A watching connection that dies is dropped
+  at the session's next command on that slot (or with the session); from
+  then on the slot answers a lost-connection error until UNWATCH, DISCARD
+  or RESET, or a new WATCH replaces it, so EXEC never runs unguarded.
+  UNWATCH, DISCARD, RESET and a refused EXEC send UNWATCH behind the
+  requests the connection already accepted; the slot keeps routing there
+  until the connection is quiet, as it does around an EXEC, so pipelined
+  neighbours stay ordered and the connection returns to the pool only once
+  everything it accepted has answered. The EXEC or release reply arrives
+  when the connection is quiet, or at once when the client already queued
+  more behind it. A FLUSHALL issued while watching makes the EXEC answer
+  nil, as it would on one node.
 - Blocking commands and pubsub use dedicated backend connections.
 - MOVED/ASK are absorbed: one transparent retry against the named target,
   plus a debounced topology refresh.

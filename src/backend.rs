@@ -266,7 +266,7 @@ pub struct ExclusiveLease {
 }
 
 impl ExclusiveLease {
-    pub fn conn(&self) -> &Conn {
+    pub fn conn(&self) -> &Rc<Conn> {
         &self.conn
     }
 

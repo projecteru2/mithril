@@ -37,7 +37,12 @@ impl Session {
             ));
             return;
         }
-        let current = self.multi.borrow().as_ref().and_then(|s| s.slot);
+        let current = self
+            .multi
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.slot)
+            .or_else(|| self.guarding_slot());
         let new_slot = spec
             .all_keys(resp::Args::new(&frame, argc).skip(1), argc)
             .map(crc16::slot)
@@ -90,7 +95,9 @@ impl Session {
                 Some(Bytes::from_static(resp::OK))
             }
             "reset" => {
-                self.do_reset();
+                if self.do_reset() {
+                    return;
+                }
                 Some(Bytes::from_static(b"+RESET\r\n"))
             }
             "multi" => {
@@ -110,10 +117,19 @@ impl Session {
             }
             "discard" => {
                 if self.take_multi().is_some() {
+                    if self.release_watch(Bytes::from_static(resp::OK)) {
+                        return;
+                    }
                     Some(Bytes::from_static(resp::OK))
                 } else {
                     Some(error_frame("ERR DISCARD without MULTI"))
                 }
+            }
+            "unwatch" => {
+                if self.release_watch(Bytes::from_static(resp::OK)) {
+                    return;
+                }
+                Some(Bytes::from_static(resp::OK))
             }
             _ => self.handle_local_args(spec, &collect_args(&frame, argc)),
         };
@@ -127,11 +143,23 @@ impl Session {
             self.emit_error("ERR EXEC without MULTI");
             return None;
         };
+        // a guarding watch owns the transaction; otherwise the slot's newest generation, still
+        // draining, keeps it ordered behind what that connection accepted
+        let watched = {
+            let watch = self.link.watch.borrow();
+            match watch.as_ref() {
+                Some(w) if w.guarding() => Some(w.clone()),
+                _ => state.slot.and_then(|s| self.link.generation(s)),
+            }
+        };
         if state.aborted {
-            self.emit_error("EXECABORT Transaction discarded because of previous errors.");
+            let abort = error_frame("EXECABORT Transaction discarded because of previous errors.");
+            if !self.release_watch(abort.clone()) {
+                self.emit_local(abort);
+            }
             return None;
         }
-        let Some(slot) = state.slot else {
+        let Some(slot) = state.slot.or(watched.as_ref().map(|w| w.slot)) else {
             self.emit_local(Bytes::from_static(b"*0\r\n"));
             return None;
         };
@@ -147,13 +175,28 @@ impl Session {
         }
         blob.extend_from_slice(b"*1\r\n$4\r\nEXEC\r\n");
         let blob = Bytes::from(blob);
+        if let Some(watched) = watched {
+            if !self.fanouts_pending() {
+                self.exec_watched(watched, seq, blob, expect);
+                return None;
+            }
+            return Some(Box::pin(async move {
+                if self.wait_fanouts(&[slot]).await {
+                    self.exec_watched(watched, seq, blob, expect);
+                } else {
+                    self.closing.set(true);
+                }
+            }));
+        }
         self.gated(slot, move |s| {
             s.route_single(seq, slot, false, blob, expect, None)
         })
     }
 
-    pub(super) fn do_reset(&self) {
+    /// Resets the session; true when the RESET reply follows the watch release instead.
+    pub(super) fn do_reset(&self) -> bool {
         self.take_multi();
+        let delivered = self.release_watch(Bytes::from_static(b"+RESET\r\n"));
         self.store_name("");
         self.proto.set(2);
         self.link.proto_switches.push(self.link.next_seq.get(), 2);
@@ -161,6 +204,7 @@ impl Session {
         let user = self.shared.acl.default_user();
         self.authed.set(user.enabled && user.nopass);
         self.adopt(user, generation);
+        delivered
     }
 
     pub(super) fn abort_multi(&self) {

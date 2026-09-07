@@ -123,8 +123,9 @@ impl Session {
             }
             "reset" => {
                 self.stop_pubsub();
-                self.do_reset();
-                self.emit_local(Bytes::from_static(b"+RESET\r\n"));
+                if !self.do_reset() {
+                    self.emit_local(Bytes::from_static(b"+RESET\r\n"));
+                }
                 return;
             }
             "ping" => {}

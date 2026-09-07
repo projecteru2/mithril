@@ -21,8 +21,11 @@ use super::pipe::{ColdSend, Pipe, pipe_for, queue_on};
 use super::pubsub::{PubsubHandle, PubsubSim, pubsub_allowed};
 use super::queue::ReplyQueue;
 use super::tuner::PIPELINED_LOCAL;
+use super::watch::NO_WATCH;
 use super::writer::write_loop;
-use super::{Cold, ERR_NO_OWNER, ERR_NOAUTH, MAX_INFLIGHT, Reply, Shared, error_frame};
+use super::{
+    Cold, ERR_CROSSSLOT, ERR_NO_OWNER, ERR_NOAUTH, MAX_INFLIGHT, Reply, Shared, error_frame,
+};
 use crate::acl::User;
 use crate::backend::{ERR_BACKEND_LOST, ensure_read_room};
 use crate::cache::CACHING_FRAME;
@@ -52,7 +55,6 @@ pub(super) struct Session {
     pub(super) in_multi: Cell<bool>,
     pub(super) pubsub: RefCell<Option<PubsubHandle>>,
     pub(super) subs: RefCell<PubsubSim>,
-    pub(super) blocking: RefCell<Vec<(u64, tokio::task::JoinHandle<()>)>>,
     pub(super) closing: Cell<bool>,
     // the worker wants this session on the shared pipes: reading pauses until it drains
     pub(super) switch_pending: Cell<bool>,
@@ -322,6 +324,22 @@ impl Session {
             self.queue_multi(spec, frame, argc);
             return;
         }
+        if self.link.generations.get() > 0 {
+            match self.watched_keys(spec, &frame, argc) {
+                Some((watched, true)) => {
+                    if let Some(cold) = self.serve_watched(watched, spec, frame, argc) {
+                        cold.await;
+                    }
+                    return;
+                }
+                // the watched slot's part would run beside the watching connection, unordered
+                Some((_, false)) => {
+                    self.emit_error_frame(Bytes::from_static(ERR_CROSSSLOT));
+                    return;
+                }
+                None => {}
+            }
+        }
         // writes drop their keys before they are queued: read-your-writes
         if spec.is_write()
             && let Some(cache) = &self.shared.cache
@@ -361,6 +379,11 @@ impl Session {
                     cold.await;
                 }
             }
+            Kind::Watch => {
+                if let Some(cold) = self.handle_watch(spec, frame, argc) {
+                    cold.await;
+                }
+            }
             Kind::Eval => {
                 if let Some(cold) = self.forward_eval(frame, argc) {
                     cold.await;
@@ -383,6 +406,11 @@ impl Session {
                 }
             }
             Kind::Flushall => {
+                if let Some(w) = self.link.watch.borrow().as_ref()
+                    && w.guarding()
+                {
+                    w.mark_dirty();
+                }
                 if Box::pin(self.gates_clear()).await {
                     Box::pin(self.run_broadcast(frame, Targets::Masters, Gather::Ok, None)).await;
                 }
@@ -623,6 +651,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: SocketAddr, id: 
     let link: Rc<WriterLink> = Rc::new(WriterLink::default());
     link.sharded
         .set(shared.cfg.backend_sharding == Sharding::On);
+    link.watch_slot.set(NO_WATCH);
 
     let acl_gen = shared.acl.generation();
     let user = shared.acl.default_user();
@@ -641,7 +670,6 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: SocketAddr, id: 
         in_multi: Cell::new(false),
         pubsub: RefCell::new(None),
         subs: RefCell::new(PubsubSim::default()),
-        blocking: RefCell::new(Vec::new()),
         closing: Cell::new(false),
         switch_pending: Cell::new(false),
         has_relay: Cell::new(false),
@@ -745,7 +773,14 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: SocketAddr, id: 
     }
     stats::bump(&shared.wstats.readers_exited);
     session.stop_pubsub();
-    for (seq, task) in session.blocking.borrow_mut().drain(..) {
+    session.link.watch.borrow_mut().take();
+    for task in session.link.watch_tasks.borrow_mut().drain(..) {
+        task.abort();
+    }
+    for w in session.link.watches.borrow_mut().drain(..) {
+        w.fail_all(&reply_q);
+    }
+    for (seq, task) in session.link.blocking.borrow_mut().drain(..) {
         if task.is_finished() {
             continue;
         }

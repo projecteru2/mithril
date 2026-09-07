@@ -68,6 +68,8 @@ pub enum Kind {
     Dbsize,
     /// FLUSHALL ASYNC broadcast to all masters.
     Flushall,
+    /// WATCH: keys pinned on an exclusive connection until EXEC.
+    Watch,
     /// Answered by the proxy itself.
     Local,
     /// MULTI queue flushed to the slot owner as one blob.

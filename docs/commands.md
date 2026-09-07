@@ -66,7 +66,22 @@ one master. SCRIPT KILL, FUNCTION KILL and SCRIPT DEBUG are not proxied.
 
 MULTI queues key-addressed commands locally, enforcing single-slot at queue
 time (`CROSSSLOT` otherwise); EXEC ships the whole transaction as one native
-MULTI/EXEC to the owning master. DISCARD is supported; WATCH is not.
+MULTI/EXEC to the owning master. WATCH pins its keys on an exclusive
+connection to that master (all watched keys, and the transaction that
+follows, must share one slot — `CROSSSLOT` otherwise); every command whose
+keys all live in that slot, and the EXEC, then run on that connection, so
+a read after WATCH sees the master's current value (never a replica's or
+the reply cache's), the commands stay ordered with EXEC, and a key changed
+by anyone else aborts EXEC with the nil reply, exactly as on a single node.
+A multi-key command spanning the watched slot and others is refused with
+`CROSSSLOT` while the watch is held or its connection is still draining
+(the EXEC, UNWATCH, DISCARD or RESET reply arrives once the connection is
+quiet unless more was queued behind it, so only a pipelining client meets
+it, and a retry succeeds). A WATCH takes effect once every earlier request of the session has answered
+(blocking commands, fan-outs and redirect retries included), while the
+session keeps reading. UNWATCH, DISCARD and RESET release the connection
+behind the requests it already accepted, and the slot keeps using it until
+it is quiet; a WATCH inside MULTI is refused as Redis refuses it.
 
 ## Blocking and pubsub
 
@@ -97,7 +112,7 @@ misbehaves:
 
 - SCRIPT KILL, SCRIPT DEBUG and FUNCTION KILL
 - shard pubsub: SSUBSCRIBE, SPUBLISH, SUNSUBSCRIBE
-- WATCH/UNWATCH, FLUSHDB, cluster-wide KEYS
+- FLUSHDB, cluster-wide KEYS
 - server management: WAIT, DEBUG, LATENCY, MEMORY, SHUTDOWN,
   FAILOVER, REPLICAOF, SAVE/BGSAVE, MIGRATE and similar
 - the search module (FT.*), whose indexes are not keys

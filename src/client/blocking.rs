@@ -7,7 +7,7 @@ use tokio::sync::oneshot;
 
 use super::pipe::{parse_redirect, recv_or_lost};
 use super::session::Session;
-use super::{Cold, ERR_NO_OWNER, Reply, Shared, error_frame};
+use super::{Cold, ERR_EXCLUSIVE_LIMIT, ERR_NO_OWNER, Reply, Shared, error_frame};
 use crate::backend::{ASKING_FRAME, Outbound, Sink};
 use crate::command::Spec;
 use crate::crc16;
@@ -55,7 +55,7 @@ impl Session {
             let reply = blocking_round(&shared, slot, frame, None, false).await;
             let _ = reply_q.send(Reply::At(seq, reply));
         });
-        let mut blocking = self.blocking.borrow_mut();
+        let mut blocking = self.link.blocking.borrow_mut();
         blocking.retain(|(_, t)| !t.is_finished());
         blocking.push((seq, task));
     }
@@ -99,7 +99,7 @@ async fn blocking_round(
         return Bytes::from_static(ERR_NO_OWNER);
     };
     let Some(lease) = shared.backends.take_exclusive(addr) else {
-        return error_frame("ERR too many blocking connections");
+        return error_frame(ERR_EXCLUSIVE_LIMIT);
     };
     let (tx, rx) = oneshot::channel();
     lease

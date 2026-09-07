@@ -7,7 +7,9 @@ use std::rc::Rc;
 
 use bytes::Bytes;
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
+use super::watch::{NO_WATCH, Watched};
 use crate::cache::ReplyCache;
 use crate::multikey;
 
@@ -45,6 +47,20 @@ pub(super) struct WriterLink {
     // the session sends through the process-wide shard pipes
     pub(super) sharded: Cell<bool>,
     pub(super) fanouts: RefCell<FanoutGates>,
+    // detached tasks answering at a sequence: blocking commands, WATCH arming, watched EXEC
+    pub(super) blocking: RefCell<Vec<(u64, JoinHandle<()>)>>,
+    // WATCH arming, EXEC and release tasks: answer through the watch, never backfilled
+    pub(super) watch_tasks: RefCell<Vec<JoinHandle<()>>>,
+    // arming WATCHes wait until every earlier reply of the session has been emitted
+    pub(super) fence_waiters: Cell<u32>,
+    pub(super) fence_notify: Notify,
+    pub(super) watch: RefCell<Option<Rc<Watched>>>,
+    // every generation still owing replies; drained when the session goes
+    pub(super) watches: RefCell<Vec<Rc<Watched>>>,
+    // how many generations are live: the dispatch fast check
+    pub(super) generations: Cell<u32>,
+    // the watched slot, NO_WATCH when none: the dispatch fast check
+    pub(super) watch_slot: Cell<u16>,
     pub(super) fanouts_any: Cell<bool>,
     // slots seen migrating: their same-slot multi-key commands take the gated path
     migrating: RefCell<Vec<u16>>,
@@ -52,6 +68,29 @@ pub(super) struct WriterLink {
 }
 
 impl WriterLink {
+    /// The newest live watch generation of `slot`.
+    pub(super) fn generation(&self, slot: u16) -> Option<Rc<Watched>> {
+        let watches = self.watches.borrow();
+        watches.iter().rev().find(|w| w.slot == slot).cloned()
+    }
+
+    /// Drops a watch from the slot's routing and from the generations still owing replies.
+    pub(super) fn forget_watch(&self, watched: &Watched) {
+        let mine = self
+            .watch
+            .borrow()
+            .as_ref()
+            .is_some_and(|w| std::ptr::eq(&**w, watched));
+        if mine {
+            self.watch_slot.set(NO_WATCH);
+            self.watch.borrow_mut().take();
+        }
+        self.watches
+            .borrow_mut()
+            .retain(|w| !std::ptr::eq(&**w, watched));
+        self.generations.set(self.watches.borrow().len() as u32);
+    }
+
     pub(super) fn is_migrating(&self, slot: u16) -> bool {
         self.migrating_any.get() && self.migrating.borrow().contains(&slot)
     }

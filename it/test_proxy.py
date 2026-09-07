@@ -188,12 +188,6 @@ def test_multi_exec_cross_slot_rejected(r, key_prefix):
         pipe.execute()
 
 
-def test_watch_rejected(r, key_prefix):
-    pipe = r.pipeline(transaction=True)
-    with pytest.raises(redis.exceptions.ResponseError, match=r"(?i)unknown command"):
-        pipe.watch(f"{key_prefix}:watched")
-
-
 # --- blocking commands ---
 
 
@@ -1162,3 +1156,239 @@ def test_redis810_lmovem_and_set_cardinalities(r, cluster_direct, key_prefix):
     r.sadd(s2, "a")
     assert r.execute_command("SDIFFCARD", 2, s1, s2) == 2
     assert r.execute_command("SUNIONCARD", 2, s1, s2) == 3
+
+
+def test_watch_aborts_exec_after_a_foreign_write(r, cluster_direct, raw_socket, key_prefix):
+    k = f"{key_prefix}:w"
+    assert r.set(k, "0")
+    s = raw_socket()
+    reader = _RespReader(s)
+    s.sendall(_resp_encode(["WATCH", k]))
+    assert reader.read_reply() == "OK"
+    cluster_direct.set(k, "changed")
+    for cmd in (["MULTI"], ["SET", k, "mine"], ["EXEC"]):
+        s.sendall(_resp_encode(cmd))
+    assert [reader.read_reply() for _ in range(3)] == ["OK", "QUEUED", None]
+    assert r.get(k) == "changed"
+    s.sendall(_resp_encode(["WATCH", k]))
+    assert reader.read_reply() == "OK"
+    for cmd in (["MULTI"], ["INCR", k], ["EXEC"]):
+        s.sendall(_resp_encode(cmd))
+    assert reader.read_reply() == "OK" and reader.read_reply() == "QUEUED"
+    with pytest.raises(redis.exceptions.ResponseError):
+        reader.read_reply()
+    assert r.get(k) == "changed"
+    s.sendall(_resp_encode(["UNWATCH"]))
+    assert reader.read_reply() == "OK"
+
+
+def test_watch_rules_and_redis_py_flow(r, cluster_direct, raw_socket, key_prefix):
+    near, far = _cross_slot_pair(key_prefix)
+    s = raw_socket()
+    reader = _RespReader(s)
+    s.sendall(_resp_encode(["WATCH", near, far]))
+    with pytest.raises(redis.exceptions.ResponseError, match=r"(?i)crossslot"):
+        reader.read_reply()
+    s.sendall(_resp_encode(["WATCH", near]))
+    assert reader.read_reply() == "OK"
+    for cmd in (["MULTI"], ["SET", far, "1"]):
+        s.sendall(_resp_encode(cmd))
+    assert reader.read_reply() == "OK"
+    with pytest.raises(redis.exceptions.ResponseError, match=r"(?i)crossslot"):
+        reader.read_reply()
+    s.sendall(_resp_encode(["WATCH", near]))
+    with pytest.raises(redis.exceptions.ResponseError, match="inside MULTI"):
+        reader.read_reply()
+    s.sendall(_resp_encode(["DISCARD"]))
+    assert reader.read_reply() == "OK"
+    k = f"{key_prefix}:opt"
+    assert r.set(k, "1")
+    with r.pipeline() as pipe:
+        pipe.watch(k)
+        current = int(pipe.get(k))
+        pipe.multi()
+        pipe.set(k, current + 1)
+        assert pipe.execute() == [True]
+    assert r.get(k) == "2"
+    with r.pipeline() as pipe:
+        pipe.watch(k)
+        cluster_direct.set(k, "9")
+        pipe.multi()
+        pipe.set(k, "3")
+        with pytest.raises(redis.WatchError):
+            pipe.execute()
+    assert r.get(k) == "9"
+
+
+def test_watch_orders_pipelined_neighbours(cluster_direct, raw_socket, key_prefix):
+    k = f"{key_prefix}:fence"
+    cluster_direct.delete(k)
+    s = raw_socket()
+    reader = _RespReader(s)
+    for _ in range(3):
+        s.sendall(
+            b"".join(
+                _resp_encode(c)
+                for c in (["SET", k, "1"], ["WATCH", k], ["MULTI"], ["SET", k, "2"], ["EXEC"])
+            )
+        )
+        assert [reader.read_reply() for _ in range(5)] == ["OK", "OK", "OK", "QUEUED", ["OK"]]
+        assert cluster_direct.get(k) == "2"
+        s.sendall(
+            b"".join(
+                _resp_encode(c)
+                for c in (["WATCH", k], ["SET", k, "3"], ["MULTI"], ["INCR", k], ["EXEC"])
+            )
+        )
+        assert [reader.read_reply() for _ in range(5)] == ["OK", "OK", "OK", "QUEUED", None]
+        assert cluster_direct.get(k) == "3"
+        s.sendall(
+            b"".join(
+                _resp_encode(c)
+                for c in (["WATCH", k], ["DEL", k], ["MULTI"], ["SET", k, "4"], ["EXEC"])
+            )
+        )
+        assert [reader.read_reply() for _ in range(5)] == ["OK", 1, "OK", "QUEUED", None]
+        assert cluster_direct.get(k) is None
+        s.sendall(
+            b"".join(
+                _resp_encode(c)
+                for c in (["BLPOP", k, "0.3"], ["WATCH", k], ["MULTI"], ["LPUSH", k, "v"], ["EXEC"])
+            )
+        )
+        assert [reader.read_reply() for _ in range(5)] == [None, "OK", "OK", "QUEUED", [1]]
+        assert cluster_direct.lrange(k, 0, -1) == ["v"]
+        s.sendall(
+            b"".join(
+                _resp_encode(c)
+                for c in (["WATCH", k], ["BLPOP", k, "0.3"], ["MULTI"], ["LPUSH", k, "w"], ["EXEC"])
+            )
+        )
+        assert [reader.read_reply() for _ in range(5)] == ["OK", [k, "v"], "OK", "QUEUED", None]
+        assert cluster_direct.lrange(k, 0, -1) == []
+        other = _cross_slot_pair(key_prefix)[1]
+        assert cluster_direct.set(k, "5") and cluster_direct.set(other, "5")
+        s.sendall(
+            b"".join(
+                _resp_encode(c)
+                for c in (["WATCH", k], ["DEL", k, other], ["MULTI"], ["SET", k, "6"], ["EXEC"])
+            )
+        )
+        assert reader.read_reply() == "OK"
+        with pytest.raises(redis.exceptions.ResponseError, match=r"(?i)crossslot"):
+            reader.read_reply()
+        assert [reader.read_reply() for _ in range(3)] == ["OK", "QUEUED", ["OK"]]
+        assert cluster_direct.get(k) == "6" and cluster_direct.get(other) == "5"
+        cluster_direct.delete(k, other)
+        s.sendall(
+            b"".join(
+                _resp_encode(c)
+                for c in (["WATCH", k], ["SET", k, "7"], ["UNWATCH"], ["GET", k], ["DEL", k, other])
+            )
+        )
+        assert [reader.read_reply() for _ in range(4)] == ["OK", "OK", "OK", "7"]
+        with pytest.raises(redis.exceptions.ResponseError, match=r"(?i)crossslot"):
+            reader.read_reply()
+        for _ in range(100):
+            s.sendall(_resp_encode(["DEL", k, other]))
+            try:
+                assert reader.read_reply() == 1
+                break
+            except redis.exceptions.ResponseError:
+                time.sleep(0.01)
+        else:
+            pytest.fail("the released connection never went quiet")
+        s.sendall(
+            b"".join(
+                _resp_encode(c)
+                for c in (["WATCH", k], ["MULTI"], ["SET", k, "8"], ["EXEC"], ["GET", k], ["MULTI"], ["SET", other, "9"], ["EXEC"])
+            )
+        )
+        assert [reader.read_reply() for _ in range(8)] == ["OK", "OK", "QUEUED", ["OK"], "8", "OK", "QUEUED", ["OK"]]
+        assert cluster_direct.get(other) == "9"
+        cluster_direct.delete(k, other)
+        s.sendall(
+            b"".join(
+                _resp_encode(c)
+                for c in (["WATCH", k], ["MULTI"], ["SET", k], ["EXEC"], ["MULTI"], ["SET", other, "10"], ["EXEC"])
+            )
+        )
+        assert [reader.read_reply() for _ in range(2)] == ["OK", "OK"]
+        with pytest.raises(redis.exceptions.ResponseError, match="wrong number"):
+            reader.read_reply()
+        with pytest.raises(redis.exceptions.ResponseError, match="EXECABORT"):
+            reader.read_reply()
+        assert [reader.read_reply() for _ in range(3)] == ["OK", "QUEUED", ["OK"]]
+        assert cluster_direct.get(other) == "10"
+        started = time.time()
+        s.sendall(
+            b"".join(_resp_encode(c) for c in (["WATCH", k], ["UNWATCH"], ["BLPOP", k, "0.5"]))
+        )
+        assert [reader.read_reply() for _ in range(2)] == ["OK", "OK"]
+        assert time.time() - started < 0.4
+        s.sendall(_resp_encode(["LPUSH", k, "late"]))
+        assert reader.read_reply() is None
+        assert reader.read_reply() == 1
+        assert time.time() - started >= 0.5
+        assert cluster_direct.lrange(k, 0, -1) == ["late"]
+        cluster_direct.delete(k, other)
+        s.sendall(
+            b"".join(
+                _resp_encode(c)
+                for c in (["WATCH", k], ["MULTI"], ["SET", k, "1"], ["EXEC"], ["MULTI"], ["INCR", k], ["EXEC"])
+            )
+        )
+        assert [reader.read_reply() for _ in range(7)] == ["OK", "OK", "QUEUED", ["OK"], "OK", "QUEUED", [2]]
+        s.sendall(
+            b"".join(
+                _resp_encode(c)
+                for c in (["DEL", k], ["WATCH", k], ["UNWATCH"], ["BLPOP", k, "0.3"], ["WATCH", other], ["LPUSH", k, "v"], ["UNWATCH"])
+            )
+        )
+        assert [reader.read_reply() for _ in range(7)] == [1, "OK", "OK", None, "OK", 1, "OK"]
+        assert cluster_direct.lrange(k, 0, -1) == ["v"]
+        cluster_direct.delete(k, other)
+        s.sendall(
+            b"".join(
+                _resp_encode(c)
+                for c in (["WATCH", k], ["UNWATCH"], ["BLPOP", k, "0.3"], ["WATCH", other], ["UNWATCH"], ["MULTI"], ["LPUSH", k, "w"], ["EXEC"])
+            )
+        )
+        assert [reader.read_reply() for _ in range(8)] == ["OK", "OK", None, "OK", "OK", "OK", "QUEUED", [1]]
+        assert cluster_direct.lrange(k, 0, -1) == ["w"]
+        cluster_direct.delete(k, other)
+
+
+def test_watch_sees_flushall(r, raw_socket, key_prefix):
+    k = f"{key_prefix}:flushed"
+    assert r.set(k, "1")
+    s = raw_socket()
+    reader = _RespReader(s)
+    s.sendall(b"".join(_resp_encode(c) for c in (["WATCH", k], ["FLUSHALL"])))
+    assert [reader.read_reply() for _ in range(2)] == ["OK", "OK"]
+    s.sendall(b"".join(_resp_encode(c) for c in (["MULTI"], ["SET", k, "2"], ["EXEC"], ["GET", k])))
+    assert [reader.read_reply() for _ in range(4)] == ["OK", "QUEUED", None, None]
+
+
+def test_watch_reads_the_master_uncached(cache_proxy, cluster_direct, key_prefix):
+    k = f"{key_prefix}:fresh"
+    assert cache_proxy.set(k, "0")
+    assert cache_proxy.get(k) == "0"
+    assert cache_proxy.get(k) == "0"
+    for i in range(1, 4):
+        cluster_direct.set(k, str(i))
+        with cache_proxy.pipeline() as pipe:
+            pipe.watch(k)
+            assert pipe.get(k) == str(i)
+            pipe.multi()
+            pipe.incr(k)
+            assert pipe.execute() == [i + 1]
+    src, dst = f"{{{key_prefix}}}:src", f"{{{key_prefix}}}:dst"
+    assert cache_proxy.mset({src: "new", dst: "old"})
+    assert cache_proxy.get(dst) == "old"
+    assert cache_proxy.get(dst) == "old"
+    with cache_proxy.pipeline() as pipe:
+        pipe.watch(src)
+        assert pipe.execute_command("RENAME", src, dst) is True
+        assert cache_proxy.get(dst) == "new"
+        pipe.unwatch()

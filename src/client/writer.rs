@@ -226,6 +226,7 @@ pub(super) async fn write_loop(
                             continue;
                         }
                         // clients believe the proxy owns every slot: never leak redirects
+                        let _ = shared.refresh.send(());
                         frame = Bytes::from_static(ERR_TRYAGAIN);
                     } else if frame.starts_with(NOSCRIPT)
                         && rerunnable(&link, seq)
@@ -379,6 +380,9 @@ pub(super) async fn write_loop(
                 .saturating_sub(next_emit.saturating_sub(link.emitted.get())),
         );
         link.emitted.set(next_emit);
+        if link.fence_waiters.get() > 0 {
+            link.fence_notify.notify_waiters();
+        }
         if close_now {
             return;
         }

@@ -1,6 +1,6 @@
 # Compatibility
 
-The 76-test integration suite runs against each backend, in every mode
+The 80-test integration suite runs against each backend, in every mode
 combination (`backend-sharding`, `reply-cache`), with full cluster
 teardown/recreate between versions; it includes a live slot migration
 (CLUSTER SETSLOT MIGRATING/IMPORTING + MIGRATE) under multi-key commands:
@@ -28,7 +28,10 @@ memtier_benchmark, redis-benchmark.
   GETUSER renders command rules in canonical form (`-@all +@cat...
   +cmd... +cmd|sub`).
 - MULTI queues key-addressed commands only (EVAL/PING inside MULTI are
-  rejected; real Redis queues them). WATCH is not supported.
+  rejected; real Redis queues them). WATCH keys and the transaction that
+  follows must share one slot, and a multi-key command spanning the
+  watched slot and others is refused while the watch is held; UNWATCH
+  inside MULTI answers OK at once instead of being queued.
 - Aggregate replies to RESP3 clients keep RESP2 shape (flat arrays, not
   maps); every mainstream client parses by wire type and accepts this.
 - Pubsub delivery to a slow subscriber is windowed (4096 pushes).

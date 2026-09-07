@@ -12,6 +12,7 @@ mod scripting;
 mod session;
 mod tuner;
 mod users;
+mod watch;
 mod writer;
 
 pub use queue::{ReplyQueue, SharedQueue};
@@ -44,6 +45,7 @@ pub(super) const ERR_CROSSSLOT: &[u8] =
     b"-CROSSSLOT Keys in request don't hash to the same slot\r\n";
 pub(super) const ERR_NO_OWNER: &[u8] = b"-CLUSTERDOWN Hash slot not served\r\n";
 pub(super) const ERR_TRYAGAIN: &[u8] = b"-TRYAGAIN slot is migrating, retry later\r\n";
+pub(super) const ERR_EXCLUSIVE_LIMIT: &str = "ERR too many blocking connections";
 
 /// Everything a session needs from its worker.
 pub struct Shared {
