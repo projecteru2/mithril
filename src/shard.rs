@@ -1,4 +1,4 @@
-//! Cross-worker backend sharding: one pipelined connection per node, owned by
+//! Cross-worker backend sharding: one pipelined connection per node and database, owned by
 //! the worker its address hashes to; other workers hand requests across.
 
 use std::collections::HashMap;
@@ -28,6 +28,7 @@ pub enum RemoteSink {
 pub struct NewConn {
     pub addr: String,
     pub readonly: bool,
+    pub db: u8,
     pub rx: mpsc::Receiver<RemoteOutbound>,
 }
 
@@ -40,10 +41,13 @@ pub struct Controls {
     pub invals: mpsc::Sender<Invalidations>,
 }
 
+// a node's pipes by database
+type DbPipes = Vec<Option<mpsc::Sender<RemoteOutbound>>>;
+
 /// Process-wide shard fabric shared by every worker.
 pub struct Fabric {
     controls: Vec<Controls>,
-    conns: Mutex<[HashMap<Box<str>, mpsc::Sender<RemoteOutbound>>; 2]>,
+    conns: Mutex<[HashMap<Box<str>, DbPipes>; 2]>,
 }
 
 impl Fabric {
@@ -55,22 +59,29 @@ impl Fabric {
     }
 
     /// Returns the node's shared pipe, dialing it on the owner worker first.
-    pub fn pipe(&self, addr: &str, readonly: bool) -> mpsc::Sender<RemoteOutbound> {
+    pub fn pipe(&self, addr: &str, readonly: bool, db: u8) -> mpsc::Sender<RemoteOutbound> {
         let mut conns = self
             .conns
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let conns = &mut conns[usize::from(readonly)];
-        if let Some(tx) = conns.get(addr)
+        if let Some(tx) = conns
+            .get(addr)
+            .and_then(|p| p.get(usize::from(db))?.as_ref())
             && !tx.is_closed()
         {
             return tx.clone();
         }
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
-        conns.insert(addr.into(), tx.clone());
+        let by_db = conns.entry(addr.into()).or_default();
+        if by_db.len() <= usize::from(db) {
+            by_db.resize(usize::from(db) + 1, None);
+        }
+        by_db[usize::from(db)] = Some(tx.clone());
         let _ = self.controls[self.owner(addr)].conns.send(NewConn {
             addr: addr.to_string(),
             readonly,
+            db,
             rx,
         });
         tx
@@ -88,6 +99,7 @@ impl Fabric {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)[0]
             .get(addr)
+            .and_then(|p| p.first()?.as_ref())
             .filter(|tx| !tx.is_closed())
             .cloned();
         let Some(tx) = tx else {
@@ -118,14 +130,18 @@ impl Fabric {
     }
 
     // generation-safe: a replacement pipe created meanwhile must survive
-    fn forget(&self, addr: &str, readonly: bool) {
+    fn forget(&self, addr: &str, readonly: bool, db: u8) {
         let mut conns = self
             .conns
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let conns = &mut conns[usize::from(readonly)];
-        if conns.get(addr).is_some_and(|tx| tx.is_closed()) {
-            conns.remove(addr);
+        let slot = conns[usize::from(readonly)]
+            .get_mut(addr)
+            .and_then(|p| p.get_mut(usize::from(db)));
+        if let Some(slot) = slot
+            && slot.as_ref().is_some_and(|tx| tx.is_closed())
+        {
+            *slot = None;
         }
     }
 }
@@ -144,14 +160,14 @@ pub async fn control_loop(
             nc = ctl.recv() => {
                 let Some(mut nc) = nc else { return };
                 let frame = match &tracking {
-                    Some(t) if !nc.readonly => t.borrow().get(nc.addr.as_str()).cloned(),
+                    Some(t) if !nc.readonly && nc.db == 0 => t.borrow().get(nc.addr.as_str()).cloned(),
                     _ => None,
                 };
                 let fabric = fabric.clone();
                 let cfg = cfg.clone();
                 tokio::task::spawn_local(async move {
                     run_pipe(
-                        &nc.addr,
+                        (&nc.addr, nc.db),
                         nc.readonly,
                         &cfg,
                         frame.as_deref(),
@@ -160,7 +176,7 @@ pub async fn control_loop(
                         deliver,
                     )
                     .await;
-                    fabric.forget(&nc.addr, nc.readonly);
+                    fabric.forget(&nc.addr, nc.readonly, nc.db);
                 });
             }
             keys = invals.recv() => {

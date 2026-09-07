@@ -3,8 +3,9 @@
 use bytes::Bytes;
 
 use super::fanout::write_keys;
+use super::pipe::{recv_or_lost, scatter_one};
 use super::session::Session;
-use super::{Cold, ERR_CROSSSLOT, error_frame};
+use super::{Cold, ERR_CROSSSLOT, ERR_NO_OWNER, error_frame};
 use crate::command::{Kind, Spec};
 use crate::resp;
 use crate::{admin, crc16};
@@ -22,6 +23,8 @@ impl MultiState {
         self.frames.len()
     }
 }
+
+const CLUSTER_DATABASES: &[u8] = b"*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$17\r\ncluster-databases\r\n";
 
 impl Session {
     pub(super) fn queue_multi(&self, spec: &Spec, frame: Bytes, argc: usize) {
@@ -69,7 +72,7 @@ impl Session {
             Some(slot) => {
                 state.slot = Some(slot);
                 state.bytes += frame.len();
-                if self.shared.cache.is_some() && spec.is_write() {
+                if self.link.db.get() == 0 && self.shared.cache.is_some() && spec.is_write() {
                     write_keys(spec, &frame, argc, |k| {
                         state.write_keys.push(frame.slice_ref(k))
                     });
@@ -148,8 +151,8 @@ impl Session {
         let watched = {
             let watch = self.link.watch.borrow();
             match watch.as_ref() {
-                Some(w) if w.guarding() => Some(w.clone()),
-                _ => state.slot.and_then(|s| self.link.generation(s)),
+                Some(w) if w.guarding() && w.db == self.link.db.get() => Some(w.clone()),
+                _ => state.slot.and_then(|s| self.link.generation_in_db(s)),
             }
         };
         if state.aborted {
@@ -193,8 +196,57 @@ impl Session {
         })
     }
 
+    /// SELECT: database 0 is the proxy's own answer; any other index is checked against the
+    /// cluster's `cluster-databases` before the session switches to it.
+    pub(super) async fn handle_select(&self, frame: Bytes, argc: usize) {
+        let index = resp::Args::new(&frame, argc)
+            .nth(1)
+            .and_then(|a| std::str::from_utf8(a).ok()?.parse::<i64>().ok());
+        let Some(index) = index else {
+            self.emit_error("ERR invalid DB index");
+            return;
+        };
+        if index == 0 {
+            let changed = self.link.db.get() != 0;
+            self.set_db(0);
+            let seq = self.alloc_seq();
+            self.deliver_select(seq, Bytes::from_static(resp::OK), changed);
+            return;
+        }
+        let seq = self.alloc_seq();
+        let Some(addr) = self.any_master_addr() else {
+            self.emit_at(seq, Bytes::from_static(ERR_NO_OWNER));
+            return;
+        };
+        let probe = Bytes::from_static(CLUSTER_DATABASES);
+        let reply =
+            recv_or_lost(scatter_one(&self.shared, &addr, self.lane(), None, probe).await).await;
+        let reply = match databases(&reply) {
+            None if reply.first() == Some(&b'-') => reply,
+            None => error_frame("ERR SELECT is not allowed in cluster mode"),
+            Some(count) => match u8::try_from(index) {
+                Ok(db) if i64::from(db) < count => {
+                    let changed = self.link.db.get() != db;
+                    self.set_db(db);
+                    return self.deliver_select(seq, Bytes::from_static(resp::OK), changed);
+                }
+                _ => error_frame("ERR DB index is out of range"),
+            },
+        };
+        self.emit_at(seq, reply);
+    }
+
+    // ends any active WATCH when the database changes, so later commands reach the new one
+    fn deliver_select(&self, seq: u64, reply: Bytes, changed: bool) {
+        if changed && self.end_watch_at(seq, reply.clone()) {
+            return;
+        }
+        self.emit_at(seq, reply);
+    }
+
     /// Resets the session; true when the RESET reply follows the watch release instead.
     pub(super) fn do_reset(&self) -> bool {
+        self.set_db(0);
         self.take_multi();
         let delivered = self.release_watch(Bytes::from_static(b"+RESET\r\n"));
         self.store_name("");
@@ -217,7 +269,6 @@ impl Session {
         match spec.name {
             "ping" => Some(Bytes::from(admin::ping(args))),
             "echo" => Some(Bytes::from(admin::echo(args))),
-            "select" => Some(Bytes::from(admin::select(args))),
             "config" => Some(Bytes::from(admin::config_cmd(
                 args,
                 &self.shared.cfg,
@@ -407,4 +458,11 @@ pub(super) fn display_name(raw: &[u8]) -> String {
         });
     }
     out
+}
+
+// the value of a CONFIG GET reply; an empty array (an unknown config: Redis) is None
+fn databases(reply: &[u8]) -> Option<i64> {
+    let (n, _) = resp::scan_int_line(reply, 1)?;
+    let mut args = resp::Args::new(reply, usize::try_from(n).ok()?);
+    std::str::from_utf8(args.nth(1)?).ok()?.parse().ok()
 }

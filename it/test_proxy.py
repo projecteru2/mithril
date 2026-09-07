@@ -386,12 +386,162 @@ def test_admin_client_id_setname_getname(new_conn):
     assert c.client_getname() == "it-test-client"
 
 
-def test_admin_select(new_conn):
+def _cluster_databases(cluster_direct):
+    node = cluster_direct.get_primaries()[0]
+    with redis.Redis(host=node.host, port=node.port, decode_responses=True) as direct:
+        return int(direct.config_get("cluster-databases").get("cluster-databases", 1))
+
+
+def test_admin_select(new_conn, cluster_direct):
     c = new_conn()
     # redis-py's SELECT callback normalizes the +OK reply to a bool.
     assert c.execute_command("SELECT", 0) is True
-    with pytest.raises(redis.exceptions.ResponseError):
-        c.execute_command("SELECT", 1)
+    databases = _cluster_databases(cluster_direct)
+    if databases > 1:
+        assert c.execute_command("SELECT", databases - 1) is True
+        with pytest.raises(redis.exceptions.ResponseError, match="out of range"):
+            c.execute_command("SELECT", databases)
+    else:
+        with pytest.raises(redis.exceptions.ResponseError):
+            c.execute_command("SELECT", 1)
+    with pytest.raises(redis.exceptions.ResponseError, match="invalid DB index"):
+        c.execute_command("SELECT", "x")
+
+
+def test_select_ends_watch_pipelined(new_conn, cluster_direct, raw_socket, key_prefix):
+    if _cluster_databases(cluster_direct) < 2:
+        pytest.skip("cluster-databases is 1")
+    k = f"{key_prefix}:wselp"
+    setup = new_conn()
+    assert setup.execute_command("SELECT", 1) is True
+    assert setup.set(k, "one")
+    assert setup.execute_command("SELECT", 0) is True
+    assert setup.set(k, "zero")
+    s = raw_socket()
+    reader = _RespReader(s)
+    batch = (
+        _resp_encode(["SELECT", "1"])
+        + _resp_encode(["WATCH", k])
+        + _resp_encode(["SELECT", "0"])
+        + _resp_encode(["GET", k])
+    )
+    s.sendall(batch)
+    assert reader.read_reply() == "OK"
+    assert reader.read_reply() == "OK"
+    assert reader.read_reply() == "OK"
+    assert reader.read_reply() == "zero"
+    assert setup.execute_command("SELECT", 1) is True
+    assert setup.delete(k) == 1
+    assert setup.execute_command("SELECT", 0) is True
+    assert setup.delete(k) == 1
+
+
+def test_exec_after_select_runs_in_the_new_database(cluster_direct, raw_socket, key_prefix):
+    if _cluster_databases(cluster_direct) < 2:
+        pytest.skip("cluster-databases is 1")
+    k = f"{key_prefix}:xsel"
+    s = raw_socket()
+    reader = _RespReader(s)
+    batch = (
+        _resp_encode(["SELECT", "1"])
+        + _resp_encode(["WATCH", k])
+        + _resp_encode(["SELECT", "0"])
+        + _resp_encode(["MULTI"])
+        + _resp_encode(["SET", k, "v"])
+        + _resp_encode(["EXEC"])
+    )
+    s.sendall(batch)
+    assert reader.read_reply() == "OK"
+    assert reader.read_reply() == "OK"
+    assert reader.read_reply() == "OK"
+    assert reader.read_reply() == "OK"
+    assert reader.read_reply() == "QUEUED"
+    assert reader.read_reply() == ["OK"]
+    verify = raw_socket()
+    vr = _RespReader(verify)
+    verify.sendall(_resp_encode(["GET", k]))
+    assert vr.read_reply() == "v"
+    verify.sendall(_resp_encode(["SELECT", "1"]) + _resp_encode(["GET", k]))
+    assert vr.read_reply() == "OK"
+    assert vr.read_reply() is None
+    verify.sendall(_resp_encode(["DEL", k]))
+    assert vr.read_reply() == 0
+    verify.sendall(_resp_encode(["SELECT", "0"]) + _resp_encode(["DEL", k]))
+    assert vr.read_reply() == "OK"
+    assert vr.read_reply() == 1
+
+
+def test_select_ends_watch(new_conn, cluster_direct, key_prefix):
+    if _cluster_databases(cluster_direct) < 2:
+        pytest.skip("cluster-databases is 1")
+    k = f"{key_prefix}:wsel"
+    c = new_conn()
+    assert c.execute_command("SELECT", 1) is True
+    assert c.set(k, "one")
+    assert c.execute_command("SELECT", 0) is True
+    assert c.set(k, "zero")
+    assert c.execute_command("SELECT", 1) is True
+    assert c.execute_command("WATCH", k) is True
+    assert c.execute_command("SELECT", 0) is True
+    assert c.get(k) == "zero"
+    other = new_conn()
+    assert other.set(k, "zero2")
+    with c.pipeline(transaction=True) as pipe:
+        pipe.multi()
+        pipe.get(k)
+        assert pipe.execute() == ["zero2"]
+    assert c.execute_command("SELECT", 1) is True
+    assert c.get(k) == "one"
+    assert c.delete(k) == 1
+    assert c.execute_command("SELECT", 0) is True
+    assert c.delete(k) == 1
+
+
+def test_select_isolates_databases(r, new_conn, cluster_direct, key_prefix):
+    if _cluster_databases(cluster_direct) < 2:
+        pytest.skip("cluster-databases is 1")
+    k, other = _cross_slot_pair(key_prefix)
+    n, lk = f"{key_prefix}:n", f"{key_prefix}:l"
+    c = new_conn()
+    assert c.execute_command("SELECT", 1) is True
+    assert c.mset({k: "one", other: "two"})
+    assert c.mget(k, other) == ["one", "two"]
+    assert r.mget(k, other) == [None, None]
+    assert r.set(k, "zero")
+    assert c.get(k) == "one"
+    assert c.incr(n) == 1
+    assert c.incr(n) == 2
+    assert r.get(n) is None
+    assert c.eval("return redis.call('GET', KEYS[1])", 1, k) == "one"
+    with c.pipeline() as pipe:
+        pipe.multi()
+        pipe.set(k, "uno")
+        pipe.get(k)
+        assert pipe.execute() == [True, "uno"]
+    pusher = new_conn()
+    assert pusher.execute_command("SELECT", 1) is True
+    t = threading.Timer(0.2, lambda: pusher.lpush(lk, "x"))
+    t.start()
+    try:
+        assert c.blpop([lk], timeout=5) == (lk, "x")
+    finally:
+        t.join()
+    assert r.llen(lk) == 0
+    with c.pipeline() as pipe:
+        pipe.watch(k)
+        pipe.multi()
+        pipe.set(k, "dos")
+        assert pipe.execute() == [True]
+    assert c.get(k) == "dos"
+    assert r.get(k) == "zero"
+    assert c.execute_command("SELECT", 0) is True
+    assert c.get(k) == "zero"
+    assert c.execute_command("SELECT", 1) is True
+    assert c.execute_command("RESET") == "RESET"
+    assert c.get(k) == "zero"
+    assert c.execute_command("SELECT", 1) is True
+    assert c.delete(k, other, n) == 3
+    assert r.delete(k) == 1
 
 
 # --- errors ---

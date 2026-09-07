@@ -63,16 +63,6 @@ pub fn echo(args: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-pub fn select(args: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::new();
-    if args.len() == 2 && args[1] == b"0" {
-        out.extend_from_slice(resp::OK);
-    } else {
-        resp::write_error(&mut out, "ERR SELECT is not allowed in cluster mode");
-    }
-    out
-}
-
 pub fn time() -> Vec<u8> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

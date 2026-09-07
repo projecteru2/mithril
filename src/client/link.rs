@@ -9,6 +9,7 @@ use bytes::Bytes;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+use super::Lane;
 use super::pubsub::{PendingSub, PubsubSim};
 use super::watch::{NO_WATCH, Watched};
 use crate::cache::ReplyCache;
@@ -22,6 +23,7 @@ pub(super) struct InFlight {
     pub(super) degraded: bool,
     pub(super) waited: bool,
     pub(super) fill: Option<Fill>,
+    pub(super) db: u8,
 }
 
 // sequences are allocated monotonically, so the ring stays sorted
@@ -54,6 +56,7 @@ pub(super) struct WriterLink {
     // rolls a refused subscription back and mirrors the server's own unsubscribes
     pub(super) subs: RefCell<PubsubSim>,
     pub(super) pending_subs: RefCell<VecDeque<PendingSub>>,
+    pub(super) db: Cell<u8>,
     pub(super) fanouts: RefCell<FanoutGates>,
     // detached tasks answering at a sequence: blocking commands, WATCH arming, watched EXEC
     pub(super) blocking: RefCell<Vec<(u64, JoinHandle<()>)>>,
@@ -77,9 +80,16 @@ pub(super) struct WriterLink {
 
 impl WriterLink {
     /// The newest live watch generation of `slot`.
-    pub(super) fn generation(&self, slot: u16) -> Option<Rc<Watched>> {
+    /// The newest generation of a slot in the session's database; a watch armed under
+    /// another database (before a SELECT) no longer routes the session's commands.
+    pub(super) fn generation_in_db(&self, slot: u16) -> Option<Rc<Watched>> {
+        let db = self.db.get();
         let watches = self.watches.borrow();
-        watches.iter().rev().find(|w| w.slot == slot).cloned()
+        watches
+            .iter()
+            .rev()
+            .find(|w| w.slot == slot && w.db == db)
+            .cloned()
     }
 
     /// Drops a watch from the slot's routing and from the generations still owing replies.
@@ -97,6 +107,19 @@ impl WriterLink {
             .borrow_mut()
             .retain(|w| !std::ptr::eq(&**w, watched));
         self.generations.set(self.watches.borrow().len() as u32);
+    }
+
+    pub(super) fn lane(&self, id: u64) -> Lane {
+        self.lane_with(id, self.db.get())
+    }
+
+    // the lane a request was issued under; a later SELECT must not redirect it elsewhere
+    pub(super) fn lane_with(&self, id: u64, db: u8) -> Lane {
+        Lane {
+            id,
+            sharded: self.sharded.get(),
+            db,
+        }
     }
 
     pub(super) fn is_migrating(&self, slot: u16) -> bool {

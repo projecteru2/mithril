@@ -40,7 +40,7 @@ impl Session {
         let shared = self.shared.clone();
         let reply_q = self.reply_q.clone();
         let topo = shared.topo.load_full();
-        let sharded = self.link.sharded.get();
+        let lane = self.lane();
         let all;
         let nodes: &[u16] = match targets {
             Targets::Masters => &topo.masters,
@@ -55,7 +55,7 @@ impl Session {
         let mut receivers = Vec::with_capacity(nodes.len());
         for &i in nodes {
             let addr = &topo.nodes[i as usize].addr;
-            receivers.push(scatter_one(&shared, addr, self.id, sharded, None, frame.clone()).await);
+            receivers.push(scatter_one(&shared, addr, lane, None, frame.clone()).await);
         }
         // detached deliberately: completion is bounded by backend replies
         tokio::task::spawn_local(async move {

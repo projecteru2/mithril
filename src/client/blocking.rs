@@ -51,8 +51,9 @@ impl Session {
         let seq = self.alloc_seq();
         let shared = self.shared.clone();
         let reply_q = self.reply_q.clone();
+        let db = self.link.db.get();
         let task = tokio::task::spawn_local(async move {
-            let reply = blocking_round(&shared, slot, frame, None, false).await;
+            let reply = blocking_round(&shared, db, slot, frame, None, false).await;
             let _ = reply_q.send(Reply::At(seq, reply));
         });
         let mut blocking = self.link.blocking.borrow_mut();
@@ -81,6 +82,7 @@ fn xread_slot(frame: &Bytes, argc: usize, start: usize) -> Option<(u16, bool)> {
 
 async fn blocking_round(
     shared: &Rc<Shared>,
+    db: u8,
     slot: u16,
     frame: Bytes,
     redirect: Option<(bool, &str)>,
@@ -98,7 +100,7 @@ async fn blocking_round(
     let Some(addr) = addr else {
         return Bytes::from_static(ERR_NO_OWNER);
     };
-    let Some(lease) = shared.backends.take_exclusive(addr) else {
+    let Some(lease) = shared.backends.take_exclusive(addr, db) else {
         return error_frame(ERR_EXCLUSIVE_LIMIT);
     };
     let (tx, rx) = oneshot::channel();
@@ -118,7 +120,7 @@ async fn blocking_round(
         && let Some(redir) = parse_redirect(&reply)
     {
         let _ = shared.refresh.send(());
-        return Box::pin(blocking_round(shared, slot, frame, Some(redir), true)).await;
+        return Box::pin(blocking_round(shared, db, slot, frame, Some(redir), true)).await;
     }
     reply
 }

@@ -15,7 +15,7 @@ use super::pipe::{parse_redirect, pipe_for, queue_on, recv_or_lost, scatter_one}
 use super::pubsub::PUBSUB_PUSH_WINDOW;
 use super::queue::ReplyQueue;
 use super::scripting::evalsha_target;
-use super::{ERR_TRYAGAIN, Reply, Shared};
+use super::{ERR_TRYAGAIN, Lane, Reply, Shared};
 use crate::backend::{ASKING_FRAME, BATCH, ERR_BACKEND_LOST, write_frames};
 use crate::resp;
 use crate::stats;
@@ -96,6 +96,7 @@ impl Resend<'_> {
         head: Option<Bytes>,
         (req, base_expect, fill): Retry,
         extra: u32,
+        db: u8,
     ) {
         if let Some(fill) = fill
             && let Some(cache) = &self.shared.cache
@@ -105,9 +106,8 @@ impl Resend<'_> {
         let pipe = pipe_for(
             self.shared,
             target,
-            self.client_id,
+            self.link.lane_with(self.client_id, db),
             false,
-            self.link.sharded.get(),
         );
         match queue_on(&pipe, self.reply_q, seq, head, req, base_expect + extra) {
             Ok(Some(cold)) => cold.flush().await,
@@ -216,7 +216,7 @@ pub(super) async fn write_loop(
                 }
                 if frame.first() == Some(&b'-') {
                     if let Some((ask, target)) = parse_redirect(&frame) {
-                        if let Some(retry) = take_retry(&link, seq, ask) {
+                        if let Some((retry, db)) = take_retry(&link, seq, ask) {
                             stats::bump(&shared.wstats.redirects);
                             let _ = shared.refresh.send(());
                             let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
@@ -227,11 +227,11 @@ pub(super) async fn write_loop(
                                 client_id,
                             };
                             resend
-                                .requeue(target, seq, head, retry, u32::from(ask))
+                                .requeue(target, seq, head, retry, u32::from(ask), db)
                                 .await;
                             continue;
                         }
-                        if let Some((retry, slot)) = take_bounce(&link, seq) {
+                        if let Some((retry, slot, db)) = take_bounce(&link, seq) {
                             stats::bump(&shared.wstats.redirect_waits);
                             let gate = Rc::new(Notify::new());
                             link.gate_slots(&[slot], &gate);
@@ -240,7 +240,7 @@ pub(super) async fn write_loop(
                             // detached deliberately: bounded by the hops and one backend reply each
                             tokio::task::spawn_local(async move {
                                 let reply =
-                                    follow(&shared, client_id, link.sharded.get(), frame, retry)
+                                    follow(&shared, link.lane_with(client_id, db), frame, retry)
                                         .await;
                                 link.release_gates(&[slot]);
                                 gate.notify_waiters();
@@ -253,7 +253,7 @@ pub(super) async fn write_loop(
                         frame = Bytes::from_static(ERR_TRYAGAIN);
                     } else if frame.starts_with(NOSCRIPT)
                         && rerunnable(&link, seq)
-                        && let Some(retry) = take_retry(&link, seq, false)
+                        && let Some((retry, db)) = take_retry(&link, seq, false)
                     {
                         let topo = shared.topo.load_full();
                         let reload = shared
@@ -267,11 +267,11 @@ pub(super) async fn write_loop(
                                 link: &link,
                                 client_id,
                             };
-                            resend.requeue(target, seq, Some(load), retry, 1).await;
+                            resend.requeue(target, seq, Some(load), retry, 1, db).await;
                             continue;
                         }
                     } else if frame.starts_with(b"-TRYAGAIN")
-                        && let Some((req, fill)) = take_degrade(&link, seq)
+                        && let Some((req, fill, db)) = take_degrade(&link, seq)
                     {
                         // the singles carry no CACHING opt-in: they cannot fill
                         if let Some(fill) = fill
@@ -293,8 +293,7 @@ pub(super) async fn write_loop(
                                     let mut singles = Singles::new(merge);
                                     resend_singles(
                                         &shared,
-                                        client_id,
-                                        link.sharded.get(),
+                                        link.lane_with(client_id, db),
                                         &req,
                                         nkeys,
                                         0..nkeys,
@@ -304,6 +303,7 @@ pub(super) async fn write_loop(
                                     // a fill raced by the late writes goes before the gate lets
                                     // the client read again
                                     if plan.spec.is_write()
+                                        && db == 0
                                         && let Some(cache) = &shared.cache
                                     {
                                         write_keys(plan.spec, &req, plan.argc, |k| {
@@ -431,18 +431,19 @@ fn rerunnable(link: &WriterLink, seq: u64) -> bool {
 }
 
 // retryable redirects: single-reply requests always, multi-reply blobs only for MOVED
-fn take_retry(link: &WriterLink, seq: u64, ask: bool) -> Option<Retry> {
+fn take_retry(link: &WriterLink, seq: u64, ask: bool) -> Option<(Retry, u8)> {
     let mut entry = entry_at(&link.inflight, seq)?;
     if entry.retried || (entry.expect > 1 && ask) {
         return None;
     }
     entry.retried = true;
+    let db = entry.db;
     let fill = link.detach_fill(&mut entry);
-    Some((entry.frame.clone(), entry.expect, fill))
+    Some(((entry.frame.clone(), entry.expect, fill), db))
 }
 
 // a request redirected a second time waits the handoff out once, while nothing later holds a sequence
-fn take_bounce(link: &WriterLink, seq: u64) -> Option<(Retry, u16)> {
+fn take_bounce(link: &WriterLink, seq: u64) -> Option<(Retry, u16, u8)> {
     if !rerunnable(link, seq) {
         return None;
     }
@@ -452,15 +453,15 @@ fn take_bounce(link: &WriterLink, seq: u64) -> Option<(Retry, u16)> {
     }
     let slot = request_slot(&entry.frame)?;
     entry.waited = true;
+    let db = entry.db;
     let fill = link.detach_fill(&mut entry);
-    Some(((entry.frame.clone(), entry.expect, fill), slot))
+    Some(((entry.frame.clone(), entry.expect, fill), slot, db))
 }
 
 // the request follows each redirect after a wait; the last answer stands
 async fn follow(
     shared: &Rc<Shared>,
-    client_id: u64,
-    sharded: bool,
+    lane: Lane,
     mut redirect: Bytes,
     (req, _, fill): Retry,
 ) -> Bytes {
@@ -477,7 +478,7 @@ async fn follow(
         tokio::time::sleep(wait).await;
         wait *= 2;
         let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
-        let rx = scatter_one(shared, target, client_id, sharded, head, req.clone()).await;
+        let rx = scatter_one(shared, target, lane, head, req.clone()).await;
         redirect = recv_or_lost(rx).await;
     }
     if parse_redirect(&redirect).is_some() {
@@ -488,7 +489,7 @@ async fn follow(
 }
 
 // one key-by-key resend per request, whether or not a redirect retry preceded it
-fn take_degrade(link: &WriterLink, seq: u64) -> Option<(Bytes, Option<Fill>)> {
+fn take_degrade(link: &WriterLink, seq: u64) -> Option<(Bytes, Option<Fill>, u8)> {
     let mut entry = entry_at(&link.inflight, seq)?;
     if entry.degraded || entry.expect > 1 {
         return None;
@@ -496,8 +497,9 @@ fn take_degrade(link: &WriterLink, seq: u64) -> Option<(Bytes, Option<Fill>)> {
     // a redirect merged out of the resend must not re-run the whole request
     entry.degraded = true;
     entry.retried = true;
+    let db = entry.db;
     let fill = link.detach_fill(&mut entry);
-    Some((entry.frame.clone(), fill))
+    Some((entry.frame.clone(), fill, db))
 }
 
 // the single window-release site: a push frees its slot on emission

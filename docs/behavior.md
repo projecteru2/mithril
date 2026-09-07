@@ -27,6 +27,9 @@
   more behind it. A FLUSHALL issued while watching makes the EXEC answer
   nil, as it would on one node.
 - Blocking commands and pubsub use dedicated backend connections.
+- SELECT n (a Valkey 9 cluster with `cluster-databases`) moves the session
+  onto connections bound to that database; the reply cache serves
+  database 0 only.
 - MOVED/ASK are absorbed: one transparent retry against the named target,
   plus a debounced topology refresh.
 - An atomic slot migration (Valkey 9 `CLUSTER MIGRATESLOTS`, Redis 8.4

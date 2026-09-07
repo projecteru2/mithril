@@ -1,4 +1,5 @@
-//! Backend connections: shared pipelined conns per node, exclusive ones for blocking.
+//! Backend connections: shared pipelined conns per node and database, exclusive ones for
+//! blocking and WATCH capped per node across databases.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -134,7 +135,9 @@ impl BatchDepth {
 /// Per-worker backend pools keyed by node address, split by readonly role.
 pub struct Backends {
     cfg: Arc<Config>,
-    pools: RefCell<HashMap<Box<str>, PoolPair>>,
+    pools: RefCell<HashMap<Box<str>, Vec<PoolPair>>>,
+    // exclusive connections are capped per node, not per database
+    exclusive: RefCell<HashMap<Box<str>, Rc<Cell<usize>>>>,
     tracking: Option<TrackingFrames>,
     depth: Rc<BatchDepth>,
 }
@@ -149,6 +152,7 @@ impl Backends {
         Rc::new(Backends {
             cfg,
             pools: RefCell::new(HashMap::new()),
+            exclusive: RefCell::new(HashMap::new()),
             tracking,
             depth: Rc::new(BatchDepth::default()),
         })
@@ -156,7 +160,7 @@ impl Backends {
 
     /// Redirects every live shared connection to `addr` at a new tracker; a refusal fails it.
     pub async fn rearm(&self, addr: &str, frame: &Bytes) -> Result<(), String> {
-        let conns: Vec<Rc<Conn>> = match self.pools.borrow().get(addr) {
+        let conns: Vec<Rc<Conn>> = match self.pools.borrow().get(addr).and_then(|p| p.first()) {
             Some([Some(pool), _]) => pool.shared.borrow().clone(),
             _ => Vec::new(),
         };
@@ -174,9 +178,9 @@ impl Backends {
         Ok(())
     }
 
-    /// Returns the sticky shared connection for `addr`.
-    pub fn shared(&self, addr: &str, sticky: u64, readonly: bool) -> Rc<Conn> {
-        let pool = self.pool(addr, readonly);
+    /// Returns the sticky shared connection for `addr` on database `db`.
+    pub fn shared(&self, addr: &str, sticky: u64, readonly: bool, db: u8) -> Rc<Conn> {
+        let pool = self.pool(addr, readonly, db);
         let want = self.cfg.backend_conns;
         let idx = (sticky % want as u64) as usize;
         let mut conns = pool.shared.borrow_mut();
@@ -186,40 +190,57 @@ impl Backends {
             Role::Master
         };
         while conns.len() <= idx {
-            conns.push(self.dial(addr, role));
+            conns.push(self.dial(addr, role, db));
         }
         if conns[idx].is_dead() {
-            conns[idx] = self.dial(addr, role);
+            conns[idx] = self.dial(addr, role, db);
         }
         conns[idx].clone()
     }
 
     /// Leases an exclusive connection; drop returns it or frees its quota.
-    pub fn take_exclusive(&self, addr: &str) -> Option<ExclusiveLease> {
-        let pool = self.pool(addr, false);
+    pub fn take_exclusive(&self, addr: &str, db: u8) -> Option<ExclusiveLease> {
+        let pool = self.pool(addr, false, db);
+        let quota = self.exclusive_quota(addr);
         let conn = loop {
             let idle = pool.idle_exclusive.borrow_mut().pop();
             match idle {
                 Some(c) if !c.is_dead() => break c,
-                Some(_) => pool.release_exclusive(),
+                Some(_) => release_one(&quota),
                 None => {
-                    if pool.exclusive_count.get() >= MAX_EXCLUSIVE_PER_NODE {
+                    if quota.get() >= MAX_EXCLUSIVE_PER_NODE {
                         return None;
                     }
-                    pool.exclusive_count.set(pool.exclusive_count.get() + 1);
-                    break self.dial(addr, Role::Exclusive);
+                    quota.set(quota.get() + 1);
+                    break self.dial(addr, Role::Exclusive, db);
                 }
             }
         };
         Some(ExclusiveLease {
             conn,
             pool,
+            quota,
             complete: false,
         })
     }
 
-    fn pool(&self, addr: &str, readonly: bool) -> Rc<Pool> {
-        if let Some(pair) = self.pools.borrow().get(addr)
+    fn exclusive_quota(&self, addr: &str) -> Rc<Cell<usize>> {
+        if let Some(q) = self.exclusive.borrow().get(addr) {
+            return q.clone();
+        }
+        self.exclusive
+            .borrow_mut()
+            .entry(addr.into())
+            .or_default()
+            .clone()
+    }
+
+    fn pool(&self, addr: &str, readonly: bool, db: u8) -> Rc<Pool> {
+        if let Some(pair) = self
+            .pools
+            .borrow()
+            .get(addr)
+            .and_then(|p| p.get(usize::from(db)))
             && let Some(p) = &pair[usize::from(readonly)]
         {
             return p.clone();
@@ -227,15 +248,17 @@ impl Backends {
         let pool = Rc::new(Pool {
             shared: RefCell::new(Vec::new()),
             idle_exclusive: RefCell::new(Vec::new()),
-            exclusive_count: Cell::new(0),
         });
         let mut pools = self.pools.borrow_mut();
-        let pair = pools.entry(addr.into()).or_default();
-        pair[usize::from(readonly)] = Some(pool.clone());
+        let by_db = pools.entry(addr.into()).or_default();
+        if by_db.len() <= usize::from(db) {
+            by_db.resize_with(usize::from(db) + 1, PoolPair::default);
+        }
+        by_db[usize::from(db)][usize::from(readonly)] = Some(pool.clone());
         pool
     }
 
-    fn dial(&self, addr: &str, role: Role) -> Rc<Conn> {
+    fn dial(&self, addr: &str, role: Role, db: u8) -> Rc<Conn> {
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
         let conn = Rc::new(Conn {
             tx,
@@ -244,14 +267,14 @@ impl Backends {
         });
         let task_conn = conn.clone();
         let tracking = match &self.tracking {
-            Some(t) if role == Role::Master => t.borrow().get(addr).cloned(),
+            Some(t) if role == Role::Master && db == 0 => t.borrow().get(addr).cloned(),
             _ => None,
         };
         let addr = addr.to_string();
         let cfg = self.cfg.clone();
         let depth = self.depth.clone();
         tokio::task::spawn_local(async move {
-            run_conn(&addr, rx, role, tracking, &cfg, &task_conn, &depth).await;
+            run_conn((&addr, db), rx, role, tracking, &cfg, &task_conn, &depth).await;
             task_conn.dead.set(true);
         });
         conn
@@ -262,6 +285,7 @@ impl Backends {
 pub struct ExclusiveLease {
     conn: Rc<Conn>,
     pool: Rc<Pool>,
+    quota: Rc<Cell<usize>>,
     complete: bool,
 }
 
@@ -284,7 +308,7 @@ impl Drop for ExclusiveLease {
                 .push(self.conn.clone());
         } else {
             self.conn.abort();
-            self.pool.release_exclusive();
+            release_one(&self.quota);
         }
     }
 }
@@ -299,19 +323,16 @@ type PoolPair = [Option<Rc<Pool>>; 2];
 struct Pool {
     shared: RefCell<Vec<Rc<Conn>>>,
     idle_exclusive: RefCell<Vec<Rc<Conn>>>,
-    exclusive_count: Cell<usize>,
 }
 
-impl Pool {
-    fn release_exclusive(&self) {
-        self.exclusive_count
-            .set(self.exclusive_count.get().saturating_sub(1));
-    }
+// one exclusive connection to a node retires; the per-node quota frees a slot
+fn release_one(quota: &Cell<usize>) {
+    quota.set(quota.get().saturating_sub(1));
 }
 
 /// Dials a raw authenticated backend connection for relays and the refresher.
 pub async fn dial_raw(addr: &str, cfg: &Config) -> std::io::Result<TcpStream> {
-    let (r, w) = open(addr, false, cfg, None)
+    let (r, w) = open(addr, 0, false, cfg, None)
         .await
         .map_err(std::io::Error::other)?;
     r.reunite(w).map_err(std::io::Error::other)
@@ -377,6 +398,7 @@ pub(crate) fn pair_replies<S>(
 /// Connects and handshakes one backend socket.
 pub(crate) async fn open(
     addr: &str,
+    db: u8,
     readonly: bool,
     cfg: &Config,
     tracking: Option<&[u8]>,
@@ -385,7 +407,7 @@ pub(crate) async fn open(
         .await
         .map_err(|e| e.to_string())?;
     let (mut r, mut w) = stream.into_split();
-    handshake(&mut r, &mut w, readonly, cfg, tracking).await?;
+    handshake(&mut r, &mut w, (db, readonly), cfg, tracking).await?;
     Ok((r, w))
 }
 
@@ -487,7 +509,7 @@ pub(crate) async fn connect(addr: &str, keepalive_secs: u64) -> std::io::Result<
 pub(crate) async fn handshake(
     reader: &mut OwnedReadHalf,
     writer: &mut OwnedWriteHalf,
-    readonly: bool,
+    (db, readonly): (u8, bool),
     cfg: &Config,
     tracking: Option<&[u8]>,
 ) -> Result<(), String> {
@@ -500,6 +522,14 @@ pub(crate) async fn handshake(
         } else {
             resp::write_command(&mut cmds, &[b"AUTH", user, pass]);
         }
+        expected += 1;
+    }
+    if db != 0 {
+        let mut digits = [0u8; resp::DEC_BUF];
+        resp::write_command(
+            &mut cmds,
+            &[b"SELECT", resp::u64_digits(&mut digits, u64::from(db))],
+        );
         expected += 1;
     }
     if readonly {
@@ -555,7 +585,7 @@ pub(crate) async fn read_reply<R: AsyncRead + Unpin>(
 }
 
 pub(crate) async fn run_pipe<S, D: Fn(S, Bytes) + Copy>(
-    addr: &str,
+    (addr, db): (&str, u8),
     readonly: bool,
     cfg: &Config,
     tracking: Option<&[u8]>,
@@ -565,7 +595,7 @@ pub(crate) async fn run_pipe<S, D: Fn(S, Bytes) + Copy>(
 ) {
     let halves = tokio::select! {
         _ = abort_signal(abort) => Err("aborted".to_string()),
-        r = open(addr, readonly, cfg, tracking) => r,
+        r = open(addr, db, readonly, cfg, tracking) => r,
     };
     match halves {
         Ok(halves) => pump(addr, rx, halves, abort, depth, deliver).await,
@@ -593,7 +623,7 @@ async fn write_slices<W: tokio::io::AsyncWrite + Unpin>(
 }
 
 async fn run_conn(
-    addr: &str,
+    (addr, db): (&str, u8),
     mut rx: mpsc::Receiver<Outbound>,
     role: Role,
     tracking: Option<Bytes>,
@@ -605,7 +635,7 @@ async fn run_conn(
     let depth =
         (role != Role::Exclusive && cfg.backend_sharding == Sharding::Auto).then_some(depth);
     run_pipe(
-        addr,
+        (addr, db),
         role == Role::Replica,
         cfg,
         tracking.as_deref(),

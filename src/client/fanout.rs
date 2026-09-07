@@ -11,7 +11,7 @@ use super::pipe::{
     ColdSend, Pipe, Staged, parse_redirect, recv_or_lost, scatter_one, scatter_pipe, stage_one,
 };
 use super::session::Session;
-use super::{Cold, ERR_NO_OWNER, Reply, Shared, error_frame};
+use super::{Cold, ERR_NO_OWNER, Lane, Reply, Shared, error_frame};
 use crate::backend::{ASKING_FRAME, BATCH, ERR_BACKEND_LOST};
 use crate::cache::{CACHING_FRAME, ReplyCache};
 use crate::command::{self, Kind, Spec};
@@ -167,7 +167,7 @@ impl Session {
             Planned::Failed => return None,
             Planned::Single(slot) => {
                 if spec.is_write()
-                    && let Some(cache) = &self.shared.cache
+                    && let Some(cache) = self.cache()
                 {
                     write_keys(spec, &frame, argc, |k| cache.invalidate(k));
                 }
@@ -213,9 +213,8 @@ impl Session {
         let seq = self.alloc_seq();
         let shared = self.shared.clone();
         let reply_q = self.reply_q.clone();
-        let id = self.id;
+        let lane = self.lane();
         // detached deliberately: completion is bounded by backend replies
-        let sharded = self.link.sharded.get();
         tokio::task::spawn_local(async move {
             let topo = shared.topo.load_full();
             if master_idx >= topo.masters.len() {
@@ -231,7 +230,7 @@ impl Session {
             sub_args.extend_from_slice(&args[2..]);
             let mut cmd = Vec::new();
             resp::write_command(&mut cmd, &sub_args);
-            let rx = scatter_one(&shared, addr, id, sharded, None, Bytes::from(cmd)).await;
+            let rx = scatter_one(&shared, addr, lane, None, Bytes::from(cmd)).await;
             let reply = recv_or_lost(rx).await;
             let out = match multikey::parse_scan_reply(&reply) {
                 Some((next, keys)) => {
@@ -289,7 +288,7 @@ impl Session {
         }
         let total = keys.len();
         let marks = match &self.shared.cache {
-            Some(cache) if spec.is_write() => Some(WriteMarks::new(
+            Some(cache) if spec.is_write() && self.link.db.get() == 0 => Some(WriteMarks::new(
                 cache,
                 keys.iter().map(|k| frame.slice_ref(k)).collect(),
             )),
@@ -359,7 +358,7 @@ impl Session {
     ) -> Option<Box<ColdSend>> {
         let mut fill = None;
         if spec.flags & command::FLAG_CACHE != 0
-            && let Some(cache) = &self.shared.cache
+            && let Some(cache) = self.cache()
         {
             match mget_cache(cache, &frame, self.may_fill()) {
                 PartCache::Hit(reply) => {
@@ -379,7 +378,7 @@ impl Session {
     // the merged reply went out. Replica-routed parts never fill: those connections
     // carry no tracking
     fn cache_parts(&self, plan: &mut FanoutPlan, cacheable: bool) -> bool {
-        let Some(cache) = &self.shared.cache else {
+        let Some(cache) = self.cache() else {
             return false;
         };
         if !cacheable || plan.total > MGET_CACHE_KEYS {
@@ -444,11 +443,11 @@ impl Session {
         let link = self.link.clone();
         let shared = self.shared.clone();
         let reply_q = self.reply_q.clone();
-        let id = self.id;
+        // the lane is snapshotted here: a later SELECT must not move these parts
+        let lane = self.lane();
         // detached deliberately: completion is bounded by backend replies
         tokio::task::spawn_local(async move {
             let _marks = marks;
-            let sharded = link.sharded.get();
             let mut results: Vec<(Vec<usize>, Bytes)> = Vec::with_capacity(parts.len());
             let mut retries: Vec<(multikey::Part, oneshot::Receiver<Bytes>)> = Vec::new();
             let mut singles = Singles::new(merge);
@@ -471,15 +470,14 @@ impl Session {
                         let _ = shared.refresh.send(());
                         let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
                         let frame = part.frame.clone();
-                        let rx = scatter_one(&shared, target, id, sharded, head, frame).await;
+                        let rx = scatter_one(&shared, target, lane, head, frame).await;
                         retries.push((part, rx));
                     }
                     None if degradable && reply.starts_with(b"-TRYAGAIN") => {
                         // boxed: the resend's state must not widen every fan-out's future
                         Box::pin(resend_singles(
                             &shared,
-                            id,
-                            sharded,
+                            lane,
                             &part.frame,
                             part.positions.len(),
                             part.positions.iter().copied(),
@@ -495,8 +493,7 @@ impl Session {
                 if degradable && reply.starts_with(b"-TRYAGAIN") {
                     Box::pin(resend_singles(
                         &shared,
-                        id,
-                        sharded,
+                        lane,
                         &part.frame,
                         part.positions.len(),
                         part.positions.iter().copied(),
@@ -540,8 +537,7 @@ pub(super) fn key_pairs<'a>(
 // a migrating slot answers a multi-key request with TRYAGAIN; one key at a time follows ASK
 pub(super) async fn resend_singles(
     shared: &Rc<Shared>,
-    id: u64,
-    sharded: bool,
+    lane: Lane,
     frame: &[u8],
     count: usize,
     positions: impl Iterator<Item = usize>,
@@ -560,7 +556,7 @@ pub(super) async fn resend_singles(
                 out.push(pos, Bytes::from_static(ERR_NO_OWNER));
                 continue;
             };
-            let rx = scatter_one(shared, addr, id, sharded, None, frame.clone()).await;
+            let rx = scatter_one(shared, addr, lane, None, frame.clone()).await;
             pending.push((pos, frame, rx));
         }
         for (pos, frame, rx) in pending.drain(..) {
@@ -572,7 +568,7 @@ pub(super) async fn resend_singles(
                         let _ = shared.refresh.send(());
                     }
                     let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
-                    let rx = scatter_one(shared, target, id, sharded, head, frame).await;
+                    let rx = scatter_one(shared, target, lane, head, frame).await;
                     followed.push((pos, rx));
                 }
                 None => out.push(pos, reply),

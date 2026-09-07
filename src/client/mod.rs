@@ -47,6 +47,15 @@ pub(super) const ERR_NO_OWNER: &[u8] = b"-CLUSTERDOWN Hash slot not served\r\n";
 pub(super) const ERR_TRYAGAIN: &[u8] = b"-TRYAGAIN slot is migrating, retry later\r\n";
 pub(super) const ERR_EXCLUSIVE_LIMIT: &str = "ERR too many blocking connections";
 
+/// How a session reaches the backends: its sticky connection key, the shard fabric or the
+/// worker's own pools, and its database.
+#[derive(Clone, Copy)]
+pub(super) struct Lane {
+    pub(super) id: u64,
+    pub(super) sharded: bool,
+    pub(super) db: u8,
+}
+
 /// Everything a session needs from its worker.
 pub struct Shared {
     pub cfg: Arc<Config>,

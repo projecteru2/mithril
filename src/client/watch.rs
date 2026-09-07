@@ -68,6 +68,8 @@ enum Settle {
 /// The keys a session watches live on this connection until EXEC or a release.
 pub(super) struct Watched {
     pub(super) slot: u16,
+    // the database the watch was armed in; its lease selected it, so a later SELECT skips it
+    pub(super) db: u8,
     state: Cell<State>,
     // FLUSHALL passed on other connections: the EXEC answers nil, as it would on one node
     dirty: Cell<bool>,
@@ -284,8 +286,10 @@ impl Session {
             self.emit_at(seq, Bytes::from_static(ERR_NO_OWNER));
             return None;
         };
+        let db = self.link.db.get();
         let watched = Rc::new(Watched {
             slot,
+            db,
             state: Cell::new(State::Arming),
             dirty: Cell::new(false),
             exec_taken: Cell::new(false),
@@ -308,7 +312,7 @@ impl Session {
         let (shared, reply_q, link) =
             (self.shared.clone(), self.reply_q.clone(), self.link.clone());
         let task = tokio::task::spawn_local(async move {
-            arm(&shared, &reply_q, &link, &watched, (seq, frame), addr).await;
+            arm(&shared, &reply_q, &link, &watched, (seq, frame), (addr, db)).await;
         });
         track_task(&self.link, task);
         None
@@ -327,6 +331,16 @@ impl Session {
             return false;
         };
         let seq = self.alloc_seq();
+        self.release_at(w, seq, reply);
+        true
+    }
+
+    // a SELECT that changes the database ends the watch (its lease is bound to the old one),
+    // delivering the SELECT reply at its own sequence once the release lands
+    pub(super) fn end_watch_at(&self, seq: u64, reply: Bytes) -> bool {
+        let Some(w) = self.link.watch.borrow().clone() else {
+            return false;
+        };
         self.release_at(w, seq, reply);
         true
     }
@@ -385,7 +399,7 @@ impl Session {
         }
         let (mut found, mut whole) = (None::<Rc<Watched>>, true);
         for key in spec.all_keys(resp::Args::new(frame, argc).skip(1), argc) {
-            match self.link.generation(crc16::slot(key)) {
+            match self.link.generation_in_db(crc16::slot(key)) {
                 Some(w) => match &found {
                     Some(f) if !Rc::ptr_eq(f, &w) => whole = false,
                     Some(_) => {}
@@ -407,7 +421,7 @@ impl Session {
         argc: usize,
     ) -> Option<Cold<'_>> {
         if spec.is_write()
-            && let Some(cache) = &self.shared.cache
+            && let Some(cache) = self.cache()
         {
             write_keys(spec, &frame, argc, |k| cache.invalidate(k));
         }
@@ -507,12 +521,12 @@ async fn arm(
     link: &WriterLink,
     watched: &Rc<Watched>,
     (seq, frame): (u64, Bytes),
-    addr: String,
+    (addr, db): (String, u8),
 ) {
     link.fence_waiters.set(link.fence_waiters.get() + 1);
     settled(&link.fence_notify, || link.emitted.get() < seq).await;
     link.fence_waiters.set(link.fence_waiters.get() - 1);
-    let Some(lease) = shared.backends.take_exclusive(&addr) else {
+    let Some(lease) = shared.backends.take_exclusive(&addr, db) else {
         watched.lose(link, reply_q, seq, error_frame(ERR_EXCLUSIVE_LIMIT));
         return;
     };

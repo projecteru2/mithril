@@ -1,6 +1,6 @@
 # Compatibility
 
-The 88-test integration suite runs against each backend, in every mode
+The 92-test integration suite runs against each backend, in every mode
 combination (`backend-sharding`, `reply-cache`), with full cluster
 teardown/recreate between versions; it includes a live slot migration
 (CLUSTER SETSLOT MIGRATING/IMPORTING + MIGRATE) under multi-key commands
@@ -35,6 +35,9 @@ memtier_benchmark, redis-benchmark.
   follows must share one slot, and a multi-key command spanning the
   watched slot and others is refused while the watch is held; UNWATCH
   inside MULTI answers OK at once instead of being queued.
+- SELECT n (Valkey 9 `cluster-databases`) binds the session to connections
+  that selected that database; the reply cache serves database 0 only, and
+  SWAPDB and MOVE across databases are the servers' own affair per node.
 - Aggregate replies to RESP3 clients keep RESP2 shape (flat arrays, not
   maps); every mainstream client parses by wire type and accepts this.
 - Pubsub delivery to a slow subscriber is windowed (4096 pushes).

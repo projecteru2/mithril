@@ -479,7 +479,7 @@ pub(super) static TABLE: &[Spec] = &[
     c(218, "sdiff", -2, R, 1, -1, 1, 0, 0, Kind::Single, I_READONLY, A_READ | A_SET | A_SLOW, &[]),
     c(219, "sdiffcard", -3, R, 0, 0, 1, 1, 0, Kind::Single, I_READONLY | I_MOVABLEKEYS, A_READ | A_SET | A_SLOW, &[]),
     c(220, "sdiffstore", -3, W, 1, -1, 1, 0, 0, Kind::Single, I_WRITE | I_DENYOOM, A_WRITE | A_SET | A_SLOW, &[]),
-    c(221, "select", 2, 0, 0, 0, 0, 0, 0, Kind::Local, I_LOADING | I_STALE | I_FAST, A_FAST | A_CONNECTION, &[]),
+    c(221, "select", 2, 0, 0, 0, 0, 0, 0, Kind::Select, I_LOADING | I_STALE | I_FAST, A_FAST | A_CONNECTION, &[]),
     c(222, "set", -3, W, 1, 1, 1, 0, 0, Kind::Single, I_WRITE | I_DENYOOM, A_WRITE | A_STRING | A_SLOW, &[]),
     c(223, "setbit", 4, W, 1, 1, 1, 0, 0, Kind::Single, I_WRITE | I_DENYOOM, A_WRITE | A_BITMAP | A_SLOW, &[]),
     c(224, "setex", 4, W, 1, 1, 1, 0, 0, Kind::Single, I_WRITE | I_DENYOOM, A_WRITE | A_STRING | A_SLOW, &[]),

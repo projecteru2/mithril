@@ -84,10 +84,14 @@ admission; no unbounded queue is reachable from client input.
 ## Backend connections
 
 Regular traffic multiplexes over `backend-conns` shared pipelined
-connections per node per worker (sticky per client). With
+connections per node per worker (sticky per client), and a session on
+`SELECT n` opens its own set to each node, so a cluster in active use of
+several databases holds one such set per database. The exclusive
+connections for blocking commands and WATCH are capped per node across all
+databases. With
 `backend-sharding yes` every request to a node crosses to the worker that
-owns that node's single process-wide pipe, which batches deeper for
-unpipelined clients; with `auto` two signals decide. Each session scores
+owns that node's process-wide pipe (one per node per database in use),
+which batches deeper for unpipelined clients; with `auto` two signals decide. Each session scores
 its own pipelining depth at dispatch (up over commands with replies still
 outstanding, down over idle ones) and moves to the shared pipe once four
 idle dispatches have run the score down, back to its worker's connections

@@ -24,11 +24,11 @@ use super::tuner::PIPELINED_LOCAL;
 use super::watch::NO_WATCH;
 use super::writer::write_loop;
 use super::{
-    Cold, ERR_CROSSSLOT, ERR_NO_OWNER, ERR_NOAUTH, MAX_INFLIGHT, Reply, Shared, error_frame,
+    Cold, ERR_CROSSSLOT, ERR_NO_OWNER, ERR_NOAUTH, Lane, MAX_INFLIGHT, Reply, Shared, error_frame,
 };
 use crate::acl::User;
 use crate::backend::{ERR_BACKEND_LOST, ensure_read_room};
-use crate::cache::CACHING_FRAME;
+use crate::cache::{CACHING_FRAME, ReplyCache};
 use crate::command::{self, Kind, Spec};
 use crate::config::Sharding;
 use crate::resp::{self, ReqScan};
@@ -214,6 +214,24 @@ impl Session {
         }
     }
 
+    pub(super) fn lane(&self) -> Lane {
+        self.link.lane(self.id)
+    }
+
+    /// The reply cache, which serves database 0 only.
+    pub(super) fn cache(&self) -> Option<&ReplyCache> {
+        self.shared
+            .cache
+            .as_deref()
+            .filter(|_| self.link.db.get() == 0)
+    }
+
+    /// Switches the session's database; its resolved pipes belong to the old one.
+    pub(super) fn set_db(&self, db: u8) {
+        self.link.db.set(db);
+        self.conns.borrow_mut().by_node.clear();
+    }
+
     pub(super) fn outstanding(&self) -> u64 {
         self.link
             .next_seq
@@ -346,8 +364,12 @@ impl Session {
         {
             match spec.kind {
                 Kind::Single | Kind::MultiSum | Kind::Mset => {}
+                // FLUSHALL empties every database, so it clears the DB-0 cache from any DB
                 Kind::Flushall => cache.clear(),
-                _ => write_keys(spec, &frame, argc, |k| cache.invalidate(k)),
+                _ if self.link.db.get() == 0 => {
+                    write_keys(spec, &frame, argc, |k| cache.invalidate(k))
+                }
+                _ => {}
             }
         }
         match spec.kind {
@@ -384,6 +406,7 @@ impl Session {
                     cold.await;
                 }
             }
+            Kind::Select => self.handle_select(frame, argc).await,
             Kind::Eval => {
                 if let Some(cold) = self.forward_eval(frame, argc) {
                     cold.await;
@@ -435,9 +458,8 @@ impl Session {
         cache.by_node[i] = Some(pipe_for(
             &self.shared,
             &topo.nodes[i].addr,
-            self.id,
+            self.lane(),
             is_replica,
-            self.link.sharded.get(),
         ));
     }
 
@@ -506,6 +528,7 @@ impl Session {
             degraded: false,
             waited: false,
             fill,
+            db: self.link.db.get(),
         });
     }
 
@@ -552,7 +575,7 @@ impl Session {
         argc: usize,
     ) -> Option<Box<ColdSend>> {
         let mut fill = None;
-        if let Some(cache) = &self.shared.cache {
+        if let Some(cache) = self.cache() {
             let key = &frame[at];
             if spec.is_write() {
                 if spec.first_key == 1

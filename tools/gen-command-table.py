@@ -29,10 +29,10 @@ KIND = {
     **{n: "Eval" for n in ["eval", "eval_ro", "evalsha", "evalsha_ro", "fcall", "fcall_ro"]},
     **{n: "Subscribe" for n in ["subscribe", "psubscribe", "unsubscribe", "punsubscribe"]},
     **{n: "AnyMaster" for n in ["publish", "pubsub", "randomkey"]},
-    "scan": "Scan", "dbsize": "Dbsize", "flushall": "Flushall", "exec": "Exec",
+    "scan": "Scan", "dbsize": "Dbsize", "flushall": "Flushall", "exec": "Exec", "select": "Select",
     "script": "Script", "function": "Script",
     **{n: "Local" for n in ["acl", "auth", "client", "cluster", "command", "config", "discard", "echo",
-                            "hello", "info", "multi", "ping", "quit", "reset", "select", "time"]},
+                            "hello", "info", "multi", "ping", "quit", "reset", "time"]},
 }
 MFLAGS = {
     "get": ["C"], "mget": ["C"], "eval": ["W"], "evalsha": ["W"], "fcall": ["W"], "sort": ["S"], "georadius": ["S"], "georadiusbymember": ["S"], "pfcount": ["U"],

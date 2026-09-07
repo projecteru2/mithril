@@ -70,6 +70,8 @@ pub enum Kind {
     Flushall,
     /// WATCH: keys pinned on an exclusive connection until EXEC.
     Watch,
+    /// SELECT: the session's database, once the cluster confirms it exists.
+    Select,
     /// Answered by the proxy itself.
     Local,
     /// MULTI queue flushed to the slot owner as one blob.

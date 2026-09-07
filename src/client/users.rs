@@ -118,12 +118,13 @@ impl Session {
             let registry = self.shared.stats.registry();
             let info = registry.get(&self.id);
             format!(
-                "id={} addr={} fd={} name={} age={} idle=0 flags=N db=0 sub={subs} psub={patterns} ssub={shards} multi={queued} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={cmd} user={} redir=-1 resp={}",
+                "id={} addr={} fd={} name={} age={} idle=0 flags=N db={} sub={subs} psub={patterns} ssub={shards} multi={queued} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={cmd} user={} redir=-1 resp={}",
                 self.id,
                 info.map_or(String::new(), |i| i.addr.to_string()),
                 info.map_or(-1, |i| i.fd),
                 info.map_or(String::new(), |i| token(&i.name)),
                 info.map_or(0, |i| i.since.elapsed().as_secs()),
+                self.link.db.get(),
                 token(&current),
                 self.proto.get(),
             )

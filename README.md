@@ -13,11 +13,12 @@ thread-per-core runtime and zero-copy frame forwarding.
 ## Highlights
 
 - **Thread-per-core** — each worker runs a single-threaded tokio runtime with
-  its own backend pools; by default nothing crosses workers on the request
-  path, and a central acceptor places each connection on the least-loaded
-  worker (configurable) so no worker becomes the latency floor. The optional
-  `backend-sharding` mode trades that isolation for one process-wide pipe per
-  node, deepening backend batches for unpipelined workloads — and `auto`
+  its own backend pools (one set per node per database in use); by default
+  nothing crosses workers on the request path, and a central acceptor places
+  each connection on the least-loaded worker (configurable) so no worker
+  becomes the latency floor. The optional `backend-sharding` mode trades that
+  isolation for one process-wide pipe per node per database in use,
+  deepening backend batches for unpipelined workloads — and `auto`
   makes that call per session, so unpipelined and pipelining clients each
   get the path that is faster for them
 - **Zero-copy pipeline** — requests and replies travel as `bytes::Bytes`
@@ -27,9 +28,9 @@ thread-per-core runtime and zero-copy frame forwarding.
 - **Full cluster absorption** — slot routing with per-slot multi-key fan-out,
   transparent MOVED/ASK retry, multi-key commands that ride out a migrating
   slot (a `TRYAGAIN` part is re-issued key by key), atomic slot migrations
-  ridden out through their handoff, all verified against live migrations, and
-  single-virtual-node cluster emulation so
-  cluster-aware clients work unchanged against one endpoint
+  ridden out through their handoff, all verified against live migrations,
+  Valkey 9 cluster databases (`SELECT n`), and single-virtual-node cluster
+  emulation so cluster-aware clients work unchanged against one endpoint
 - **Reply cache** — optional worker-local GET/MGET cache kept coherent by the
   cluster itself: every backend connection redirects RESP3 key tracking to
   a per-worker tracker and opts each cached read in, so the servers
@@ -80,7 +81,7 @@ See [`mithril.conf.sample`](mithril.conf.sample) and the
 make test lint fmt-check   # the CI gate
 ```
 
-The integration suite lives in [`it/`](it/): 88 dockerized tests driving a
+The integration suite lives in [`it/`](it/): 92 dockerized tests driving a
 real 3-master/3-replica cluster through the proxy with redis-py — including
 live slot migrations (legacy and atomic) under traffic — run against redis 6.2
 through 8.10 and valkey 9.1 in every mode combination (`backend-sharding`,

@@ -102,9 +102,23 @@ well; a subscription the server refuses (a redirect from stale topology)
 is not kept, and the redirect prompts a topology refresh. Under RESP3, subscribed clients may keep issuing regular
 commands.
 
+## Databases
+
+SELECT 0 is answered by the proxy. Any other index is checked against the
+cluster's `cluster-databases` (Valkey 9; a Redis cluster answers with its
+cluster-mode error, an index beyond the setting with `ERR DB index is out
+of range`) and then binds the session to that database: every backend
+connection it uses from there on, shared or dedicated, selected that
+database at handshake, so single-key and multi-key commands, scripts,
+transactions and blocking commands all act on it; a database change ends an
+open WATCH, whose backend lease is database-bound. Databases 0 through 255
+are addressable (a cluster set beyond that is not a supported deployment).
+The reply cache serves database 0 only; pubsub is not per database; RESET
+returns to 0.
+
 ## Answered by the proxy
 
-PING, ECHO, SELECT (db 0 only), TIME, AUTH, HELLO, RESET, QUIT, INFO,
+PING, ECHO, SELECT, TIME, AUTH, HELLO, RESET, QUIT, INFO,
 CONFIG (GET; SET accepts `loglevel`, `acl-pubsub-default`, `acllog-max-len`),
 CLIENT (ID/SETNAME/GETNAME/LIST),
 COMMAND (COUNT, INFO with flags and ACL categories, GETKEYS covering

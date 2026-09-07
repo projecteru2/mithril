@@ -6,7 +6,7 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
 use super::queue::ReplyQueue;
-use super::{Reply, Shared};
+use super::{Lane, Reply, Shared};
 use crate::backend::{Conn, ERR_BACKEND_LOST, Outbound, Sink};
 use crate::shard::{RemoteOutbound, RemoteSink};
 
@@ -87,16 +87,10 @@ impl Staged {
     }
 }
 
-pub(super) fn pipe_for(
-    shared: &Shared,
-    addr: &str,
-    id: u64,
-    readonly: bool,
-    sharded: bool,
-) -> Pipe {
+pub(super) fn pipe_for(shared: &Shared, addr: &str, lane: Lane, readonly: bool) -> Pipe {
     match &shared.fabric {
-        Some(f) if sharded => Pipe::Shard(f.pipe(addr, readonly)),
-        _ => Pipe::Local(shared.backends.shared(addr, id, readonly)),
+        Some(f) if lane.sharded => Pipe::Shard(f.pipe(addr, readonly, lane.db)),
+        _ => Pipe::Local(shared.backends.shared(addr, lane.id, readonly, lane.db)),
     }
 }
 
@@ -187,12 +181,11 @@ pub(super) async fn scatter_pipe(
 pub(super) async fn scatter_one(
     shared: &Rc<Shared>,
     addr: &str,
-    id: u64,
-    sharded: bool,
+    lane: Lane,
     head: Option<Bytes>,
     frame: Bytes,
 ) -> oneshot::Receiver<Bytes> {
-    scatter_pipe(&pipe_for(shared, addr, id, false, sharded), head, frame).await
+    scatter_pipe(&pipe_for(shared, addr, lane, false), head, frame).await
 }
 
 pub(super) async fn recv_or_lost(rx: oneshot::Receiver<Bytes>) -> Bytes {
