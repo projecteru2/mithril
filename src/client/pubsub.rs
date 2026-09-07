@@ -8,68 +8,139 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use super::link::{WriterLink, mark_closed};
+use super::pipe::parse_redirect;
 use super::queue::ReplyQueue;
 use super::session::Session;
-use super::{ERR_NO_OWNER, MAX_INFLIGHT, Reply, Shared};
+use super::{ERR_CROSSSLOT, ERR_NO_OWNER, MAX_INFLIGHT, Reply, Shared, error_frame};
 use crate::backend::{ERR_BACKEND_LOST, ensure_read_room};
 use crate::command::{self, Kind, Spec};
+use crate::crc16;
 use crate::log_debug;
 use crate::resp;
 
 pub(super) const PUBSUB_PUSH_WINDOW: usize = 4096;
 const SUBS_LIMIT: usize = 32768;
 const PUBSUB_FORWARD_QUEUE: usize = 64;
+const ERR_SHARD_NODE: &str = "ERR shard channels of one connection must live on one node";
 
 pub(super) struct PubsubHandle {
     tx: mpsc::Sender<Bytes>,
     task: tokio::task::JoinHandle<()>,
+    // shard channels must live on this node, as on a direct connection
+    addr: String,
 }
 
-// reader-side subscription mirror; confirmation counts derive from it
+/// One command awaiting its confirmations: what frames confirm it, by kind and by the channels
+/// still unconfirmed (a bare unsubscribe's are every subscription of its kind, taken once the
+/// commands before it have settled), so the server's own unsubscribes stay pushes; `reserved`
+/// names the subscriptions it adds, each held against SUBS_LIMIT until that channel confirms.
+pub(super) struct PendingSub {
+    expect: &'static [u8],
+    channels: Vec<Bytes>,
+    remaining: usize,
+    reserved: HashSet<Bytes>,
+}
+
+impl PendingSub {
+    // an error answers any command; a pong (an array while subscribed, a simple string or the
+    // echoed bulk when no subscription took) or a confirmation naming one of the command's
+    // channels answers its own, so the server's own unsubscribes stay pushes
+    fn confirmed_by(&mut self, frame: &[u8]) -> bool {
+        if frame.first() == Some(&b'-') {
+            return true;
+        }
+        if self.expect == b"pong" && matches!(frame.first(), Some(b'+' | b'$')) {
+            return true;
+        }
+        let Some((kind, name)) = push_parts(frame) else {
+            return false;
+        };
+        if !kind.eq_ignore_ascii_case(self.expect) {
+            return false;
+        }
+        if self.channels.is_empty() {
+            return true;
+        }
+        match self.channels.iter().position(|c| c.as_ref() == name) {
+            Some(i) => {
+                self.channels.swap_remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum SubKind {
+    Channel,
+    Pattern,
+    Shard,
+}
+
+impl SubKind {
+    fn of(name: &[u8]) -> Option<SubKind> {
+        match name {
+            b"subscribe" | b"unsubscribe" => Some(SubKind::Channel),
+            b"psubscribe" | b"punsubscribe" => Some(SubKind::Pattern),
+            b"ssubscribe" | b"sunsubscribe" => Some(SubKind::Shard),
+            _ => None,
+        }
+    }
+}
+
+// the subscriptions the server has confirmed, and how many the pending subscribes still add
 #[derive(Default)]
 pub(super) struct PubsubSim {
     channels: HashSet<Vec<u8>>,
     patterns: HashSet<Vec<u8>>,
+    shards: HashSet<Vec<u8>>,
+    promised: usize,
 }
 
 impl PubsubSim {
-    /// Subscribed channels and patterns, as CLIENT INFO counts them.
-    pub(super) fn counts(&self) -> (usize, usize) {
-        (self.channels.len(), self.patterns.len())
+    /// Subscribed channels, patterns and shard channels, as CLIENT INFO counts them.
+    pub(super) fn counts(&self) -> (usize, usize, usize) {
+        (self.channels.len(), self.patterns.len(), self.shards.len())
     }
 
-    fn apply(&mut self, spec: &Spec, frame: &Bytes, argc: usize) {
-        let target = match spec.name {
-            "psubscribe" | "punsubscribe" => &mut self.patterns,
-            _ => &mut self.channels,
+    // a confirmation is the truth, on a promised sequence or not: a subscribe enters, an
+    // unsubscribe (the server's own too, after a slot moved) leaves; returns whether a
+    // subscription newly entered, so its reservation can be released
+    fn confirm(&mut self, kind: &[u8], name: &[u8]) -> bool {
+        let Some(sub) = SubKind::of(kind) else {
+            return false;
         };
-        let names = resp::Args::new(frame, argc).skip(1);
-        if matches!(spec.name, "subscribe" | "psubscribe") {
-            target.extend(names.map(<[u8]>::to_vec));
-        } else if argc > 1 {
-            for name in names {
-                target.remove(name);
-            }
+        let set = match sub {
+            SubKind::Channel => &mut self.channels,
+            SubKind::Pattern => &mut self.patterns,
+            SubKind::Shard => &mut self.shards,
+        };
+        if kind.ends_with(b"unsubscribe") {
+            set.remove(name);
+            false
         } else {
-            target.clear();
+            set.insert(name.to_vec())
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.channels.is_empty() && self.patterns.is_empty()
+        self.channels.is_empty() && self.patterns.is_empty() && self.shards.is_empty()
     }
 
-    // acks per command: named channels, or the matching set for a bare unsubscribe
-    fn ack_count(&self, spec: &Spec, argc: usize) -> usize {
-        if argc > 1 {
-            return argc - 1;
-        }
-        match spec.name {
-            "unsubscribe" => self.channels.len().max(1),
-            "punsubscribe" => self.patterns.len().max(1),
-            _ => 1,
+    fn set(&self, kind: SubKind) -> &HashSet<Vec<u8>> {
+        match kind {
+            SubKind::Channel => &self.channels,
+            SubKind::Pattern => &self.patterns,
+            SubKind::Shard => &self.shards,
         }
     }
+}
+
+/// Whether a command in pubsub mode waits for the confirmations in flight: a bare
+/// unsubscribe is sized by the settled subscriptions, QUIT and RESET must not backfill them.
+pub(super) fn settles_first(spec: &Spec, argc: usize) -> bool {
+    matches!(spec.name, "quit" | "reset") || (argc == 1 && spec.name.ends_with("unsubscribe"))
 }
 
 // an aborted relay must not detach a child blocked in write_all
@@ -82,24 +153,25 @@ impl Drop for AbortOnDrop {
 }
 
 impl Session {
-    // drains already-promised confirmations before dropping the relay
-    pub(super) async fn exit_pubsub_if_done(&self) -> bool {
-        if !self.relay_dead() {
-            if !self.subs.borrow().is_empty() {
-                return false;
-            }
-            self.drain_acks().await;
+    // drops the relay once the settled subscriptions are gone; the caller has drained
+    pub(super) fn exit_pubsub_if_done(&self) -> bool {
+        if !self.relay_dead() && !self.link.subs.borrow().is_empty() {
+            return false;
         }
         self.stop_pubsub();
         true
     }
 
+    // a push the relay holds while its window is full is part of the state in flight
     pub(super) async fn drain_acks(&self) {
-        while !self.link.ack_seqs.borrow().is_empty() {
+        while !self.link.ack_seqs.borrow().is_empty() || self.link.pushing.get() {
             if self.relay_dead() || self.link.closed.get() {
                 return;
             }
-            if !self.notified_or_closed(&self.link.acks_drained).await {
+            self.link.draining.set(true);
+            let woke = self.notified_or_closed(&self.link.acks_drained).await;
+            self.link.draining.set(false);
+            if !woke {
                 return;
             }
         }
@@ -110,7 +182,8 @@ impl Session {
         if let Some(ps) = self.pubsub.borrow_mut().take() {
             ps.task.abort();
         }
-        *self.subs.borrow_mut() = PubsubSim::default();
+        *self.link.subs.borrow_mut() = PubsubSim::default();
+        self.link.pending_subs.borrow_mut().clear();
         backfill_acks(&self.link, &self.reply_q);
     }
 
@@ -139,11 +212,24 @@ impl Session {
                 return;
             }
         }
-        let Some(acks) = self.pubsub_admit(spec, &frame, argc) else {
+        if spec.name == "ssubscribe" {
+            let relay = self.pubsub.borrow().as_ref().map(|ps| ps.addr.clone());
+            match self.shard_owner(&frame, argc) {
+                Err(err) => {
+                    self.emit_error_frame(err);
+                    return;
+                }
+                Ok(owner) if relay.is_some_and(|r| r != owner) => {
+                    self.emit_error(ERR_SHARD_NODE);
+                    return;
+                }
+                Ok(_) => {}
+            }
+        }
+        if self.promise(spec, &frame, argc).is_none() {
             self.emit_error("ERR pubsub confirmation backlog exceeds limit");
             return;
-        };
-        self.promise(spec, &frame, argc, acks);
+        }
         let sent = self
             .pubsub
             .borrow()
@@ -156,25 +242,54 @@ impl Session {
     }
 
     pub(super) fn enter_pubsub(&self, spec: &Spec, first_frame: Bytes, argc: usize) {
-        let Some(acks) = self.pubsub_admit(spec, &first_frame, argc) else {
-            self.emit_error("ERR pubsub confirmation backlog exceeds limit");
-            return;
+        let addr = if spec.name == "ssubscribe" {
+            match self.shard_owner(&first_frame, argc) {
+                Ok(addr) => Some(addr),
+                Err(err) => {
+                    self.emit_error_frame(err);
+                    return;
+                }
+            }
+        } else {
+            self.any_master_addr()
         };
-        let Some(addr) = self.any_master_addr() else {
+        let Some(addr) = addr else {
             self.emit_error_frame(Bytes::from_static(ERR_NO_OWNER));
             return;
         };
-        self.promise(spec, &first_frame, argc, acks);
+        if self.promise(spec, &first_frame, argc).is_none() {
+            self.emit_error("ERR pubsub confirmation backlog exceeds limit");
+            return;
+        }
         self.has_relay.set(true);
         let (tx, rx) = mpsc::channel::<Bytes>(PUBSUB_FORWARD_QUEUE);
         let _ = tx.try_send(first_frame);
         let shared = self.shared.clone();
         let reply_q = self.reply_q.clone();
         let link = self.link.clone();
+        let relay_addr = addr.clone();
         let task = tokio::task::spawn_local(async move {
-            pubsub_relay(shared, addr, rx, reply_q, link).await;
+            pubsub_relay(shared, relay_addr, rx, reply_q, link).await;
         });
-        *self.pubsub.borrow_mut() = Some(PubsubHandle { tx, task });
+        *self.pubsub.borrow_mut() = Some(PubsubHandle { tx, task, addr });
+    }
+
+    // the master owning the one slot every shard channel of the request hashes to
+    fn shard_owner(&self, frame: &Bytes, argc: usize) -> Result<String, Bytes> {
+        let mut channels = resp::Args::new(frame, argc).skip(1);
+        let Some(first) = channels.next() else {
+            return Err(error_frame(
+                "ERR wrong number of arguments for 'ssubscribe' command",
+            ));
+        };
+        let slot = crc16::slot(first);
+        if channels.any(|c| crc16::slot(c) != slot) {
+            return Err(Bytes::from_static(ERR_CROSSSLOT));
+        }
+        let topo = self.topo();
+        topo.owner_addr(slot)
+            .map(str::to_string)
+            .ok_or_else(|| Bytes::from_static(ERR_NO_OWNER))
     }
 
     fn relay_dead(&self) -> bool {
@@ -184,33 +299,55 @@ impl Session {
             .is_none_or(|ps| ps.task.is_finished())
     }
 
-    // promised confirmations occupy the reply window until emitted: bound them
-    fn pubsub_admit(&self, spec: &Spec, frame: &Bytes, argc: usize) -> Option<usize> {
-        let subs = self.subs.borrow();
-        let acks = subs.ack_count(spec, argc);
+    // the reply window bounds the promised confirmations and SUBS_LIMIT the subscriptions
+    // confirmed or promised, both before the command is queued
+    fn promise(&self, spec: &Spec, frame: &Bytes, argc: usize) -> Option<()> {
+        let subscribing = matches!(spec.name, "subscribe" | "psubscribe" | "ssubscribe");
+        let kind = SubKind::of(spec.name.as_bytes());
+        let mut subs = self.link.subs.borrow_mut();
+        let channels: Vec<Bytes> = match kind {
+            Some(kind) if !subscribing && argc == 1 => subs
+                .set(kind)
+                .iter()
+                .map(|c| Bytes::copy_from_slice(c))
+                .collect(),
+            _ => resp::Args::new(frame, argc)
+                .skip(1)
+                .map(|n| frame.slice_ref(n))
+                .collect(),
+        };
+        let acks = channels.len().max(1);
         if self.outstanding() as usize + acks > MAX_INFLIGHT {
             return None;
         }
-        let target = match spec.name {
-            "subscribe" => &subs.channels,
-            "psubscribe" => &subs.patterns,
-            _ => return Some(acks),
-        };
-        let mut grown = subs.channels.len() + subs.patterns.len();
-        let mut fresh: HashSet<&[u8]> = HashSet::new();
-        for a in resp::Args::new(frame, argc).skip(1) {
-            if !target.contains(a) && fresh.insert(a) {
-                grown += 1;
+        let mut reserved = HashSet::new();
+        if let Some(kind) = kind
+            && subscribing
+        {
+            let held = subs.set(kind);
+            for c in &channels {
+                if !held.contains(c.as_ref()) {
+                    reserved.insert(c.clone());
+                }
             }
+            let (c, p, s) = subs.counts();
+            if c + p + s + subs.promised + reserved.len() > SUBS_LIMIT {
+                return None;
+            }
+            subs.promised += reserved.len();
         }
-        (grown <= SUBS_LIMIT).then_some(acks)
-    }
-
-    fn promise(&self, spec: &Spec, frame: &Bytes, argc: usize, acks: usize) {
-        if spec.kind == Kind::Subscribe {
-            self.subs.borrow_mut().apply(spec, frame, argc);
-        }
+        self.link.pending_subs.borrow_mut().push_back(PendingSub {
+            expect: if spec.name == "ping" {
+                b"pong"
+            } else {
+                spec.name.as_bytes()
+            },
+            channels,
+            remaining: acks,
+            reserved,
+        });
         self.promise_acks(acks);
+        Some(())
     }
 
     fn promise_acks(&self, n: usize) {
@@ -258,19 +395,28 @@ async fn pubsub_relay(
             match resp::scan_value_at(&buf, &mut cur) {
                 resp::Scan::Complete(len) => {
                     let frame = buf.split_to(len).freeze();
-                    let popped = (!is_publication(&frame))
+                    let popped = confirms_pending(&link, &frame)
                         .then(|| link.ack_seqs.borrow_mut().pop_front())
                         .flatten();
                     let reply = match popped {
                         Some(seq) => {
+                            // one error answers a whole command: its other promised
+                            // sequences emit nothing
+                            for _ in 0..reconcile_ack(&shared, &link, &frame) {
+                                if let Some(s) = link.ack_seqs.borrow_mut().pop_front() {
+                                    let _ = reply_q.send(Reply::Ack(s, Bytes::new()));
+                                }
+                            }
                             link.acks_drained.notify_one();
                             last_ack = Some(seq);
                             Reply::Ack(seq, frame)
                         }
                         None => {
+                            link.pushing.set(true);
                             if !charge_push(&link).await {
                                 return;
                             }
+                            reconcile_push(&link, &frame);
                             Reply::Push {
                                 after: last_ack,
                                 frame,
@@ -279,6 +425,9 @@ async fn pubsub_relay(
                     };
                     if reply_q.send(reply).is_err() {
                         break 'io;
+                    }
+                    if link.pushing.replace(false) && link.draining.get() {
+                        link.acks_drained.notify_one();
                     }
                 }
                 resp::Scan::Invalid(_) => break 'io,
@@ -308,6 +457,67 @@ async fn charge_push(link: &Rc<WriterLink>) -> bool {
     true
 }
 
+// a refused command (a redirect from stale topology, say) never reaches the confirmed set
+// and retires every confirmation it still had; a redirect also asks for the topology it
+// revealed; returns how many promised sequences are left to void
+fn reconcile_ack(shared: &Shared, link: &WriterLink, frame: &[u8]) -> usize {
+    if frame.first() == Some(&b'-') && parse_redirect(frame).is_some() {
+        let _ = shared.refresh.send(());
+    }
+    absorb_ack(link, frame)
+}
+
+// the ack accounting a redirect refresh does not need: retire one promised sequence of the
+// head command, settling a confirmed subscription (releasing its reservation) or voiding the
+// rest on an error
+fn absorb_ack(link: &WriterLink, frame: &[u8]) -> usize {
+    let mut pending = link.pending_subs.borrow_mut();
+    let Some(entry) = pending.front_mut() else {
+        return 0;
+    };
+    entry.remaining -= 1;
+    let mut void = 0;
+    if frame.first() == Some(&b'-') {
+        void = entry.remaining;
+        entry.remaining = 0;
+    } else if let Some((kind, name)) = push_parts(frame) {
+        let mut subs = link.subs.borrow_mut();
+        if subs.confirm(kind, name) && entry.reserved.remove(name) {
+            subs.promised -= 1;
+        }
+    }
+    if entry.remaining == 0 {
+        link.subs.borrow_mut().promised -= entry.reserved.len();
+        pending.pop_front();
+    }
+    void
+}
+
+fn reconcile_push(link: &WriterLink, frame: &[u8]) -> bool {
+    match push_parts(frame) {
+        Some((kind, name)) => link.subs.borrow_mut().confirm(kind, name),
+        None => false,
+    }
+}
+
+// the kind and channel of a pubsub frame: its first two bulks (a subscribed PING's pong has
+// only two elements)
+fn push_parts(frame: &[u8]) -> Option<(&[u8], &[u8])> {
+    if frame.first() != Some(&b'*') {
+        return None;
+    }
+    let (n, after) = resp::scan_int_line(frame, 1)?;
+    if n < 2 {
+        return None;
+    }
+    let kind = resp::scan_bulk(frame, after)?.ok()?;
+    let name = resp::scan_bulk(frame, kind.next)?.ok()?;
+    Some((
+        &frame[kind.payload_start..kind.payload_end],
+        &frame[name.payload_start..name.payload_end],
+    ))
+}
+
 // promised confirmation sequences must resolve or the writer never drains past them
 fn backfill_acks(link: &Rc<WriterLink>, reply_q: &Rc<ReplyQueue>) {
     while let Some(seq) = link.ack_seqs.borrow_mut().pop_front() {
@@ -316,20 +526,100 @@ fn backfill_acks(link: &Rc<WriterLink>, reply_q: &Rc<ReplyQueue>) {
     link.acks_drained.notify_one();
 }
 
-// true for publications; every other pubsub frame consumes a promised sequence
-fn is_publication(frame: &[u8]) -> bool {
-    if frame.first() != Some(&b'*') {
-        return false;
+// a frame consumes a promised sequence only when it confirms the command at the head of the
+// queue; publications and the server's own frames stay pushes
+fn confirms_pending(link: &WriterLink, frame: &[u8]) -> bool {
+    link.pending_subs
+        .borrow_mut()
+        .front_mut()
+        .is_some_and(|p| p.confirmed_by(frame))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sub_entry(reserved: &[&[u8]], acks: usize) -> PendingSub {
+        PendingSub {
+            expect: b"subscribe",
+            channels: Vec::new(),
+            remaining: acks,
+            reserved: reserved.iter().map(|n| Bytes::copy_from_slice(n)).collect(),
+        }
     }
-    let Some((n, after)) = resp::scan_int_line(frame, 1) else {
-        return false;
-    };
-    if n < 3 {
-        return false;
+
+    fn ack(link: &WriterLink, kind: &str, name: &[u8]) {
+        let frame = format!(
+            "*3\r\n${}\r\n{}\r\n${}\r\n{}\r\n:1\r\n",
+            kind.len(),
+            kind,
+            name.len(),
+            std::str::from_utf8(name).unwrap()
+        );
+        absorb_ack(link, frame.as_bytes());
     }
-    let Some(Ok(b)) = resp::scan_bulk(frame, after) else {
-        return false;
-    };
-    let kind = &frame[b.payload_start..b.payload_end];
-    kind.eq_ignore_ascii_case(b"message") || kind.eq_ignore_ascii_case(b"pmessage")
+
+    #[test]
+    fn reservations_release_as_confirmations_land() {
+        let link = WriterLink::default();
+        link.subs.borrow_mut().promised = 2;
+        link.pending_subs
+            .borrow_mut()
+            .push_back(sub_entry(&[b"a", b"b"], 2));
+        ack(&link, "subscribe", b"a");
+        assert_eq!(link.subs.borrow().promised, 1);
+        assert_eq!(link.subs.borrow().counts(), (1, 0, 0));
+        ack(&link, "subscribe", b"b");
+        assert_eq!(link.subs.borrow().promised, 0);
+        assert_eq!(link.subs.borrow().counts(), (2, 0, 0));
+        assert!(link.pending_subs.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_argument_reserves_once_and_releases_the_remainder() {
+        let link = WriterLink::default();
+        link.subs.borrow_mut().promised = 1;
+        link.pending_subs
+            .borrow_mut()
+            .push_back(sub_entry(&[b"a"], 2));
+        ack(&link, "subscribe", b"a");
+        ack(&link, "subscribe", b"a");
+        assert_eq!(link.subs.borrow().promised, 0);
+        assert_eq!(link.subs.borrow().counts(), (1, 0, 0));
+        assert!(link.pending_subs.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_reconfirmed_channel_does_not_spend_a_neighbours_reservation() {
+        let link = WriterLink::default();
+        link.subs.borrow_mut().channels.insert(b"old".to_vec());
+        link.subs.borrow_mut().promised = 1;
+        let mut unsub = sub_entry(&[], 1);
+        unsub.expect = b"unsubscribe";
+        link.pending_subs.borrow_mut().push_back(unsub);
+        link.pending_subs
+            .borrow_mut()
+            .push_back(sub_entry(&[b"new"], 2));
+        ack(&link, "unsubscribe", b"old");
+        assert_eq!(link.subs.borrow().counts(), (0, 0, 0));
+        ack(&link, "subscribe", b"old");
+        assert_eq!(link.subs.borrow().promised, 1);
+        assert_eq!(link.subs.borrow().counts(), (1, 0, 0));
+        ack(&link, "subscribe", b"new");
+        assert_eq!(link.subs.borrow().promised, 0);
+        assert_eq!(link.subs.borrow().counts(), (2, 0, 0));
+        assert!(link.pending_subs.borrow().is_empty());
+    }
+
+    #[test]
+    fn confirmations_settle_the_mirror() {
+        let link = WriterLink::default();
+        reconcile_push(&link, b"*3\r\n$9\r\nsubscribe\r\n$1\r\na\r\n:1\r\n");
+        assert_eq!(link.subs.borrow().counts(), (1, 0, 0));
+        reconcile_push(&link, b"*3\r\n$7\r\nmessage\r\n$1\r\na\r\n$2\r\nhi\r\n");
+        reconcile_push(&link, b"*3\r\n$12\r\nsunsubscribe\r\n$1\r\na\r\n:0\r\n");
+        assert_eq!(link.subs.borrow().counts(), (1, 0, 0));
+        reconcile_push(&link, b"*3\r\n$11\r\nunsubscribe\r\n$1\r\na\r\n:0\r\n");
+        assert_eq!(link.subs.borrow().counts(), (0, 0, 0));
+    }
 }

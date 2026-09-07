@@ -18,7 +18,7 @@ use super::fanout::write_keys;
 use super::link::{Fill, InFlight, WriterLink};
 use super::local::{MultiState, display_name};
 use super::pipe::{ColdSend, Pipe, pipe_for, queue_on};
-use super::pubsub::{PubsubHandle, PubsubSim, pubsub_allowed};
+use super::pubsub::{PubsubHandle, pubsub_allowed, settles_first};
 use super::queue::ReplyQueue;
 use super::tuner::PIPELINED_LOCAL;
 use super::watch::NO_WATCH;
@@ -54,7 +54,6 @@ pub(super) struct Session {
     pub(super) multi: RefCell<Option<MultiState>>,
     pub(super) in_multi: Cell<bool>,
     pub(super) pubsub: RefCell<Option<PubsubHandle>>,
-    pub(super) subs: RefCell<PubsubSim>,
     pub(super) closing: Cell<bool>,
     // the worker wants this session on the shared pipes: reading pauses until it drains
     pub(super) switch_pending: Cell<bool>,
@@ -303,13 +302,14 @@ impl Session {
             self.adapt_pipes();
         }
         if self.has_relay.get() {
-            if !self.exit_pubsub_if_done().await {
-                let passthrough = self.proto.get() >= 3 && !pubsub_allowed(spec);
+            let pubsub_cmd = pubsub_allowed(spec);
+            // only the settled subscriptions say whether the session may leave pubsub mode
+            if !pubsub_cmd || settles_first(spec, argc) {
+                self.drain_acks().await;
+            }
+            if pubsub_cmd || !self.exit_pubsub_if_done() {
+                let passthrough = self.proto.get() >= 3 && !pubsub_cmd;
                 if !passthrough {
-                    // a pipelined QUIT must not backfill confirmations still in flight
-                    if spec.name == "quit" {
-                        self.drain_acks().await;
-                    }
                     self.dispatch_pubsub(spec, frame, argc);
                     return;
                 }
@@ -669,7 +669,6 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: SocketAddr, id: 
         multi: RefCell::new(None),
         in_multi: Cell::new(false),
         pubsub: RefCell::new(None),
-        subs: RefCell::new(PubsubSim::default()),
         closing: Cell::new(false),
         switch_pending: Cell::new(false),
         has_relay: Cell::new(false),

@@ -89,8 +89,18 @@ BLPOP, BRPOP, BRPOPLPUSH, BLMOVE, BLMOVEM, BLMPOP, BZPOPMAX, BZPOPMIN, BZMPOP
 and blocking XREAD run on dedicated backend connections and always on the
 slot's master.
 (P)SUBSCRIBE/(P)UNSUBSCRIBE run over a per-client pubsub connection with
-fully ordered confirmations; PUBLISH and PUBSUB forward to a master. Under
-RESP3, subscribed clients may keep issuing regular commands.
+fully ordered confirmations; a regular command, QUIT, RESET or a bare
+unsubscribe waits for the confirmations and pushes in flight, so it sees the
+settled subscriptions as it would on a direct connection. PUBLISH and PUBSUB forward to a master. Shard
+channels: SPUBLISH routes by the channel's slot; SSUBSCRIBE dials the
+pubsub connection to that slot's master (or checks the connection already
+open reaches it — shard channels of one client live on one node, as on a
+direct connection, and the channels of one SSUBSCRIBE share one slot);
+SUNSUBSCRIBE and the server's own `sunsubscribe` pushes after a slot moves
+pass through, and the latter end the subscription on the proxy's side as
+well; a subscription the server refuses (a redirect from stale topology)
+is not kept, and the redirect prompts a topology refresh. Under RESP3, subscribed clients may keep issuing regular
+commands.
 
 ## Answered by the proxy
 
@@ -111,7 +121,6 @@ Requests for these return unknown-command; none of them silently
 misbehaves:
 
 - SCRIPT KILL, SCRIPT DEBUG and FUNCTION KILL
-- shard pubsub: SSUBSCRIBE, SPUBLISH, SUNSUBSCRIBE
 - FLUSHDB, cluster-wide KEYS
 - server management: WAIT, DEBUG, LATENCY, MEMORY, SHUTDOWN,
   FAILOVER, REPLICAOF, SAVE/BGSAVE, MIGRATE and similar

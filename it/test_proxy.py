@@ -1392,3 +1392,167 @@ def test_watch_reads_the_master_uncached(cache_proxy, cluster_direct, key_prefix
         assert pipe.execute_command("RENAME", src, dst) is True
         assert cache_proxy.get(dst) == "new"
         pipe.unwatch()
+
+
+def test_sharded_pubsub_routes_by_slot(r, cluster_direct, raw_socket, key_prefix):
+    _needs(cluster_direct, (7, 0))
+    ch = f"{key_prefix}:{{sh}}:news"
+    s = raw_socket()
+    reader = _RespReader(s)
+    s.sendall(_resp_encode(["SSUBSCRIBE", ch]))
+    assert reader.read_reply() == ["ssubscribe", ch, 1]
+    assert r.execute_command("SPUBLISH", ch, "hi") == 1
+    assert reader.read_reply() == ["smessage", ch, "hi"]
+    cluster_direct.execute_command("SPUBLISH", ch, "direct")
+    assert reader.read_reply() == ["smessage", ch, "direct"]
+    s.sendall(_resp_encode(["PING"]))
+    assert reader.read_reply() == ["pong", ""]
+    near, far = _cross_slot_pair(key_prefix)
+    s.sendall(_resp_encode(["SSUBSCRIBE", near, far]))
+    with pytest.raises(redis.exceptions.ResponseError, match=r"(?i)crossslot"):
+        reader.read_reply()
+    s.sendall(_resp_encode(["SUNSUBSCRIBE"]))
+    assert reader.read_reply() == ["sunsubscribe", ch, 0]
+    s.sendall(_resp_encode(["PING"]))
+    assert reader.read_reply() == "PONG"
+
+
+def test_pubsub_overlapping_commands_keep_the_subscription(r, raw_socket, key_prefix):
+    a, b, key = f"{key_prefix}:ov:a", f"{key_prefix}:ov:b", f"{key_prefix}:ov:k"
+    bulk = [f"{key_prefix}:ov:c{i}" for i in range(20000)]
+    s = raw_socket()
+    reader = _RespReader(s)
+    s.sendall(_resp_encode(["SUBSCRIBE", a, b]))
+    assert reader.read_reply() == ["subscribe", a, 1]
+    assert reader.read_reply() == ["subscribe", b, 2]
+    for _ in range(2):
+        s.sendall(_resp_encode(["SUBSCRIBE", *bulk]))
+        for n in range(len(bulk)):
+            assert reader.read_reply() == ["subscribe", bulk[n], 3 + n]
+        s.sendall(
+            _resp_encode(["UNSUBSCRIBE", a])
+            + _resp_encode(["UNSUBSCRIBE", *bulk])
+            + _resp_encode(["SUBSCRIBE", a])
+            + _resp_encode(["UNSUBSCRIBE", b])
+        )
+        assert reader.read_reply() == ["unsubscribe", a, len(bulk) + 1]
+        s.sendall(_resp_encode(["GET", key]))
+        for n in range(len(bulk)):
+            assert reader.read_reply() == ["unsubscribe", bulk[n], len(bulk) - n]
+        assert reader.read_reply() == ["subscribe", a, 2]
+        assert reader.read_reply() == ["unsubscribe", b, 1]
+        with pytest.raises(redis.exceptions.ResponseError, match=r"only \(P\|S\)SUBSCRIBE"):
+            reader.read_reply()
+        s.sendall(_resp_encode(["SUBSCRIBE", b]))
+        assert reader.read_reply() == ["subscribe", b, 2]
+    r.publish(a, "still")
+    assert reader.read_reply() == ["message", a, "still"]
+
+
+def test_pubsub_bare_unsubscribe_behind_overlapping_commands(raw_socket, key_prefix):
+    a, b = f"{key_prefix}:bu:a", f"{key_prefix}:bu:b"
+    bulk = [f"{key_prefix}:bu:c{i}" for i in range(20000)]
+    s = raw_socket()
+    s.settimeout(30)
+    reader = _RespReader(s)
+    s.sendall(_resp_encode(["SUBSCRIBE", b]))
+    assert reader.read_reply() == ["subscribe", b, 1]
+    s.sendall(_resp_encode(["SUBSCRIBE", a, *bulk]) + _resp_encode(["UNSUBSCRIBE", a]))
+    assert reader.read_reply() == ["subscribe", a, 2]
+    s.sendall(_resp_encode(["UNSUBSCRIBE"]) + _resp_encode(["PING"]))
+    for n in range(len(bulk)):
+        assert reader.read_reply() == ["subscribe", bulk[n], 3 + n]
+    assert reader.read_reply() == ["unsubscribe", a, len(bulk) + 1]
+    gone = set()
+    for _ in range(len(bulk) + 1):
+        kind, name, _ = reader.read_reply()
+        assert kind == "unsubscribe"
+        gone.add(name)
+    assert gone == {b, *bulk}
+    assert reader.read_reply() == "PONG"
+
+
+def test_pubsub_regular_command_behind_pipelined_unsubscribe(r, raw_socket, key_prefix):
+    b, key = f"{key_prefix}:rc:b", f"{key_prefix}:rc:k"
+    bulk = [f"{key_prefix}:rc:c{i}" for i in range(20000)]
+    r.set(key, "v")
+    s = raw_socket()
+    reader = _RespReader(s)
+    s.sendall(_resp_encode(["SUBSCRIBE", b]))
+    assert reader.read_reply() == ["subscribe", b, 1]
+    s.sendall(_resp_encode(["SUBSCRIBE", *bulk]) + _resp_encode(["UNSUBSCRIBE"]) + _resp_encode(["GET", key]))
+    for n in range(len(bulk)):
+        assert reader.read_reply() == ["subscribe", bulk[n], 2 + n]
+    gone = set()
+    for _ in range(len(bulk) + 1):
+        kind, name, _ = reader.read_reply()
+        assert kind == "unsubscribe"
+        gone.add(name)
+    assert gone == {b, *bulk}
+    assert reader.read_reply() == "v"
+    s.sendall(_resp_encode(["SUBSCRIBE", b]) + _resp_encode(["PING"]))
+    assert reader.read_reply() == ["subscribe", b, 1]
+    assert reader.read_reply() == ["pong", ""]
+
+
+def test_pubsub_reset_behind_pipelined_subscribe(raw_socket, key_prefix):
+    a = f"{key_prefix}:rs:a"
+    s = raw_socket()
+    reader = _RespReader(s)
+    s.sendall(_resp_encode(["SUBSCRIBE", a]) + _resp_encode(["RESET"]) + _resp_encode(["PING"]))
+    assert reader.read_reply() == ["subscribe", a, 1]
+    assert reader.read_reply() == "RESET"
+    assert reader.read_reply() == "PONG"
+
+
+def test_sharded_channel_follows_its_slot_away(cluster_direct, raw_socket, key_prefix):
+    _needs(cluster_direct, (7, 0))
+    ch = f"{key_prefix}:{{mv}}:news"
+    slot = key_slot(ch.encode())
+    src_node = cluster_direct.get_node_from_key(ch)
+    dst_node = next(
+        n for n in cluster_direct.get_primaries() if (n.host, n.port) != (src_node.host, src_node.port)
+    )
+    src = redis.Redis(host=src_node.host, port=src_node.port, decode_responses=True)
+    dst = redis.Redis(host=dst_node.host, port=dst_node.port, decode_responses=True)
+    src_id, dst_id = src.execute_command("CLUSTER MYID"), dst.execute_command("CLUSTER MYID")
+    s = raw_socket()
+    reader = _RespReader(s)
+    s.sendall(_resp_encode(["SSUBSCRIBE", ch]))
+    assert reader.read_reply() == ["ssubscribe", ch, 1]
+    try:
+        src.execute_command("CLUSTER SETSLOT", slot, "MIGRATING", dst_id)
+        dst.execute_command("CLUSTER SETSLOT", slot, "IMPORTING", src_id)
+        dst.execute_command("CLUSTER SETSLOT", slot, "NODE", dst_id)
+        src.execute_command("CLUSTER SETSLOT", slot, "NODE", dst_id)
+        assert reader.read_reply() == ["sunsubscribe", ch, 0]
+        s.sendall(_resp_encode(["PING"]))
+        assert reader.read_reply() == "PONG"
+    finally:
+        dst.execute_command("CLUSTER SETSLOT", slot, "MIGRATING", src_id)
+        src.execute_command("CLUSTER SETSLOT", slot, "IMPORTING", dst_id)
+        src.execute_command("CLUSTER SETSLOT", slot, "NODE", src_id)
+        dst.execute_command("CLUSTER SETSLOT", slot, "NODE", src_id)
+        src.close()
+        dst.close()
+
+
+def test_sharded_channels_stay_on_one_node(cluster_direct, raw_socket, key_prefix):
+    _needs(cluster_direct, (7, 0))
+    first = f"{key_prefix}:sa"
+    owner = cluster_direct.get_node_from_key(first)
+    other = next(
+        f"{key_prefix}:sb{i}"
+        for i in range(1000)
+        if (n := cluster_direct.get_node_from_key(f"{key_prefix}:sb{i}")).host != owner.host
+        or n.port != owner.port
+    )
+    s = raw_socket()
+    reader = _RespReader(s)
+    s.sendall(_resp_encode(["SSUBSCRIBE", first]))
+    assert reader.read_reply() == ["ssubscribe", first, 1]
+    s.sendall(_resp_encode(["SSUBSCRIBE", other]))
+    with pytest.raises(redis.exceptions.ResponseError, match="one node"):
+        reader.read_reply()
+    s.sendall(_resp_encode(["SUNSUBSCRIBE", first]))
+    assert reader.read_reply() == ["sunsubscribe", first, 0]

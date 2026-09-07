@@ -1,6 +1,6 @@
 # Compatibility
 
-The 80-test integration suite runs against each backend, in every mode
+The 87-test integration suite runs against each backend, in every mode
 combination (`backend-sharding`, `reply-cache`), with full cluster
 teardown/recreate between versions; it includes a live slot migration
 (CLUSTER SETSLOT MIGRATING/IMPORTING + MIGRATE) under multi-key commands:
@@ -44,7 +44,10 @@ memtier_benchmark, redis-benchmark.
   `NOSCRIPT` and the client's own EVAL fallback applies). FUNCTION
   commands reach the masters that own slots; a node needs its libraries
   loaded before slots move to it, as with any client.
-- Shard pubsub (SSUBSCRIBE/SPUBLISH/SUNSUBSCRIBE) is not implemented.
+- Shard pubsub: the shard channels of one client connection must live on
+  one node (the node its pubsub connection reaches), as with a direct
+  cluster connection; a channel elsewhere is refused with an error rather
+  than a redirect.
 - Blocking commands (BLPOP, BRPOP, BRPOPLPUSH, BLMOVE, BLMOVEM, BLMPOP,
   BZPOPMAX, BZPOPMIN, BZMPOP, blocking XREAD) always run on the slot's master and
   never use replica routing.

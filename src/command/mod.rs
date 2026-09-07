@@ -2,7 +2,7 @@
 
 mod table;
 
-use table::{CAT_NAMES, ENTRIES, INFO_NAMES, TABLE};
+use table::{CAT_NAMES, ENTRIES, I_PUBSUB, INFO_NAMES, TABLE};
 
 const FLAG_WRITE: u8 = 1;
 const FLAG_READONLY: u8 = 1 << 1;
@@ -111,6 +111,11 @@ impl Spec {
 
     pub fn is_readonly(&self) -> bool {
         self.flags & FLAG_READONLY != 0
+    }
+
+    /// Carries channels, not keys, in its key positions (PUBLISH, SSUBSCRIBE, ...).
+    pub fn is_pubsub(&self) -> bool {
+        self.info & I_PUBSUB != 0
     }
 
     /// Validates argc against redis arity conventions.

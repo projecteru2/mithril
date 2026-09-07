@@ -24,7 +24,7 @@ KIND = {
     **{n: "MultiSum" for n in ["del", "exists", "touch", "unlink", "pfcount"]},
     "mget": "Mget", "mset": "Mset",
     **{n: "Blocking" for n in ["blpop", "brpop", "brpoplpush", "bzpopmax", "bzpopmin", "blmove", "blmpop", "bzmpop"]},
-    "watch": "Watch", "unwatch": "Local",
+    "watch": "Watch", "unwatch": "Local", "ssubscribe": "Subscribe", "sunsubscribe": "Subscribe",
     "xread": "Xread", "xreadgroup": "Xread",
     **{n: "Eval" for n in ["eval", "eval_ro", "evalsha", "evalsha_ro", "fcall", "fcall_ro"]},
     **{n: "Subscribe" for n in ["subscribe", "psubscribe", "unsubscribe", "punsubscribe"]},
@@ -36,7 +36,7 @@ KIND = {
 }
 MFLAGS = {
     "get": ["C"], "mget": ["C"], "eval": ["W"], "evalsha": ["W"], "fcall": ["W"], "sort": ["S"], "georadius": ["S"], "georadiusbymember": ["S"], "pfcount": ["U"],
-    **{n: ["P"] for n in ["ping", "subscribe", "psubscribe", "unsubscribe", "punsubscribe"]},
+    **{n: ["P"] for n in ["ping", "subscribe", "psubscribe", "unsubscribe", "punsubscribe", "ssubscribe", "sunsubscribe"]},
     **{n: ["T"] for n in ["multi", "exec", "discard", "watch", "unwatch"]},
     "quit": ["T", "P"], "reset": ["T", "P"],
 }
@@ -49,8 +49,8 @@ SKIP = {
     "asking", "bgrewriteaof", "bgsave", "clusterscan", "commandlog", "debug", "failover", "flushdb",
     "keys", "lastsave", "latency", "lolwut", "memory", "migrate", "module", "monitor",
     "move", "pfdebug", "pfselftest", "psync", "readonly", "readwrite", "replconf", "replicaof",
-    "restore-asking", "role", "save", "shutdown", "slaveof", "slowlog", "spublish",
-    "ssubscribe", "sunsubscribe", "swapdb", "sync", "wait", "waitaof",
+    "restore-asking", "role", "save", "shutdown", "slaveof", "slowlog",
+    "swapdb", "sync", "wait", "waitaof",
     "ts.mget", "ts.mrange", "ts.mrevrange", "ts.queryindex",
 }
 SKIP_PREFIX = ("ft.", "_ft.", "search.", "timeseries.")
@@ -191,7 +191,7 @@ def main():
     body = "\n".join(row for _, row in table) + "\n".join(sub_blocks)
     for i, f in enumerate(STD_FLAGS):
         if f"I_{f.upper()}" in body:
-            lines.append(f"const I_{f.upper()}: u32 = 1 << {i};")
+            lines.append(f"pub(super) const I_{f.upper()}: u32 = 1 << {i};")
     lines.append("")
     for i, c in enumerate(cats_order):
         if f"A_{c.upper()}" in body:

@@ -9,6 +9,7 @@ use bytes::Bytes;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+use super::pubsub::{PendingSub, PubsubSim};
 use super::watch::{NO_WATCH, Watched};
 use crate::cache::ReplyCache;
 use crate::multikey;
@@ -41,11 +42,17 @@ pub(super) struct WriterLink {
     // pre-allocated sequences for pending pubsub confirmations, in order
     pub(super) ack_seqs: RefCell<VecDeque<u64>>,
     pub(super) acks_drained: Notify,
+    pub(super) pushing: Cell<bool>,
+    pub(super) draining: Cell<bool>,
     // in-flight fills; the reply path skips the ring search at zero
     pub(super) fills_armed: Cell<usize>,
     pub(super) next_seq: Cell<u64>,
     // the session sends through the process-wide shard pipes
     pub(super) sharded: Cell<bool>,
+    // the subscription mirror and, per promised confirmation, what it stands for: the relay
+    // rolls a refused subscription back and mirrors the server's own unsubscribes
+    pub(super) subs: RefCell<PubsubSim>,
+    pub(super) pending_subs: RefCell<VecDeque<PendingSub>>,
     pub(super) fanouts: RefCell<FanoutGates>,
     // detached tasks answering at a sequence: blocking commands, WATCH arming, watched EXEC
     pub(super) blocking: RefCell<Vec<(u64, JoinHandle<()>)>>,

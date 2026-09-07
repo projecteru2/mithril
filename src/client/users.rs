@@ -65,7 +65,10 @@ impl Session {
                 spec.name
             )));
         }
-        for key in spec.all_keys(resp::Args::new(frame, argc).skip(1), argc) {
+        for key in spec
+            .all_keys(resp::Args::new(frame, argc).skip(1), argc)
+            .filter(|_| !spec.is_pubsub())
+        {
             if !user.may_touch(key) {
                 drop(user);
                 self.deny("key", spec.name, key, None);
@@ -74,8 +77,8 @@ impl Session {
         }
         let mut channels = resp::Args::new(frame, argc).skip(1);
         let denied = match spec.name {
-            "publish" => channels.take(1).find(|c| !user.may_use_channel(c)),
-            "subscribe" => channels.find(|c| !user.may_use_channel(c)),
+            "publish" | "spublish" => channels.take(1).find(|c| !user.may_use_channel(c)),
+            "subscribe" | "ssubscribe" => channels.find(|c| !user.may_use_channel(c)),
             "psubscribe" => channels.find(|c| !user.may_use_pattern(c)),
             _ => None,
         };
@@ -105,7 +108,7 @@ impl Session {
                 })
                 .collect()
         };
-        let (subs, patterns) = self.subs.borrow().counts();
+        let (subs, patterns, shards) = self.link.subs.borrow().counts();
         let queued = self
             .multi
             .borrow()
@@ -115,7 +118,7 @@ impl Session {
             let registry = self.shared.stats.registry();
             let info = registry.get(&self.id);
             format!(
-                "id={} addr={} fd={} name={} age={} idle=0 flags=N db=0 sub={subs} psub={patterns} ssub=0 multi={queued} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={cmd} user={} redir=-1 resp={}",
+                "id={} addr={} fd={} name={} age={} idle=0 flags=N db=0 sub={subs} psub={patterns} ssub={shards} multi={queued} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={cmd} user={} redir=-1 resp={}",
                 self.id,
                 info.map_or(String::new(), |i| i.addr.to_string()),
                 info.map_or(-1, |i| i.fd),
