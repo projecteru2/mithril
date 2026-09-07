@@ -493,10 +493,9 @@ fn absorb_ack(link: &WriterLink, frame: &[u8]) -> usize {
     void
 }
 
-fn reconcile_push(link: &WriterLink, frame: &[u8]) -> bool {
-    match push_parts(frame) {
-        Some((kind, name)) => link.subs.borrow_mut().confirm(kind, name),
-        None => false,
+fn reconcile_push(link: &WriterLink, frame: &[u8]) {
+    if let Some((kind, name)) = push_parts(frame) {
+        link.subs.borrow_mut().confirm(kind, name);
     }
 }
 
