@@ -72,7 +72,7 @@ impl Session {
             Some(slot) => {
                 state.slot = Some(slot);
                 state.bytes += frame.len();
-                if self.link.db.get() == 0 && self.shared.cache.is_some() && spec.is_write() {
+                if self.cache().is_some() && spec.is_write() {
                     write_keys(spec, &frame, argc, |k| {
                         state.write_keys.push(frame.slice_ref(k))
                     });
@@ -211,6 +211,12 @@ impl Session {
             self.set_db(0);
             let seq = self.alloc_seq();
             self.deliver_select(seq, Bytes::from_static(resp::OK), changed);
+            return;
+        }
+        // re-selecting the current database is already validated: answer without a probe
+        if index == i64::from(self.link.db.get()) {
+            let seq = self.alloc_seq();
+            self.emit_at(seq, Bytes::from_static(resp::OK));
             return;
         }
         let seq = self.alloc_seq();

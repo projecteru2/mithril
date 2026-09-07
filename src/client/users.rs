@@ -65,14 +65,13 @@ impl Session {
                 spec.name
             )));
         }
-        for key in spec
-            .all_keys(resp::Args::new(frame, argc).skip(1), argc)
-            .filter(|_| !spec.is_pubsub())
-        {
-            if !user.may_touch(key) {
-                drop(user);
-                self.deny("key", spec.name, key, None);
-                return Some(Bytes::from_static(ERR_NOPERM_KEY));
+        if !spec.is_pubsub() {
+            for key in spec.all_keys(resp::Args::new(frame, argc).skip(1), argc) {
+                if !user.may_touch(key) {
+                    drop(user);
+                    self.deny("key", spec.name, key, None);
+                    return Some(Bytes::from_static(ERR_NOPERM_KEY));
+                }
             }
         }
         let mut channels = resp::Args::new(frame, argc).skip(1);

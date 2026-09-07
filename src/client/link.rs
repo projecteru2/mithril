@@ -79,7 +79,6 @@ pub(super) struct WriterLink {
 }
 
 impl WriterLink {
-    /// The newest live watch generation of `slot`.
     /// The newest generation of a slot in the session's database; a watch armed under
     /// another database (before a SELECT) no longer routes the session's commands.
     pub(super) fn generation_in_db(&self, slot: u16) -> Option<Rc<Watched>> {
