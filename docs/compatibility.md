@@ -1,9 +1,12 @@
 # Compatibility
 
-The 87-test integration suite runs against each backend, in every mode
+The 88-test integration suite runs against each backend, in every mode
 combination (`backend-sharding`, `reply-cache`), with full cluster
 teardown/recreate between versions; it includes a live slot migration
-(CLUSTER SETSLOT MIGRATING/IMPORTING + MIGRATE) under multi-key commands:
+(CLUSTER SETSLOT MIGRATING/IMPORTING + MIGRATE) under multi-key commands
+and, on Redis 8.4+ and Valkey 9, an atomic slot migration (`CLUSTER
+MIGRATION IMPORT` / `CLUSTER MIGRATESLOTS`) moved back and forth under a
+single-key write stream, which must see no error and lose no increment:
 
 | backend | server version | result |
 |---|---|---|

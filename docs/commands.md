@@ -123,7 +123,9 @@ misbehaves:
 - SCRIPT KILL, SCRIPT DEBUG and FUNCTION KILL
 - FLUSHDB, cluster-wide KEYS
 - server management: WAIT, DEBUG, LATENCY, MEMORY, SHUTDOWN,
-  FAILOVER, REPLICAOF, SAVE/BGSAVE, MIGRATE and similar
+  FAILOVER, REPLICAOF, SAVE/BGSAVE, MIGRATE and similar; slot migrations
+  (CLUSTER SETSLOT, CLUSTER MIGRATION, CLUSTER MIGRATESLOTS) are issued to
+  the nodes directly and the proxy rides them out
 - the search module (FT.*), whose indexes are not keys
 
 RANDOMKEY samples one random master's keyspace, not the whole cluster.

@@ -16,6 +16,7 @@ pub struct WorkerStats {
     pub commands: AtomicU64,
     pub errors: AtomicU64,
     pub redirects: AtomicU64,
+    pub redirect_waits: AtomicU64,
     pub bytes_in: AtomicU64,
     pub bytes_out: AtomicU64,
     pub readers_exited: AtomicU64,

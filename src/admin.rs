@@ -215,7 +215,7 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
          # CPU\r\nused_cpu_sys:{:.3}\r\nused_cpu_user:{:.3}\r\n\r\n\
          # Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n\
          total_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\n\
-         total_errors:{}\r\nredirections:{}\r\n\
+         total_errors:{}\r\nredirections:{}\r\nredirect_waits:{}\r\n\
          readers_exited:{}\r\nwriters_exited:{}\r\nsessions_closed:{}\r\n\r\n\
          # Mithril\r\nworker_threads:{}\r\nbackend_conns_per_node:{}\r\n\
          backend_sharding:{}\r\nslave_mode:{}\r\nreply_cache:{}\r\n\
@@ -236,6 +236,7 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
         stats.sum(|w| &w.bytes_out),
         stats.sum(|w| &w.errors),
         stats.sum(|w| &w.redirects),
+        stats.sum(|w| &w.redirect_waits),
         stats.sum(|w| &w.readers_exited),
         stats.sum(|w| &w.writers_exited),
         stats.sum(|w| &w.sessions_closed),

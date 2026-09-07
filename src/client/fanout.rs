@@ -587,6 +587,17 @@ pub(super) async fn resend_singles(
     }
 }
 
+/// The slot a request runs in, by the first key of its declared range, STREAMS list or store.
+pub(super) fn request_slot(frame: &Bytes) -> Option<u16> {
+    let (argc, _) = resp::scan_int_line(frame, 1)?;
+    let argc = usize::try_from(argc).ok()?;
+    let spec = command::lookup(resp::Args::new(frame, argc).next()?)?;
+    let key = spec
+        .all_keys(resp::Args::new(frame, argc).skip(1), argc)
+        .next()?;
+    Some(crc16::slot(key))
+}
+
 pub(super) fn multikey_plan(frame: &Bytes) -> Option<DegradePlan> {
     let (argc, _) = resp::scan_int_line(frame, 1)?;
     let argc = usize::try_from(argc).ok()?;
@@ -683,6 +694,23 @@ mod tests {
         s.push(1, Bytes::from_static(b"*1\r\n$1\r\nb\r\n"));
         s.push(0, Bytes::from_static(b"*1\r\n$1\r\na\r\n"));
         assert_eq!(s.merge(2, &[]).as_ref(), b"*2\r\n$1\r\na\r\n$1\r\nb\r\n");
+    }
+
+    #[test]
+    fn request_slot_reads_keyword_and_positional_keys() {
+        let frame = |args: &[&[u8]]| {
+            let mut f = Vec::new();
+            resp::write_command(&mut f, args);
+            Bytes::from(f)
+        };
+        assert_eq!(
+            request_slot(&frame(&[b"set", b"k", b"v"])),
+            Some(crc16::slot(b"k"))
+        );
+        assert_eq!(
+            request_slot(&frame(&[b"xread", b"count", b"1", b"streams", b"s1", b"0"])),
+            Some(crc16::slot(b"s1"))
+        );
     }
 
     #[test]

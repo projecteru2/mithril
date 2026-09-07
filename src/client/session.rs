@@ -504,6 +504,7 @@ impl Session {
             expect,
             retried: false,
             degraded: false,
+            waited: false,
             fill,
         });
     }

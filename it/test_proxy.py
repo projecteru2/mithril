@@ -631,6 +631,78 @@ def test_multikey_survives_a_migrating_slot(r, cluster_direct, key_prefix):
         dst.close()
 
 
+def _migrate_slot(source, target, slot, probe):
+    """Atomic slot migration of `slot` to `target`, waited until `source` redirects."""
+    if "valkey_version" in target.info("server"):
+        target_id = target.execute_command("CLUSTER MYID")
+        assert source.execute_command("CLUSTER MIGRATESLOTS", "SLOTSRANGE", slot, slot, "NODE", target_id) == "OK"
+    else:
+        target.execute_command("CLUSTER MIGRATION", "IMPORT", slot, slot)
+    for _ in range(600):
+        if _moved(source, probe):
+            return
+        time.sleep(0.05)
+    pytest.fail("slot migration did not complete")
+
+
+def _moved(node, key):
+    try:
+        node.get(key)
+    except redis.exceptions.ResponseError as e:
+        return str(e).startswith("MOVED")
+    return False
+
+
+def test_atomic_slot_migration_under_traffic(r, cluster_direct, new_conn, key_prefix):
+    _needs(cluster_direct, (8, 4))
+    counter = f"{{{key_prefix}}}:n"
+    keys = [f"{{{key_prefix}}}:{i}" for i in range(20000)]
+    slot = key_slot(counter.encode())
+    src_node = cluster_direct.get_node_from_key(counter)
+    dst_node = next(
+        n for n in cluster_direct.get_primaries() if (n.host, n.port) != (src_node.host, src_node.port)
+    )
+    src = redis.Redis(host=src_node.host, port=src_node.port, decode_responses=True)
+    dst = redis.Redis(host=dst_node.host, port=dst_node.port, decode_responses=True)
+    bulk = new_conn()
+    pipe = bulk.pipeline(transaction=False)
+    for k in keys:
+        pipe.set(k, "x" * 1000)
+    pipe.execute()
+    stop, errors, last = threading.Event(), [], [0]
+
+    def churn():
+        c = new_conn()
+        while not stop.is_set() and len(errors) < 20:
+            try:
+                n = c.incr(counter)
+                if n != last[0] + 1 or c.get(keys[7]) != "x" * 1000:
+                    errors.append(f"incr {last[0]} -> {n}")
+                last[0] = n
+            except redis.exceptions.RedisError as e:
+                errors.append(repr(e))
+
+    worker = threading.Thread(target=churn)
+    worker.start()
+    try:
+        for source, target in [(src, dst), (dst, src)] * 2:
+            _migrate_slot(source, target, slot, counter)
+            assert target.execute_command("CLUSTER COUNTKEYSINSLOT", slot) >= len(keys) + 1
+        stop.set()
+        worker.join(30)
+        final = r.get(counter)
+    finally:
+        stop.set()
+        worker.join(30)
+        if _moved(src, counter):
+            _migrate_slot(dst, src, slot, counter)
+        bulk.delete(counter, *keys)
+        src.close()
+        dst.close()
+    assert errors == []
+    assert last[0] > 0 and int(final) == last[0]
+
+
 def test_cache_mget_hits_and_read_your_writes(cache_proxy, key_prefix):
     r = cache_proxy
     a, b, c = f"{{{key_prefix}}}a", f"{{{key_prefix}}}b", f"{key_prefix}:c"

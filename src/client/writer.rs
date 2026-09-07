@@ -3,14 +3,15 @@
 use std::cell::RefMut;
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{Notify, oneshot};
 
-use super::fanout::{Singles, multikey_plan, resend_singles, write_keys};
+use super::fanout::{Singles, multikey_plan, request_slot, resend_singles, write_keys};
 use super::link::{Fill, InFlight, InflightRing, WriterLink, mark_closed};
-use super::pipe::{parse_redirect, pipe_for, queue_on};
+use super::pipe::{parse_redirect, pipe_for, queue_on, recv_or_lost, scatter_one};
 use super::pubsub::PUBSUB_PUSH_WINDOW;
 use super::queue::ReplyQueue;
 use super::scripting::evalsha_target;
@@ -24,6 +25,11 @@ const NOSCRIPT: &[u8] = b"-NOSCRIPT No matching script";
 
 // a request taken back from the ring: frame, replies still expected, its cache ticket
 type Retry = (Bytes, u32, Option<Fill>);
+
+// an atomic slot migration's handoff leaves the two nodes briefly disagreeing on the owner: a
+// request redirected again waits between its next hops, doubling from here
+const REDIRECT_WAIT: Duration = Duration::from_millis(2);
+const REDIRECT_HOPS: u32 = 6;
 
 // out-of-order replies by sequence distance; the back slot is always Some
 #[derive(Default)]
@@ -225,6 +231,23 @@ pub(super) async fn write_loop(
                                 .await;
                             continue;
                         }
+                        if let Some((retry, slot)) = take_bounce(&link, seq) {
+                            stats::bump(&shared.wstats.redirect_waits);
+                            let gate = Rc::new(Notify::new());
+                            link.gate_slots(&[slot], &gate);
+                            let (shared, reply_q, link) =
+                                (shared.clone(), reply_q.clone(), link.clone());
+                            // detached deliberately: bounded by the hops and one backend reply each
+                            tokio::task::spawn_local(async move {
+                                let reply =
+                                    follow(&shared, client_id, link.sharded.get(), frame, retry)
+                                        .await;
+                                link.release_gates(&[slot]);
+                                gate.notify_waiters();
+                                let _ = reply_q.send(Reply::At(seq, reply));
+                            });
+                            continue;
+                        }
                         // clients believe the proxy owns every slot: never leak redirects
                         let _ = shared.refresh.send(());
                         frame = Bytes::from_static(ERR_TRYAGAIN);
@@ -416,6 +439,52 @@ fn take_retry(link: &WriterLink, seq: u64, ask: bool) -> Option<Retry> {
     entry.retried = true;
     let fill = link.detach_fill(&mut entry);
     Some((entry.frame.clone(), entry.expect, fill))
+}
+
+// a request redirected a second time waits the handoff out once, while nothing later holds a sequence
+fn take_bounce(link: &WriterLink, seq: u64) -> Option<(Retry, u16)> {
+    if !rerunnable(link, seq) {
+        return None;
+    }
+    let mut entry = entry_at(&link.inflight, seq)?;
+    if entry.waited || entry.expect != 1 {
+        return None;
+    }
+    let slot = request_slot(&entry.frame)?;
+    entry.waited = true;
+    let fill = link.detach_fill(&mut entry);
+    Some(((entry.frame.clone(), entry.expect, fill), slot))
+}
+
+// the request follows each redirect after a wait; the last answer stands
+async fn follow(
+    shared: &Rc<Shared>,
+    client_id: u64,
+    sharded: bool,
+    mut redirect: Bytes,
+    (req, _, fill): Retry,
+) -> Bytes {
+    if let Some(fill) = fill
+        && let Some(cache) = &shared.cache
+    {
+        fill.abandon(cache);
+    }
+    let mut wait = REDIRECT_WAIT;
+    for _ in 0..REDIRECT_HOPS {
+        let Some((ask, target)) = parse_redirect(&redirect) else {
+            return redirect;
+        };
+        tokio::time::sleep(wait).await;
+        wait *= 2;
+        let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
+        let rx = scatter_one(shared, target, client_id, sharded, head, req.clone()).await;
+        redirect = recv_or_lost(rx).await;
+    }
+    if parse_redirect(&redirect).is_some() {
+        Bytes::from_static(ERR_TRYAGAIN)
+    } else {
+        redirect
+    }
 }
 
 // one key-by-key resend per request, whether or not a redirect retry preceded it

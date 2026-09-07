@@ -29,6 +29,14 @@
 - Blocking commands and pubsub use dedicated backend connections.
 - MOVED/ASK are absorbed: one transparent retry against the named target,
   plus a debounced topology refresh.
+- An atomic slot migration (Valkey 9 `CLUSTER MIGRATESLOTS`, Redis 8.4
+  `CLUSTER MIGRATION`) hands the slot over while its two nodes briefly
+  disagree on the owner, so a request can be redirected back and forth: a
+  single-slot request redirected a second time follows up to six further
+  redirects with a wait before each (2 ms, doubling) instead of failing,
+  and the client sees only its reply. A pipelined client with later
+  requests already in flight receives `TRYAGAIN` for it instead, as with
+  the multi-key case below.
 - A multi-key command whose keys are split across a migrating slot
   (`TRYAGAIN` from the server) is re-issued key by key, so it completes
   through the migration; a same-slot MSET/DEL is then no longer atomic, and

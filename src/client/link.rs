@@ -20,6 +20,7 @@ pub(super) struct InFlight {
     pub(super) expect: u32,
     pub(super) retried: bool,
     pub(super) degraded: bool,
+    pub(super) waited: bool,
     pub(super) fill: Option<Fill>,
 }
 
