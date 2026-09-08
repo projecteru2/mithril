@@ -492,6 +492,17 @@ mod tests {
     }
 
     #[test]
+    fn vector_commands_are_normalized_and_routed_by_key() {
+        assert_eq!(
+            keys_of(&["VADD", "vectors", "values", "2", "1", "2", "item"]),
+            ["vectors"]
+        );
+        assert!(lookup(b"vadd").unwrap().is_write());
+        assert_eq!(keys_of(&["vSiM", "vectors", "ele", "item"]), ["vectors"]);
+        assert!(lookup(b"vsim").unwrap().is_readonly());
+    }
+
+    #[test]
     fn arity_checks() {
         let get = lookup(b"get").unwrap();
         assert!(get.arity_ok(2));

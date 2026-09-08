@@ -8,8 +8,14 @@ import json
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-INFO = json.load(open(os.path.join(HERE, "command-info.json")))
+INFO_PATH = os.path.join(HERE, "command-info.json")
 OUT = os.path.join(HERE, "..", "src", "command", "table.rs")
+
+with open(INFO_PATH, encoding="utf-8") as source:
+    INFO = json.load(source)
+for rows in INFO.values():
+    for row in rows:
+        row["name"] = row["name"].lower()
 
 STD_FLAGS = ["write", "readonly", "denyoom", "module", "admin", "pubsub", "noscript", "blocking",
              "loading", "stale", "skip_monitor", "skip_slowlog", "asking", "fast", "no_auth",
@@ -200,7 +206,8 @@ def main():
               "pub(super) static CAT_NAMES: &[&str] = &[" + ", ".join(f'"@{c}"' for c in cats_order) + "];", "",
               f"pub(super) const ENTRIES: usize = {next_id};", "", "#[rustfmt::skip]"] + sub_blocks + ["",
               "#[rustfmt::skip]", "pub(super) static TABLE: &[Spec] = &["] + [row for _, row in table] + ["];", ""]
-    open(OUT, "w").write("\n".join(lines))
+    with open(OUT, "w", encoding="utf-8") as target:
+        target.write("\n".join(lines))
     print(f"{len(table)} commands, {next_id - len(table)} subcommands, {len(cats_order)} categories")
 
 
