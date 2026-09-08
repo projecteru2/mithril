@@ -66,11 +66,16 @@ memtier_benchmark, redis-benchmark.
   (elements present in several slots count more than once); within one slot
   it is the server's exact union.
 - During a slot migration a same-slot MSET or DEL that the server refuses
-  with `TRYAGAIN` executes as independent single-key commands; a
-  concurrent reader can observe it half applied.
-- After a failover, until the next topology refresh (at most
-  `topology-refresh-secs` or the first redirect seen), a cluster-wide
-  command may reach a demoted node and return `READONLY`.
+  with `TRYAGAIN` is retried whole once the handoff settles (2 ms, doubling,
+  up to six waits), so under an atomic migration it stays atomic; only a
+  legacy migration whose keys really sit on two nodes still executes it as
+  independent single-key commands, which a concurrent reader can observe
+  half applied.
+- After a failover a cluster-wide write (FLUSHALL, FUNCTION LOAD) can reach
+  a demoted node and be answered `READONLY`; the proxy then refreshes the
+  topology and resends it to the masters the cluster reports, up to six
+  times with short waits, and only a refresh slower than that leaves the
+  client the `READONLY`.
 - Server-management commands are not proxied: WAIT, DEBUG, LATENCY, MEMORY,
   SHUTDOWN, FAILOVER, REPLICAOF, SAVE/BGSAVE, MIGRATE and similar return
   unknown-command. OBJECT routes by its key.

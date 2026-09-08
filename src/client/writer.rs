@@ -28,8 +28,8 @@ type Retry = (Bytes, u32, Option<Fill>);
 
 // an atomic slot migration's handoff leaves the two nodes briefly disagreeing on the owner: a
 // request redirected again waits between its next hops, doubling from here
-const REDIRECT_WAIT: Duration = Duration::from_millis(2);
-const REDIRECT_HOPS: u32 = 6;
+pub(super) const REDIRECT_WAIT: Duration = Duration::from_millis(2);
+pub(super) const REDIRECT_HOPS: u32 = 6;
 
 // out-of-order replies by sequence distance; the back slot is always Some
 #[derive(Default)]
@@ -232,20 +232,14 @@ pub(super) async fn write_loop(
                             continue;
                         }
                         if let Some((retry, slot, db)) = take_bounce(&link, seq) {
-                            stats::bump(&shared.wstats.redirect_waits);
-                            let gate = Rc::new(Notify::new());
-                            link.gate_slots(&[slot], &gate);
-                            let (shared, reply_q, link) =
-                                (shared.clone(), reply_q.clone(), link.clone());
-                            // detached deliberately: bounded by the hops and one backend reply each
-                            tokio::task::spawn_local(async move {
-                                let reply =
-                                    follow(&shared, link.lane_with(client_id, db), frame, retry)
-                                        .await;
-                                link.release_gates(&[slot]);
-                                gate.notify_waiters();
-                                let _ = reply_q.send(Reply::At(seq, reply));
-                            });
+                            ride_out(
+                                &shared,
+                                &reply_q,
+                                &link,
+                                (client_id, seq, slot, db),
+                                frame,
+                                retry,
+                            );
                             continue;
                         }
                         // clients believe the proxy owns every slot: never leak redirects
@@ -290,16 +284,34 @@ pub(super) async fn write_loop(
                                     (shared.clone(), reply_q.clone(), link.clone());
                                 // detached deliberately: completion is bounded by backend replies
                                 tokio::task::spawn_local(async move {
-                                    let mut singles = Singles::new(merge);
-                                    resend_singles(
+                                    let lane = link.lane_with(client_id, db);
+                                    // an atomic migration hands the slot over whole: ride it out
+                                    // first; split only if the keys really sit on two nodes
+                                    let whole = follow_slot(
                                         &shared,
-                                        link.lane_with(client_id, db),
-                                        &req,
-                                        nkeys,
-                                        0..nkeys,
-                                        &mut singles,
+                                        lane,
+                                        slot,
+                                        frame,
+                                        (req.clone(), 1, None),
                                     )
                                     .await;
+                                    let reply = if whole.starts_with(b"-TRYAGAIN")
+                                        || parse_redirect(&whole).is_some()
+                                    {
+                                        let mut singles = Singles::new(merge);
+                                        resend_singles(
+                                            &shared,
+                                            lane,
+                                            &req,
+                                            nkeys,
+                                            0..nkeys,
+                                            &mut singles,
+                                        )
+                                        .await;
+                                        singles.merge(nkeys, &[])
+                                    } else {
+                                        whole
+                                    };
                                     // a fill raced by the late writes goes before the gate lets
                                     // the client read again
                                     if plan.spec.is_write()
@@ -312,7 +324,7 @@ pub(super) async fn write_loop(
                                     }
                                     link.release_gates(&[slot]);
                                     gate.notify_waiters();
-                                    let _ = reply_q.send(Reply::At(seq, singles.merge(nkeys, &[])));
+                                    let _ = reply_q.send(Reply::At(seq, reply));
                                 });
                                 continue;
                             }
@@ -442,7 +454,7 @@ fn take_retry(link: &WriterLink, seq: u64, ask: bool) -> Option<(Retry, u8)> {
     Some(((entry.frame.clone(), entry.expect, fill), db))
 }
 
-// a request redirected a second time waits the handoff out once, while nothing later holds a sequence
+// a request that must wait a topology change out takes one ride, while nothing later holds a sequence
 fn take_bounce(link: &WriterLink, seq: u64) -> Option<(Retry, u16, u8)> {
     if !rerunnable(link, seq) {
         return None;
@@ -458,11 +470,41 @@ fn take_bounce(link: &WriterLink, seq: u64) -> Option<(Retry, u16, u8)> {
     Some(((entry.frame.clone(), entry.expect, fill), slot, db))
 }
 
-// the request follows each redirect after a wait; the last answer stands
-async fn follow(
+// gates the slot and rides the change out on a detached task; the answer lands at the
+// request's own sequence, a redirect never
+fn ride_out(
+    shared: &Rc<Shared>,
+    reply_q: &Rc<ReplyQueue>,
+    link: &Rc<WriterLink>,
+    (client_id, seq, slot, db): (u64, u64, u16, u8),
+    reply: Bytes,
+    retry: Retry,
+) {
+    stats::bump(&shared.wstats.redirect_waits);
+    let gate = Rc::new(Notify::new());
+    link.gate_slots(&[slot], &gate);
+    let (shared, reply_q, link) = (shared.clone(), reply_q.clone(), link.clone());
+    // detached deliberately: bounded by the hops and one backend reply each
+    tokio::task::spawn_local(async move {
+        let lane = link.lane_with(client_id, db);
+        let mut reply = follow_slot(&shared, lane, slot, reply, retry).await;
+        if parse_redirect(&reply).is_some() {
+            reply = Bytes::from_static(ERR_TRYAGAIN);
+        }
+        link.release_gates(&[slot]);
+        gate.notify_waiters();
+        let _ = reply_q.send(Reply::At(seq, reply));
+    });
+}
+
+// each hop waits, then goes where the reply points (a redirect's target) or where the slot
+// lives now (TRYAGAIN under an atomic migration); the first real answer stands, an error
+// outlasting the hops is the caller's to judge
+async fn follow_slot(
     shared: &Rc<Shared>,
     lane: Lane,
-    mut redirect: Bytes,
+    slot: u16,
+    mut reply: Bytes,
     (req, _, fill): Retry,
 ) -> Bytes {
     if let Some(fill) = fill
@@ -472,20 +514,21 @@ async fn follow(
     }
     let mut wait = REDIRECT_WAIT;
     for _ in 0..REDIRECT_HOPS {
-        let Some((ask, target)) = parse_redirect(&redirect) else {
-            return redirect;
+        let (ask, target) = match parse_redirect(&reply) {
+            Some((ask, target)) => (ask, target.to_owned()),
+            None if reply.starts_with(b"-TRYAGAIN") => match shared.topo.load().owner_addr(slot) {
+                Some(addr) => (false, addr.to_owned()),
+                None => return reply,
+            },
+            None => return reply,
         };
         tokio::time::sleep(wait).await;
         wait *= 2;
         let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
-        let rx = scatter_one(shared, target, lane, head, req.clone()).await;
-        redirect = recv_or_lost(rx).await;
+        let rx = scatter_one(shared, &target, lane, head, req.clone()).await;
+        reply = recv_or_lost(rx).await;
     }
-    if parse_redirect(&redirect).is_some() {
-        Bytes::from_static(ERR_TRYAGAIN)
-    } else {
-        redirect
-    }
+    reply
 }
 
 // one key-by-key resend per request, whether or not a redirect retry preceded it

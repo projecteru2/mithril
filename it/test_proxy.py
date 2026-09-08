@@ -853,6 +853,99 @@ def test_atomic_slot_migration_under_traffic(r, cluster_direct, new_conn, key_pr
     assert last[0] > 0 and int(final) == last[0]
 
 
+def test_mset_stays_atomic_under_slot_migration(r, cluster_direct, new_conn, key_prefix):
+    _needs(cluster_direct, (8, 4))
+    a, b, probe = f"{{{key_prefix}}}:ma", f"{{{key_prefix}}}:mb", f"{{{key_prefix}}}:mp"
+    slot = key_slot(probe.encode())
+    src_node = cluster_direct.get_node_from_key(probe)
+    dst_node = next(
+        n for n in cluster_direct.get_primaries() if (n.host, n.port) != (src_node.host, src_node.port)
+    )
+    src = redis.Redis(host=src_node.host, port=src_node.port, decode_responses=True)
+    dst = redis.Redis(host=dst_node.host, port=dst_node.port, decode_responses=True)
+    assert r.set(probe, "p")
+    stop, errors, torn, rounds = threading.Event(), [], [], [0]
+
+    def churn():
+        c = new_conn()
+        n = 0
+        while not stop.is_set() and len(errors) < 20:
+            n += 1
+            try:
+                c.mset({a: str(n), b: str(n)})
+                va, vb = c.mget(a, b)
+                if va != vb:
+                    torn.append((va, vb))
+                rounds[0] = n
+            except redis.exceptions.RedisError as e:
+                errors.append(repr(e))
+
+    worker = threading.Thread(target=churn)
+    worker.start()
+    try:
+        for source, target in [(src, dst), (dst, src)] * 2:
+            _migrate_slot(source, target, slot, probe)
+        stop.set()
+        worker.join(30)
+    finally:
+        stop.set()
+        worker.join(30)
+        if _moved(src, probe):
+            _migrate_slot(dst, src, slot, probe)
+        r.delete(a, b, probe)
+        src.close()
+        dst.close()
+    assert errors == []
+    assert torn == []
+    assert rounds[0] > 0
+
+
+def test_keyless_write_rides_out_a_failover(r, cluster_direct, new_conn, key_prefix):
+    _needs(cluster_direct, (7, 0))
+    k = f"{key_prefix}:fo"
+    nodes = cluster_direct.nodes_manager.slots_cache[key_slot(k.encode())]
+    assert len(nodes) > 1, "the slot's master has no replica"
+    master = redis.Redis(host=nodes[0].host, port=nodes[0].port, decode_responses=True)
+    replica = redis.Redis(host=nodes[1].host, port=nodes[1].port, decode_responses=True)
+    lib = f"#!lua name={key_prefix.replace(':', '_')}\nredis.register_function('f_{key_prefix.replace(':', '_')}', function() return 1 end)"
+    stop, errors, loads = threading.Event(), [], [0]
+
+    def churn():
+        c = new_conn()
+        while not stop.is_set() and len(errors) < 20:
+            try:
+                c.execute_command("FUNCTION", "LOAD", "REPLACE", lib)
+                loads[0] += 1
+            except redis.exceptions.RedisError as e:
+                errors.append(repr(e))
+
+    def role_is(node, role):
+        for _ in range(200):
+            if node.info("replication")["role"] == role:
+                return True
+            time.sleep(0.05)
+        return False
+
+    worker = threading.Thread(target=churn)
+    worker.start()
+    try:
+        assert replica.execute_command("CLUSTER FAILOVER")
+        assert role_is(replica, "master"), "failover did not complete"
+        time.sleep(0.5)
+        stop.set()
+        worker.join(30)
+    finally:
+        stop.set()
+        worker.join(30)
+        if master.info("replication")["role"] != "master":
+            master.execute_command("CLUSTER FAILOVER")
+            role_is(master, "master")
+        master.close()
+        replica.close()
+    assert errors == []
+    assert loads[0] > 0
+
+
 def test_cache_mget_hits_and_read_your_writes(cache_proxy, key_prefix):
     r = cache_proxy
     a, b, c = f"{{{key_prefix}}}a", f"{{{key_prefix}}}b", f"{key_prefix}:c"

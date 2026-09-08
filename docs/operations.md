@@ -41,8 +41,14 @@ against atomic slot migrations (Redis 8.4+ `CLUSTER MIGRATION`, Valkey 9
 `CLUSTER MIGRATESLOTS`), whose handoff can redirect a request back and
 forth for a moment: such a request follows the redirects with short waits
 between them, and `INFO` counts these as `redirect_waits`. Multi-key
-commands that the server refuses mid-migration (`TRYAGAIN`, keys split
-across source and target) are re-issued key by key, so they complete too.
+commands that the server refuses mid-migration (`TRYAGAIN`) are first
+retried whole with the same waits, which keeps a same-slot MSET/DEL atomic
+under an atomic migration, and only re-issued key by key when the refusal
+outlasts the waits (a legacy migration with the keys split across source
+and target). A keyless write broadcast (FLUSHALL, FUNCTION LOAD) that a
+demoted master answers `READONLY` after a failover is resent to the
+current masters after a topology refresh, with the same waits; every such
+wait counts under `redirect_waits`.
 If a slot has no known owner the client receives `-CLUSTERDOWN`; if a retry
 is not possible the client receives `-TRYAGAIN` and should back off and
 retry.

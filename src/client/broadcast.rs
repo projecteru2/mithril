@@ -2,11 +2,15 @@
 
 use bytes::Bytes;
 
+use tokio::sync::oneshot;
+
 use super::Reply;
 use super::pipe::{recv_or_lost, scatter_one};
 use super::session::Session;
+use super::writer::{REDIRECT_HOPS, REDIRECT_WAIT};
 use crate::multikey;
 use crate::resp;
+use crate::stats;
 
 /// Which nodes a broadcast reaches.
 #[derive(Clone, Copy)]
@@ -59,9 +63,27 @@ impl Session {
         }
         // detached deliberately: completion is bounded by backend replies
         tokio::task::spawn_local(async move {
-            let mut replies: Vec<Bytes> = Vec::with_capacity(receivers.len());
-            for rx in receivers {
-                replies.push(recv_or_lost(rx).await);
+            let mut replies = collect(receivers).await;
+            // a master demoted since the last refresh answers a keyless write READONLY: ask for
+            // the topology again and send once more to the masters it reports, a few times
+            let mut wait = REDIRECT_WAIT;
+            for _ in 0..REDIRECT_HOPS {
+                if !matches!(targets, Targets::Masters)
+                    || !replies.iter().any(|r| r.starts_with(b"-READONLY"))
+                {
+                    break;
+                }
+                stats::bump(&shared.wstats.redirect_waits);
+                let _ = shared.refresh.send(());
+                tokio::time::sleep(wait).await;
+                wait *= 2;
+                let topo = shared.topo.load_full();
+                let mut receivers = Vec::with_capacity(topo.masters.len());
+                for &i in &topo.masters {
+                    let addr = &topo.nodes[i as usize].addr;
+                    receivers.push(scatter_one(&shared, addr, lane, None, frame.clone()).await);
+                }
+                replies = collect(receivers).await;
             }
             let merged = match gather {
                 Gather::Sum => multikey::merge_sum(replies.iter(), 0),
@@ -77,4 +99,12 @@ impl Session {
             let _ = reply_q.send(Reply::At(seq, merged.unwrap_or_else(|e| e)));
         });
     }
+}
+
+async fn collect(receivers: Vec<oneshot::Receiver<Bytes>>) -> Vec<Bytes> {
+    let mut replies = Vec::with_capacity(receivers.len());
+    for rx in receivers {
+        replies.push(recv_or_lost(rx).await);
+    }
+    replies
 }

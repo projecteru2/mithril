@@ -40,9 +40,14 @@
   and the client sees only its reply. A pipelined client with later
   requests already in flight receives `TRYAGAIN` for it instead, as with
   the multi-key case below.
-- A multi-key command whose keys are split across a migrating slot
-  (`TRYAGAIN` from the server) is re-issued key by key, so it completes
-  through the migration; a same-slot MSET/DEL is then no longer atomic, and
+- A keyless write broadcast (FLUSHALL, FUNCTION LOAD) that a master demoted
+  by a failover answers `READONLY` is resent, after a topology refresh, to
+  the masters the cluster reports now, with the same waits.
+- A multi-key command the server refuses mid-migration (`TRYAGAIN`) is
+  first retried whole with the same waits, so under an atomic migration a
+  same-slot MSET/DEL stays atomic; only when the refusal outlasts the waits
+  (a legacy migration with the keys split across source and target) is it
+  re-issued key by key, no longer atomic, and
   a pipelined client with requests queued behind such a command receives
   one `TRYAGAIN` for it before the session switches that slot to the
   ordered path. PFCOUNT is never split this way.
