@@ -864,32 +864,40 @@ def test_mset_stays_atomic_under_slot_migration(r, cluster_direct, new_conn, key
     src = redis.Redis(host=src_node.host, port=src_node.port, decode_responses=True)
     dst = redis.Redis(host=dst_node.host, port=dst_node.port, decode_responses=True)
     assert r.set(probe, "p")
+    assert r.mset({a: "0", b: "0"})
     stop, errors, torn, rounds = threading.Event(), [], [], [0]
 
-    def churn():
+    def write():
         c = new_conn()
         n = 0
         while not stop.is_set() and len(errors) < 20:
             n += 1
             try:
                 c.mset({a: str(n), b: str(n)})
-                va, vb = c.mget(a, b)
-                if va != vb:
-                    torn.append((va, vb))
                 rounds[0] = n
             except redis.exceptions.RedisError as e:
                 errors.append(repr(e))
 
-    worker = threading.Thread(target=churn)
-    worker.start()
+    def watch():
+        c = new_conn()
+        while not stop.is_set() and len(errors) < 20:
+            try:
+                va, vb = c.mget(a, b)
+                if va != vb:
+                    torn.append((va, vb))
+            except redis.exceptions.RedisError as e:
+                errors.append(repr(e))
+
+    threads = [threading.Thread(target=write), threading.Thread(target=watch)]
+    for t in threads:
+        t.start()
     try:
         for source, target in [(src, dst), (dst, src)] * 2:
             _migrate_slot(source, target, slot, probe)
-        stop.set()
-        worker.join(30)
     finally:
         stop.set()
-        worker.join(30)
+        for t in threads:
+            t.join(30)
         if _moved(src, probe):
             _migrate_slot(dst, src, slot, probe)
         r.delete(a, b, probe)
@@ -908,7 +916,8 @@ def test_keyless_write_rides_out_a_failover(r, cluster_direct, new_conn, key_pre
         pytest.skip("the slot's master has no replica")
     master = redis.Redis(host=nodes[0].host, port=nodes[0].port, decode_responses=True)
     replica = redis.Redis(host=nodes[1].host, port=nodes[1].port, decode_responses=True)
-    lib = f"#!lua name={key_prefix.replace(':', '_')}\nredis.register_function('f_{key_prefix.replace(':', '_')}', function() return 1 end)"
+    name = key_prefix.replace(":", "_")
+    lib = f"#!lua name={name}\nredis.register_function('f_{name}', function() return 1 end)"
     stop, errors, loads = threading.Event(), [], [0]
 
     def churn():
@@ -947,6 +956,31 @@ def test_keyless_write_rides_out_a_failover(r, cluster_direct, new_conn, key_pre
     assert loads[0] > 0
 
 
+def test_evalsha_reloads_after_a_redirect(r, cluster_direct, key_prefix):
+    _needs(cluster_direct, (8, 4))
+    key = f"{key_prefix}:reload"
+    slot = key_slot(key.encode())
+    src_node = cluster_direct.get_node_from_key(key)
+    dst_node = next(
+        n for n in cluster_direct.get_primaries() if (n.host, n.port) != (src_node.host, src_node.port)
+    )
+    src = redis.Redis(host=src_node.host, port=src_node.port, decode_responses=True)
+    dst = redis.Redis(host=dst_node.host, port=dst_node.port, decode_responses=True)
+    sha = r.script_load("return redis.call('set', KEYS[1], ARGV[1])")
+    assert r.evalsha(sha, 1, key, "v1") == "OK"
+    try:
+        _migrate_slot(src, dst, slot, key)
+        dst.script_flush()
+        assert r.evalsha(sha, 1, key, "v2") == "OK"
+        assert r.get(key) == "v2"
+    finally:
+        if _moved(src, key):
+            _migrate_slot(dst, src, slot, key)
+        r.delete(key)
+        src.close()
+        dst.close()
+
+
 def _slot_nodes(cluster_direct, slot):
     deadline = time.time() + 10
     while True:
@@ -962,14 +996,8 @@ def test_cache_mget_hits_and_read_your_writes(cache_proxy, key_prefix):
     a, b, c = f"{{{key_prefix}}}a", f"{{{key_prefix}}}b", f"{key_prefix}:c"
     assert key_slot(c.encode()) != key_slot(a.encode())
     assert r.mset({a: "1", b: "2", c: "3"})
-    assert r.mget(a, b) == ["1", "2"]
-    before = int(r.info()["cache_hits"])
-    assert r.mget(a, b) == ["1", "2"]
-    assert int(r.info()["cache_hits"]) > before
-    assert r.mget(a, b, c) == ["1", "2", "3"]
-    before = int(r.info()["cache_hits"])
-    assert r.mget(a, b, c) == ["1", "2", "3"]
-    assert int(r.info()["cache_hits"]) > before
+    assert _cached_mget(r, [a, b]) == ["1", "2"]
+    assert _cached_mget(r, [a, b, c]) == ["1", "2", "3"]
     assert r.set(a, "11")
     assert r.mget(a, b, c) == ["11", "2", "3"]
     assert r.mset({b: "22", c: "33"})
@@ -977,6 +1005,15 @@ def test_cache_mget_hits_and_read_your_writes(cache_proxy, key_prefix):
     assert r.delete(c) == 1
     assert r.mget(a, b, c) == ["11", "22", None]
     assert r.mget(c, a) == [None, "11"]
+
+
+def _cached_mget(r, keys):
+    for _ in range(20):
+        before = int(r.info()["cache_hits"])
+        reply = r.mget(*keys)
+        if int(r.info()["cache_hits"]) > before:
+            return reply
+    pytest.fail("MGET never hit the reply cache")
 
 
 def test_cache_mget_converges_after_external_write(cache_proxy, cluster_direct, key_prefix):

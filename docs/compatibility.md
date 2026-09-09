@@ -45,9 +45,9 @@ memtier_benchmark, redis-benchmark.
   parameter.
 - SCRIPT KILL, SCRIPT DEBUG and FUNCTION KILL are not proxied. The
   transparent reload on `NOSCRIPT` covers scripts the proxy loaded itself,
-  and only while nothing later from the same session is in flight (a
-  pipelined EVALSHA, or one that was already redirected, gets the
-  `NOSCRIPT` and the client's own EVAL fallback applies). FUNCTION
+  redirected or not, and only while nothing later from the same session is
+  in flight (a pipelined EVALSHA gets the `NOSCRIPT` and the client's own
+  EVAL fallback applies). FUNCTION
   commands reach the masters that own slots; a node needs its libraries
   loaded before slots move to it, as with any client.
 - Shard pubsub: the shard channels of one client connection must live on
@@ -70,12 +70,13 @@ memtier_benchmark, redis-benchmark.
   up to six waits), so under an atomic migration it stays atomic; only a
   legacy migration whose keys really sit on two nodes still executes it as
   independent single-key commands, which a concurrent reader can observe
-  half applied.
+  half applied. A redirect that outlasts the waits ends it with `TRYAGAIN`.
 - After a failover a cluster-wide write (FLUSHALL, FUNCTION LOAD) can reach
   a demoted node and be answered `READONLY`; the proxy then refreshes the
-  topology and resends it to the masters the cluster reports, up to six
+  topology and resends it to the new master of that shard only, up to six
   times with short waits, and only a refresh slower than that leaves the
-  client the `READONLY`.
+  client the `READONLY`. The session waits for the outcome before it runs
+  the client's next command.
 - Server-management commands are not proxied: WAIT, DEBUG, LATENCY, MEMORY,
   SHUTDOWN, FAILOVER, REPLICAOF, SAVE/BGSAVE, MIGRATE and similar return
   unknown-command. OBJECT routes by its key.

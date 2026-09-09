@@ -56,8 +56,9 @@ SCRIPT LOAD reaches every node (scripts do not replicate since Redis 7) and
 returns the sha once all agree; SCRIPT EXISTS answers true only for a sha
 every master holds; SCRIPT FLUSH clears every node. The proxy remembers the
 body of every script it loaded, so an EVALSHA that meets `NOSCRIPT` on a
-node — after a restart or a flush behind the proxy's back — reloads it there
-and reruns transparently when nothing later from that session is in flight.
+node — after a restart or a flush behind the proxy's back, redirected there
+or not — reloads it there and reruns transparently when nothing later from
+that session is in flight.
 FUNCTION LOAD/DELETE/FLUSH/RESTORE broadcast to the masters (libraries
 replicate); FUNCTION LIST/DUMP/STATS/HELP and SCRIPT HELP/SHOW answer from
 one master. SCRIPT KILL, FUNCTION KILL and SCRIPT DEBUG are not proxied.

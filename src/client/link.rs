@@ -20,10 +20,13 @@ pub(super) struct InFlight {
     pub(super) frame: Bytes,
     pub(super) expect: u32,
     pub(super) retried: bool,
+    pub(super) reloaded: bool,
     pub(super) degraded: bool,
     pub(super) waited: bool,
     pub(super) fill: Option<Fill>,
     pub(super) db: u8,
+    // where a redirect sent the request, for a reload the topology cannot place yet
+    pub(super) target: Option<Box<str>>,
 }
 
 // sequences are allocated monotonically, so the ring stays sorted

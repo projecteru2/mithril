@@ -42,15 +42,21 @@
   the multi-key case below.
 - A keyless write broadcast (FLUSHALL, FUNCTION LOAD) that a master demoted
   by a failover answers `READONLY` is resent, after a topology refresh, to
-  the masters the cluster reports now, with the same waits.
+  the new master of that node's shard, with the same waits; the replies of
+  the other masters stand, so a FUNCTION LOAD is never repeated where it
+  already took. The session waits for a broadcast's replies, so a later
+  command of the same client never overtakes it.
 - A multi-key command the server refuses mid-migration (`TRYAGAIN`) is
   first retried whole with the same waits, so under an atomic migration a
   same-slot MSET/DEL stays atomic; only when the refusal outlasts the waits
   (a legacy migration with the keys split across source and target) is it
-  re-issued key by key, no longer atomic, and
-  a pipelined client with requests queued behind such a command receives
-  one `TRYAGAIN` for it before the session switches that slot to the
-  ordered path. PFCOUNT is never split this way.
+  re-issued key by key, no longer atomic. A redirect that outlasts the waits
+  ends the command with `TRYAGAIN` instead, never split. A pipelined client
+  with requests queued behind such a command receives one `TRYAGAIN` for it
+  before the session switches that slot to the ordered path. PFCOUNT is
+  never split this way.
+- An EVALSHA that meets `NOSCRIPT` after a redirect is reloaded at the node
+  the redirect named, while the topology refresh is still pending.
 - After a failover the proxy's topology lags by at most one refresh
   (`topology-refresh-secs`, or the first redirect it sees): in that window a
   cluster-wide command can reach a demoted node and return `READONLY`, and a

@@ -46,9 +46,9 @@ retried whole with the same waits, which keeps a same-slot MSET/DEL atomic
 under an atomic migration, and only re-issued key by key when the refusal
 outlasts the waits (a legacy migration with the keys split across source
 and target). A keyless write broadcast (FLUSHALL, FUNCTION LOAD) that a
-demoted master answers `READONLY` after a failover is resent to the
-current masters after a topology refresh, with the same waits; every such
-wait counts under `redirect_waits`.
+demoted master answers `READONLY` after a failover is resent, after a
+topology refresh, to the new master of that shard, with the same waits;
+every such wait counts under `redirect_waits`.
 If a slot has no known owner the client receives `-CLUSTERDOWN`; if a retry
 is not possible the client receives `-TRYAGAIN` and should back off and
 retry.

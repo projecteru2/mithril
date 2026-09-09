@@ -216,7 +216,7 @@ pub(super) async fn write_loop(
                 }
                 if frame.first() == Some(&b'-') {
                     if let Some((ask, target)) = parse_redirect(&frame) {
-                        if let Some((retry, db)) = take_retry(&link, seq, ask) {
+                        if let Some((retry, db)) = take_retry(&link, seq, ask, target) {
                             stats::bump(&shared.wstats.redirects);
                             let _ = shared.refresh.send(());
                             let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
@@ -247,14 +247,16 @@ pub(super) async fn write_loop(
                         frame = Bytes::from_static(ERR_TRYAGAIN);
                     } else if frame.starts_with(NOSCRIPT)
                         && rerunnable(&link, seq)
-                        && let Some((retry, db)) = take_retry(&link, seq, false)
+                        && let Some((retry, db, target)) = take_reload(&link, seq)
                     {
                         let topo = shared.topo.load_full();
-                        let reload = shared
-                            .scripts
-                            .load_frame(&retry.0)
-                            .and_then(|load| Some((load, evalsha_target(&topo, &retry.0)?)));
-                        if let Some((load, target)) = reload {
+                        let target = match target.as_deref() {
+                            Some(t) => Some(t),
+                            None => evalsha_target(&topo, &retry.0),
+                        };
+                        if let (Some(load), Some(target)) =
+                            (shared.scripts.load_frame(&retry.0), target)
+                        {
                             let resend = Resend {
                                 shared: &shared,
                                 reply_q: &reply_q,
@@ -287,7 +289,7 @@ pub(super) async fn write_loop(
                                     let lane = link.lane_with(client_id, db);
                                     // an atomic migration hands the slot over whole: ride it out
                                     // first; split only if the keys really sit on two nodes
-                                    let whole = follow_slot(
+                                    let (whole, _) = follow_slot(
                                         &shared,
                                         lane,
                                         slot,
@@ -295,9 +297,7 @@ pub(super) async fn write_loop(
                                         (req.clone(), 1, None),
                                     )
                                     .await;
-                                    let reply = if whole.starts_with(b"-TRYAGAIN")
-                                        || parse_redirect(&whole).is_some()
-                                    {
+                                    let reply = if whole.starts_with(b"-TRYAGAIN") {
                                         let mut singles = Singles::new(merge);
                                         resend_singles(
                                             &shared,
@@ -309,6 +309,8 @@ pub(super) async fn write_loop(
                                         )
                                         .await;
                                         singles.merge(nkeys, &[])
+                                    } else if parse_redirect(&whole).is_some() {
+                                        Bytes::from_static(ERR_TRYAGAIN)
                                     } else {
                                         whole
                                     };
@@ -442,13 +444,27 @@ fn rerunnable(link: &WriterLink, seq: u64) -> bool {
     seq + 1 == link.next_seq.get()
 }
 
+// one script reload per request, at the node a redirect sent it to when one did
+fn take_reload(link: &WriterLink, seq: u64) -> Option<(Retry, u8, Option<Box<str>>)> {
+    let mut entry = entry_at(&link.inflight, seq)?;
+    if entry.reloaded {
+        return None;
+    }
+    entry.reloaded = true;
+    let db = entry.db;
+    let fill = link.detach_fill(&mut entry);
+    let target = entry.target.take();
+    Some(((entry.frame.clone(), entry.expect, fill), db, target))
+}
+
 // retryable redirects: single-reply requests always, multi-reply blobs only for MOVED
-fn take_retry(link: &WriterLink, seq: u64, ask: bool) -> Option<(Retry, u8)> {
+fn take_retry(link: &WriterLink, seq: u64, ask: bool, target: &str) -> Option<(Retry, u8)> {
     let mut entry = entry_at(&link.inflight, seq)?;
     if entry.retried || (entry.expect > 1 && ask) {
         return None;
     }
     entry.retried = true;
+    entry.target = Some(Box::from(target));
     let db = entry.db;
     let fill = link.detach_fill(&mut entry);
     Some(((entry.frame.clone(), entry.expect, fill), db))
@@ -480,14 +496,20 @@ fn ride_out(
     reply: Bytes,
     retry: Retry,
 ) {
-    stats::bump(&shared.wstats.redirect_waits);
     let gate = Rc::new(Notify::new());
     link.gate_slots(&[slot], &gate);
     let (shared, reply_q, link) = (shared.clone(), reply_q.clone(), link.clone());
     // detached deliberately: bounded by the hops and one backend reply each
     tokio::task::spawn_local(async move {
         let lane = link.lane_with(client_id, db);
-        let mut reply = follow_slot(&shared, lane, slot, reply, retry).await;
+        let req = retry.0.clone();
+        let (mut reply, last) = follow_slot(&shared, lane, slot, reply, retry).await;
+        if reply.starts_with(NOSCRIPT)
+            && let (Some(load), Some(target)) = (shared.scripts.load_frame(&req), last)
+        {
+            let rx = scatter_one(&shared, &target, lane, Some(load), req).await;
+            reply = recv_or_lost(rx).await;
+        }
         if parse_redirect(&reply).is_some() {
             reply = Bytes::from_static(ERR_TRYAGAIN);
         }
@@ -498,37 +520,40 @@ fn ride_out(
 }
 
 // each hop waits, then goes where the reply points (a redirect's target) or where the slot
-// lives now (TRYAGAIN under an atomic migration); the first real answer stands, an error
-// outlasting the hops is the caller's to judge
+// lives now (TRYAGAIN under an atomic migration); the first real answer stands, with the
+// node that gave it, and an error outlasting the hops is the caller's to judge
 async fn follow_slot(
     shared: &Rc<Shared>,
     lane: Lane,
     slot: u16,
     mut reply: Bytes,
     (req, _, fill): Retry,
-) -> Bytes {
+) -> (Bytes, Option<String>) {
     if let Some(fill) = fill
         && let Some(cache) = &shared.cache
     {
         fill.abandon(cache);
     }
+    let mut last = None;
     let mut wait = REDIRECT_WAIT;
     for _ in 0..REDIRECT_HOPS {
         let (ask, target) = match parse_redirect(&reply) {
             Some((ask, target)) => (ask, target.to_owned()),
             None if reply.starts_with(b"-TRYAGAIN") => match shared.topo.load().owner_addr(slot) {
                 Some(addr) => (false, addr.to_owned()),
-                None => return reply,
+                None => break,
             },
-            None => return reply,
+            None => break,
         };
+        stats::bump(&shared.wstats.redirect_waits);
         tokio::time::sleep(wait).await;
         wait *= 2;
         let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
         let rx = scatter_one(shared, &target, lane, head, req.clone()).await;
         reply = recv_or_lost(rx).await;
+        last = Some(target);
     }
-    reply
+    (reply, last)
 }
 
 // one key-by-key resend per request, whether or not a redirect retry preceded it

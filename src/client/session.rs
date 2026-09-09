@@ -525,10 +525,12 @@ impl Session {
             frame: frame.clone(),
             expect,
             retried: false,
+            reloaded: false,
             degraded: false,
             waited: false,
             fill,
             db: self.link.db.get(),
+            target: None,
         });
     }
 
