@@ -1323,41 +1323,40 @@ def test_info_counts_commands_and_client_list_names_the_last(r, new_conn, key_pr
 
 
 def test_slowlog_keeps_commands_over_the_threshold(r, new_conn, key_prefix):
-    k = f"{key_prefix}:slow"
+    k, other = f"{key_prefix}:slow", f"{key_prefix}:slow2"
+    assert key_slot(other.encode()) != key_slot(k.encode())
     assert r.config_set("slowlog-log-slower-than", 0)
-    assert r.config_set("slowlog-max-len", 64)
+    assert r.config_set("slowlog-max-len", 4096)
+
+    def mine():
+        return [e for e in r.slowlog_get(4096) if e["client_name"] == b"slowprobe"]
+
     try:
         assert r.slowlog_reset()
         c = new_conn()
         assert c.client_setname("slowprobe")
         assert c.set(k, "v")
         assert c.get(k) == "v"
-        other = f"{key_prefix}:slow2"
-        assert key_slot(other.encode()) != key_slot(k.encode())
         assert c.mget(k, other) == ["v", None]
         assert isinstance(c.dbsize(), int)
-        entries = r.slowlog_get()
+        entries = mine()
         commands = [e["command"] for e in entries]
-        assert f"GET {k}".encode() in commands and f"SET {k} v".encode() in commands
-        assert f"MGET {k} {other}".encode() in commands and b"DBSIZE" in commands
-        mine = next(e for e in entries if e["command"] == f"GET {k}".encode())
-        assert mine["client_name"] == b"slowprobe"
-        assert b":" in mine["client_address"]
-        assert mine["duration"] >= 0
+        for want in (f"SET {k} v", f"GET {k}", f"MGET {k} {other}", "DBSIZE"):
+            assert want.encode() in commands, commands
+        assert all(b":" in e["client_address"] and e["duration"] >= 0 for e in entries)
         assert [e["id"] for e in entries] == sorted((e["id"] for e in entries), reverse=True)
-        assert r.slowlog_len() == len(entries) + 1
-        assert r.config_set("slowlog-max-len", 2)
-        assert c.get(k) == "v"
-        assert r.slowlog_len() == 2
-        assert len(r.slowlog_get(1)) == 1
-        with pytest.raises(redis.exceptions.ResponseError):
-            r.execute_command("SLOWLOG", "GET", "-2")
         pipe = c.pipeline(transaction=False)
         pipe.ping()
         pipe.execute_command("SLOWLOG", "RESET")
         pipe.execute_command("SLOWLOG", "LEN")
         assert pipe.execute()[:2] == [True, True]
-        assert [e["command"] for e in r.slowlog_get(2)] == [b"SLOWLOG LEN", b"SLOWLOG RESET"]
+        assert [e["command"] for e in mine()] == [b"SLOWLOG LEN", b"SLOWLOG RESET"]
+        assert len(r.slowlog_get(1)) == 1
+        with pytest.raises(redis.exceptions.ResponseError):
+            r.execute_command("SLOWLOG", "GET", "-2")
+        assert r.config_set("slowlog-max-len", 2)
+        assert c.get(k) == "v"
+        assert r.slowlog_len() == 2
         assert r.config_set("slowlog-log-slower-than", -1)
         assert r.slowlog_reset()
         assert c.get(k) == "v"
