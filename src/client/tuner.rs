@@ -38,16 +38,16 @@ const PROBE_DOUBLINGS: u32 = (PROBE_BACKOFF_MAX_TICKS / PROBE_BACKOFF_TICKS).ilo
 
 impl Session {
     // an unpipelined session gains from the deeper batches of the shared pipe, a
-    // pipelined one from its worker-local connection; switch only while nothing is in flight
+    // pipelined one from its worker-local connection; a switch waits for the session
+    // to drain, and a session that never idles is paused until it has
     pub(super) fn adapt_pipes(&self) {
         let depth = self.outstanding();
         let score = self.pipelined.get();
         self.pipelined.set(pipelining_score(score, depth));
         let sharded = self.link.sharded.get();
-        let prefer_shared = self.shared.prefer_shared.get();
-        self.switch_pending
-            .set(prefer_shared && !sharded && depth > 0);
-        if depth == 0 && switch_pipes(sharded, score, prefer_shared) && !self.fanouts_pending() {
+        let switch = switch_pipes(sharded, score, self.shared.prefer_shared.get());
+        self.switch_pending.set(switch && depth > 0);
+        if switch && depth == 0 && !self.fanouts_pending() {
             self.link.sharded.set(!sharded);
             self.conns.borrow_mut().by_node.clear();
         }

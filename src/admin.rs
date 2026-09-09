@@ -212,7 +212,7 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
          cache_hits:{}\r\ncache_misses:{}\r\ncache_invalidations:{}\r\n\
          cache_armed_workers:{}\r\ncache_entries:{}\r\ncache_bytes:{}\r\n\
          cache_flips:{}\r\npipe_probes:{}\r\npipe_keeps:{}\r\npipe_reverts:{}\r\n\
-         worker_commands:{}\r\nworker_shared:{}\r\n",
+         worker_commands:{}\r\nworker_prefers_shared:{}\r\n",
         crate::VERSION,
         std::process::id(),
         cfg.port,
@@ -548,7 +548,7 @@ mod tests {
         assert_eq!(field("mithril_version").as_deref(), Some(crate::VERSION));
         assert_eq!(field("cache_flips").as_deref(), Some("0"));
         assert_eq!(field("worker_commands").as_deref(), Some("0,0"));
-        assert_eq!(field("worker_shared").as_deref(), Some("0,1"));
+        assert_eq!(field("worker_prefers_shared").as_deref(), Some("0,1"));
         assert_eq!(field("pipe_probes").as_deref(), Some("5"));
         assert_eq!(field("pipe_keeps").as_deref(), Some("2"));
         assert_eq!(field("pipe_reverts").as_deref(), Some("0"));
