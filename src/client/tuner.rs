@@ -1,4 +1,4 @@
-//! Pipe selection under auto sharding: the session score and the worker-level tuner.
+//! Pipe selection under auto sharding: the session score and the proxy-wide tuner.
 
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
@@ -6,20 +6,20 @@ use std::time::{Duration, Instant};
 
 use super::Shared;
 use super::session::Session;
-use crate::stats::{self, WorkerStats};
+use crate::stats::{self, Pipes, Stats};
 
 // pipelining score: a local session shares at 0, a shared one returns at PIPELINED_LOCAL
 pub(super) const PIPELINED_LOCAL: u8 = 4;
 const PIPELINED_MAX: u8 = 8;
-// what triggers a probe: the worker is busy and its local backend batches would
+// what triggers a probe: a worker is busy and its local backend batches would
 // stay thin (in-flight commands per master)
 const TUNE_PERIOD: Duration = Duration::from_millis(100);
 const BUSY_ENTER: u32 = 85;
 const BUSY_LEAVE: u32 = 60;
 const DEPTH_ENTER: u64 = 8;
 const DEPTH_LEAVE: u64 = 16;
-// ticks the enter or leave condition must hold: moving sessions off a worker
-// lowers its own busyness, so leaving is slow and entering prompt
+// ticks the enter or leave condition must hold: moving sessions off the workers
+// lowers their busyness, so leaving is slow and entering prompt
 const ENTER_TICKS: u32 = 3;
 const LEAVE_TICKS: u32 = 30;
 // the command-rate window, ten ticks of 100 ms, so a rate is commands per second
@@ -29,7 +29,7 @@ const SETTLE_TICKS: u32 = 10;
 const PROBE_TICKS: u32 = SETTLE_TICKS + RATE_TICKS as u32;
 // the shared pipes are kept only where they measure this much faster
 const KEEP_GAIN_PCT: u64 = 5;
-// commands per second under which the worker is idle and its rates say nothing
+// commands per second per worker under which the proxy is idle and its rates say nothing
 const MIN_RATE_PER_SEC: u64 = 100;
 // ticks to the next probe, doubling while decisions confirm the current state
 const PROBE_BACKOFF_TICKS: u32 = 300;
@@ -65,7 +65,7 @@ enum Phase {
     },
 }
 
-// the worker's experiment: the busy-and-thin rule triggers it, the measured command rate decides
+// the proxy's experiment: a busy-and-thin majority triggers it, the measured command rate decides
 #[derive(Default)]
 struct Probe {
     prefer: bool,
@@ -76,6 +76,7 @@ struct Probe {
     streak: u32,
     wait: u32,
     confirmed: u32,
+    floor: u64,
     ring: [u64; RATE_TICKS],
     at: usize,
     seen: usize,
@@ -83,24 +84,28 @@ struct Probe {
 }
 
 impl Probe {
-    fn tick(&mut self, busy_pct: u32, depth: u64, commands_now: u64) -> bool {
+    fn new(workers: usize) -> Probe {
+        Probe {
+            floor: MIN_RATE_PER_SEC * workers as u64,
+            ..Probe::default()
+        }
+    }
+
+    fn tick(&mut self, busy_thin: bool, still_busy: bool, commands_now: u64) -> bool {
         self.record(commands_now);
         self.wait = self.wait.saturating_sub(1);
         match self.phase {
             Phase::Probing { baseline, ticks } => self.probing(baseline, ticks),
-            Phase::Steady if self.prefer => self.leave(busy_pct, depth),
-            Phase::Steady => self.enter(busy_pct, depth),
+            Phase::Steady if self.prefer => self.leave(still_busy),
+            Phase::Steady => self.enter(busy_thin),
         }
         self.prefer
     }
 
-    fn publish(&self, wstats: &WorkerStats) {
-        wstats
-            .pipe_shared
-            .store(u64::from(self.prefer), Ordering::Relaxed);
-        wstats.pipe_probes.store(self.probes, Ordering::Relaxed);
-        wstats.pipe_keeps.store(self.keeps, Ordering::Relaxed);
-        wstats.pipe_reverts.store(self.reverts, Ordering::Relaxed);
+    fn publish(&self, pipes: &Pipes) {
+        pipes.probes.store(self.probes, Ordering::Relaxed);
+        pipes.keeps.store(self.keeps, Ordering::Relaxed);
+        pipes.reverts.store(self.reverts, Ordering::Relaxed);
     }
 
     fn record(&mut self, commands_now: u64) {
@@ -114,8 +119,8 @@ impl Probe {
         self.ring.iter().sum()
     }
 
-    fn enter(&mut self, busy_pct: u32, depth: u64) {
-        if busy_pct < BUSY_ENTER || depth >= DEPTH_ENTER {
+    fn enter(&mut self, busy_thin: bool) {
+        if !busy_thin {
             self.streak = 0;
             return;
         }
@@ -125,8 +130,8 @@ impl Probe {
         }
     }
 
-    fn leave(&mut self, busy_pct: u32, depth: u64) {
-        if busy_pct > BUSY_LEAVE && depth < DEPTH_LEAVE {
+    fn leave(&mut self, still_busy: bool) {
+        if still_busy {
             self.streak = 0;
             self.start_probe();
             return;
@@ -142,7 +147,7 @@ impl Probe {
 
     fn start_probe(&mut self) {
         let baseline = self.rate();
-        if self.wait > 0 || self.seen < RATE_TICKS || baseline < MIN_RATE_PER_SEC {
+        if self.wait > 0 || self.seen < RATE_TICKS || baseline < self.floor {
             return;
         }
         self.probes += 1;
@@ -182,13 +187,13 @@ impl Probe {
     }
 }
 
-/// Samples this worker's CPU busyness, batch depth and command rate, and publishes
-/// whether its sessions should prefer the shared pipes.
-pub async fn auto_tuner(shared: Rc<Shared>) {
+/// Publishes this worker's CPU busyness and batch depth and mirrors the process-wide
+/// pipe preference; the lead worker also runs the experiment that sets it.
+pub async fn auto_tuner(shared: Rc<Shared>, lead: bool) {
     let mut last_ticks = stats::thread_cpu_ticks();
     let mut last_at = Instant::now();
     let mut busy_x16 = 0u32;
-    let mut probe = Probe::default();
+    let mut probe = lead.then(|| Probe::new(shared.stats.workers.len()));
     loop {
         tokio::time::sleep(TUNE_PERIOD).await;
         let now = Instant::now();
@@ -204,12 +209,45 @@ pub async fn auto_tuner(shared: Rc<Shared>) {
         let masters = shared.topo.load().masters.len().max(1) as u64;
         let (measured, writes) = shared.backends.batch_depth();
         let depth = tune_depth(measured, writes, shared.inflight.get(), masters);
-        let commands = shared.wstats.commands.load(Ordering::Relaxed);
+        shared
+            .wstats
+            .busy_pct
+            .store(u64::from((busy_x16 + 8) / 16), Ordering::Relaxed);
+        shared.wstats.batch_depth.store(depth, Ordering::Relaxed);
+        if let Some(probe) = probe.as_mut() {
+            conduct(&shared.stats, probe);
+        }
         shared
             .prefer_shared
-            .set(probe.tick((busy_x16 + 8) / 16, depth, commands));
-        probe.publish(&shared.wstats);
+            .set(shared.stats.pipes.prefer.load(Ordering::Relaxed));
     }
+}
+
+// the cost of the shared pipes is process-wide, so one experiment moves every session
+// and the whole proxy's command rate judges it
+fn conduct(stats: &Stats, probe: &mut Probe) {
+    let (busy_thin, still_busy, commands) = survey(stats);
+    let prefer = probe.tick(busy_thin, still_busy, commands);
+    stats.pipes.prefer.store(prefer, Ordering::Relaxed);
+    probe.publish(&stats.pipes);
+}
+
+// a worker that has not ticked yet reads as idle and counts against both majorities
+fn survey(stats: &Stats) -> (bool, bool, u64) {
+    let (mut busy_thin, mut still_busy, mut commands) = (0usize, 0usize, 0u64);
+    for w in &stats.workers {
+        let busy = w.busy_pct.load(Ordering::Relaxed);
+        let depth = w.batch_depth.load(Ordering::Relaxed);
+        busy_thin += usize::from(busy >= u64::from(BUSY_ENTER) && depth < DEPTH_ENTER);
+        still_busy += usize::from(busy > u64::from(BUSY_LEAVE) && depth < DEPTH_LEAVE);
+        commands += w.commands.load(Ordering::Relaxed);
+    }
+    let workers = stats.workers.len();
+    (
+        busy_thin * 2 >= workers,
+        still_busy * 2 >= workers,
+        commands,
+    )
 }
 
 // decided on an idle dispatch from the score before that dispatch counts
@@ -307,77 +345,109 @@ mod tests {
 
     #[test]
     fn a_probe_that_gains_keeps_the_shared_pipes() {
-        let mut rig = Rig::default();
-        assert!(!rig.run(RATE_TICKS as u32 - 1, 1_000, 90, 1));
-        assert!(rig.run(1, 1_000, 90, 1));
+        let mut rig = Rig::new();
+        assert!(!rig.run(RATE_TICKS as u32 - 1, 1_000, true, true));
+        assert!(rig.run(1, 1_000, true, true));
         assert_eq!(rig.probe.probes, 1);
-        rig.run(SETTLE_TICKS, 1_000, 90, 1);
-        assert!(rig.run(RATE_TICKS as u32, 1_200, 90, 1));
+        rig.run(SETTLE_TICKS, 1_000, true, true);
+        assert!(rig.run(RATE_TICKS as u32, 1_200, true, true));
         assert_eq!((rig.probe.keeps, rig.probe.reverts), (1, 0));
         assert_eq!(rig.probe.wait, PROBE_BACKOFF_TICKS);
     }
 
     #[test]
     fn a_probe_that_loses_reverts_and_waits_twice_as_long_after_the_second() {
-        let mut rig = Rig::default();
-        rig.run(RATE_TICKS as u32, 1_000, 90, 1);
-        rig.run(PROBE_TICKS - 1, 800, 90, 1);
-        assert!(!rig.run(1, 800, 90, 1));
+        let mut rig = Rig::new();
+        rig.run(RATE_TICKS as u32, 1_000, true, true);
+        rig.run(PROBE_TICKS - 1, 800, true, true);
+        assert!(!rig.run(1, 800, true, true));
         assert_eq!((rig.probe.keeps, rig.probe.reverts), (0, 1));
         assert_eq!(rig.probe.wait, PROBE_BACKOFF_TICKS);
-        assert!(!rig.run(PROBE_BACKOFF_TICKS - 1, 1_000, 90, 1));
+        assert!(!rig.run(PROBE_BACKOFF_TICKS - 1, 1_000, true, true));
         assert_eq!(rig.probe.probes, 1);
-        assert!(rig.run(1, 1_000, 90, 1));
+        assert!(rig.run(1, 1_000, true, true));
         assert_eq!(rig.probe.probes, 2);
-        rig.run(PROBE_TICKS - 1, 500, 90, 1);
-        assert!(!rig.run(1, 500, 90, 1));
+        rig.run(PROBE_TICKS - 1, 500, true, true);
+        assert!(!rig.run(1, 500, true, true));
         assert_eq!(rig.probe.reverts, 2);
         assert_eq!(rig.probe.wait, PROBE_BACKOFF_TICKS * 2);
     }
 
     #[test]
-    fn low_busyness_leaves_the_shared_pipes_without_a_backoff() {
-        let mut rig = Rig::default();
-        rig.run(RATE_TICKS as u32, 1_000, 90, 1);
-        assert!(rig.run(PROBE_TICKS, 1_200, 90, 1));
-        assert!(rig.run(LEAVE_TICKS - 1, 1_200, BUSY_LEAVE, 1));
-        assert!(!rig.run(1, 1_200, BUSY_LEAVE, 1));
+    fn a_quiet_majority_leaves_the_shared_pipes_without_a_backoff() {
+        let mut rig = Rig::new();
+        rig.run(RATE_TICKS as u32, 1_000, true, true);
+        assert!(rig.run(PROBE_TICKS, 1_200, true, true));
+        assert!(rig.run(LEAVE_TICKS - 1, 1_200, false, false));
+        assert!(!rig.run(1, 1_200, false, false));
         assert_eq!(rig.probe.wait, 0);
         assert_eq!((rig.probe.probes, rig.probe.keeps), (1, 1));
     }
 
     #[test]
     fn a_reverse_probe_returns_to_local_when_the_shared_pipes_are_not_faster() {
-        let mut rig = Rig::default();
-        rig.run(RATE_TICKS as u32, 1_000, 90, 1);
-        rig.run(PROBE_TICKS, 1_200, 90, 1);
-        assert!(!rig.run(PROBE_BACKOFF_TICKS, 1_200, 90, 1));
+        let mut rig = Rig::new();
+        rig.run(RATE_TICKS as u32, 1_000, true, true);
+        rig.run(PROBE_TICKS, 1_200, true, true);
+        assert!(!rig.run(PROBE_BACKOFF_TICKS, 1_200, false, true));
         assert_eq!(rig.probe.probes, 2);
-        rig.run(PROBE_TICKS - 1, 1_200, 90, 1);
-        assert!(!rig.run(1, 1_200, 90, 1));
+        rig.run(PROBE_TICKS - 1, 1_200, false, true);
+        assert!(!rig.run(1, 1_200, false, true));
         assert_eq!((rig.probe.keeps, rig.probe.reverts), (1, 1));
         assert_eq!(rig.probe.wait, PROBE_BACKOFF_TICKS);
     }
 
     #[test]
-    fn an_idle_worker_never_probes() {
-        let mut rig = Rig::default();
-        assert!(!rig.run(PROBE_BACKOFF_TICKS, MIN_RATE_PER_SEC - 10, 90, 1));
+    fn an_idle_proxy_never_probes() {
+        let mut rig = Rig::new();
+        let idle = MIN_RATE_PER_SEC * WORKERS as u64 - 10;
+        assert!(!rig.run(PROBE_BACKOFF_TICKS, idle, true, true));
         assert_eq!(rig.probe.probes, 0);
     }
 
-    #[derive(Default)]
+    #[test]
+    fn the_experiment_starts_only_on_a_busy_and_thin_majority() {
+        let stats = Stats::new(3);
+        assert_eq!(survey(&stats), (false, false, 0));
+        let set = |i: usize, busy: u64, depth: u64| {
+            stats.workers[i].busy_pct.store(busy, Ordering::Relaxed);
+            stats.workers[i].batch_depth.store(depth, Ordering::Relaxed);
+            stats.workers[i].commands.store(100, Ordering::Relaxed);
+        };
+        set(0, 90, 1);
+        assert_eq!(survey(&stats), (false, false, 100));
+        set(1, 90, 1);
+        assert_eq!(survey(&stats), (true, true, 200));
+        set(1, 90, DEPTH_ENTER);
+        assert_eq!(survey(&stats), (false, true, 200));
+        set(0, u64::from(BUSY_LEAVE), 1);
+        assert_eq!(survey(&stats), (false, false, 200));
+        let even = Stats::new(4);
+        even.workers[0].busy_pct.store(90, Ordering::Relaxed);
+        even.workers[1].busy_pct.store(90, Ordering::Relaxed);
+        assert_eq!(survey(&even), (true, true, 0));
+    }
+
+    const WORKERS: usize = 4;
+
     struct Rig {
         probe: Probe,
         commands: u64,
     }
 
     impl Rig {
-        fn run(&mut self, ticks: u32, per_sec: u64, busy_pct: u32, depth: u64) -> bool {
+        fn new() -> Rig {
+            Rig {
+                probe: Probe::new(WORKERS),
+                commands: 0,
+            }
+        }
+
+        fn run(&mut self, ticks: u32, per_sec: u64, busy_thin: bool, still_busy: bool) -> bool {
             let mut prefer = self.probe.prefer;
             for _ in 0..ticks {
                 self.commands += per_sec / RATE_TICKS as u64;
-                prefer = self.probe.tick(busy_pct, depth, self.commands);
+                prefer = self.probe.tick(busy_thin, still_busy, self.commands);
             }
             prefer
         }

@@ -454,7 +454,7 @@ fn worker_thread(
             prefer_shared: Cell::new(false),
         });
         if shared.cfg.backend_sharding == Sharding::Auto {
-            tokio::task::spawn_local(auto_tuner(shared.clone()));
+            tokio::task::spawn_local(auto_tuner(shared.clone(), worker == 0));
         }
         let mut next_client: u64 = worker as u64;
         while let Some(mut admitted) = conn_rx.recv().await {

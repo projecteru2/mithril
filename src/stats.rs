@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicI64, AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -48,10 +48,8 @@ pub struct WorkerStats {
     pub cache_entries: AtomicU64,
     pub cache_bytes: AtomicU64,
     pub cache_flips: AtomicU64,
-    pub pipe_shared: AtomicU64,
-    pub pipe_probes: AtomicU64,
-    pub pipe_keeps: AtomicU64,
-    pub pipe_reverts: AtomicU64,
+    pub busy_pct: AtomicU64,
+    pub batch_depth: AtomicU64,
     pub calls: Calls,
 }
 
@@ -143,6 +141,15 @@ impl Default for Slowlog {
     }
 }
 
+/// The pipe preference the auto tuner sets for the whole proxy, and its experiments.
+#[derive(Default)]
+pub struct Pipes {
+    pub prefer: AtomicBool,
+    pub probes: AtomicU64,
+    pub keeps: AtomicU64,
+    pub reverts: AtomicU64,
+}
+
 /// Process-wide stats shared across workers.
 pub struct Stats {
     pub workers: Vec<Arc<WorkerStats>>,
@@ -150,6 +157,7 @@ pub struct Stats {
     pub total_connections: AtomicU64,
     pub registry: Mutex<HashMap<u64, ClientInfo>>,
     pub slowlog: Slowlog,
+    pub pipes: Pipes,
     epoch: Instant,
 }
 
@@ -161,6 +169,7 @@ impl Stats {
             total_connections: AtomicU64::new(0),
             registry: Mutex::new(HashMap::new()),
             slowlog: Slowlog::default(),
+            pipes: Pipes::default(),
             epoch: Instant::now(),
         })
     }

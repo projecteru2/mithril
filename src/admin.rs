@@ -211,8 +211,8 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
          backend_sharding:{}\r\nslave_mode:{}\r\nreply_cache:{}\r\n\
          cache_hits:{}\r\ncache_misses:{}\r\ncache_invalidations:{}\r\n\
          cache_armed_workers:{}\r\ncache_entries:{}\r\ncache_bytes:{}\r\n\
-         cache_flips:{}\r\npipe_probes:{}\r\npipe_keeps:{}\r\npipe_reverts:{}\r\n\
-         worker_commands:{}\r\nworker_prefers_shared:{}\r\n",
+         cache_flips:{}\r\npipes_shared:{}\r\npipe_probes:{}\r\npipe_keeps:{}\r\n\
+         pipe_reverts:{}\r\nworker_commands:{}\r\nworker_busy:{}\r\n",
         crate::VERSION,
         std::process::id(),
         cfg.port,
@@ -243,11 +243,12 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
         stats.sum(|w| &w.cache_entries),
         stats.sum(|w| &w.cache_bytes),
         stats.sum(|w| &w.cache_flips),
-        stats.sum(|w| &w.pipe_probes),
-        stats.sum(|w| &w.pipe_keeps),
-        stats.sum(|w| &w.pipe_reverts),
+        u8::from(stats.pipes.prefer.load(Ordering::Relaxed)),
+        stats.pipes.probes.load(Ordering::Relaxed),
+        stats.pipes.keeps.load(Ordering::Relaxed),
+        stats.pipes.reverts.load(Ordering::Relaxed),
         per_worker(stats, |w| &w.commands),
-        per_worker(stats, |w| &w.pipe_shared),
+        per_worker(stats, |w| &w.busy_pct),
     );
     text.push_str("\r\n# Cluster\r\ncluster_enabled:1\r\n\r\n# Commandstats\r\n");
     for id in 0..command::entries() as u16 {
@@ -534,9 +535,10 @@ mod tests {
         let get = command::lookup(b"get").unwrap().id;
         stats.workers[0].calls.at(get).store(3, Ordering::Relaxed);
         stats.workers[1].calls.at(get).store(4, Ordering::Relaxed);
-        stats.workers[1].pipe_shared.store(1, Ordering::Relaxed);
-        stats.workers[0].pipe_probes.store(5, Ordering::Relaxed);
-        stats.workers[1].pipe_keeps.store(2, Ordering::Relaxed);
+        stats.workers[1].busy_pct.store(90, Ordering::Relaxed);
+        stats.pipes.prefer.store(true, Ordering::Relaxed);
+        stats.pipes.probes.store(5, Ordering::Relaxed);
+        stats.pipes.keeps.store(2, Ordering::Relaxed);
         let out = info(&cfg, &stats, 0);
         let text = String::from_utf8_lossy(&out);
         let field = |k: &str| {
@@ -548,7 +550,8 @@ mod tests {
         assert_eq!(field("mithril_version").as_deref(), Some(crate::VERSION));
         assert_eq!(field("cache_flips").as_deref(), Some("0"));
         assert_eq!(field("worker_commands").as_deref(), Some("0,0"));
-        assert_eq!(field("worker_prefers_shared").as_deref(), Some("0,1"));
+        assert_eq!(field("worker_busy").as_deref(), Some("0,90"));
+        assert_eq!(field("pipes_shared").as_deref(), Some("1"));
         assert_eq!(field("pipe_probes").as_deref(), Some("5"));
         assert_eq!(field("pipe_keeps").as_deref(), Some("2"));
         assert_eq!(field("pipe_reverts").as_deref(), Some("0"));

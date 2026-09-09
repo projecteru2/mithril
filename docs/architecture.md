@@ -101,16 +101,18 @@ idle dispatches have run the score down, back to its worker's connections
 once four busy ones have restored it. On top of that each worker samples
 its own CPU busyness and the frames its own backend connections batch per
 write every 100 ms (the in-flight commands per master stand in while no
-local traffic flows): busy (85% and above) with thin local batches (under
-eight frames per write) for 300 ms only starts an experiment. The worker
-moves its sessions to the shared pipes and compares the command rate a
-second later against the second before the move; it keeps them there on a
-5% gain, and otherwise takes them back and waits 30 seconds before trying
-again, doubling that to eight minutes while the answer holds. From the
-shared pipes it probes the other way on the same schedule, and lets go
-unmeasured once busyness has stayed under 60% or the depth above sixteen
-for three seconds — slowly, because moving its sessions away is what lowers
-its own busyness. An idle worker never probes. Switches happen only while a session has
+local traffic flows), and one worker turns those samples into a single
+experiment for the whole proxy, since the cost of the shared pipes is
+process-wide and a per-worker verdict measures a free-rider gain. Half the
+workers busy (85% and above) with thin local batches (under eight frames
+per write) for 300 ms moves every session to the shared pipes; the proxy
+then compares the commands it runs a second later against the second
+before the move, keeps them on a 5% gain, and otherwise takes them back
+and waits 30 seconds before trying again, doubling that to eight minutes
+while the answer holds. From the shared pipes it probes the other way on
+the same schedule, and lets go unmeasured once fewer than half the workers
+have stayed busy for three seconds — slowly, because moving the sessions
+away is what lowers their busyness. An idle proxy never probes. Switches happen only while a session has
 nothing in flight — a session that never idles is paused for one round
 trip so it can drain and move — so a request-response client ends up on the shared
 pipe, a pipelining client on a lightly loaded worker on its own
