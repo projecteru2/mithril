@@ -1349,7 +1349,7 @@ def test_slowlog_keeps_commands_over_the_threshold(r, new_conn, key_prefix):
         pipe.ping()
         pipe.execute_command("SLOWLOG", "RESET")
         pipe.execute_command("SLOWLOG", "LEN")
-        assert pipe.execute()[:2] == [True, True]
+        assert pipe.execute()[:2] == [True, "OK"]
         assert [e["command"] for e in mine()] == [b"SLOWLOG LEN", b"SLOWLOG RESET"]
         assert len(r.slowlog_get(1)) == 1
         with pytest.raises(redis.exceptions.ResponseError):
