@@ -150,6 +150,13 @@ impl WriterLink {
         self.migrating_any.set(!slots.is_empty());
     }
 
+    /// Registers a detached task answering at `seq`, so teardown can abort and backfill it.
+    pub(super) fn track(&self, seq: u64, task: JoinHandle<()>) {
+        let mut tasks = self.blocking.borrow_mut();
+        tasks.retain(|(_, t)| !t.is_finished());
+        tasks.push((seq, task));
+    }
+
     pub(super) fn gate_slots(&self, slots: &[u16], gate: &Rc<Notify>) {
         let mut gates = self.fanouts.borrow_mut();
         for &slot in slots {

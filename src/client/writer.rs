@@ -285,10 +285,10 @@ pub(super) async fn write_loop(
                             if rerunnable(&link, seq) {
                                 let gate = Rc::new(Notify::new());
                                 link.gate_slots(&[slot], &gate);
-                                let (shared, reply_q, link) =
-                                    (shared.clone(), reply_q.clone(), link.clone());
-                                // detached deliberately: completion is bounded by backend replies
-                                tokio::task::spawn_local(async move {
+                                let (s, q, l) = (shared.clone(), reply_q.clone(), link.clone());
+                                // detached: bounded by backend replies, aborted at teardown
+                                let task = tokio::task::spawn_local(async move {
+                                    let (shared, reply_q, link) = (s, q, l);
                                     let lane = link.lane_with(client_id, db);
                                     // an atomic migration hands the slot over whole: ride it out
                                     // first; split only if the keys really sit on two nodes
@@ -331,6 +331,7 @@ pub(super) async fn write_loop(
                                     gate.notify_waiters();
                                     let _ = reply_q.send(Reply::At(seq, reply));
                                 });
+                                link.track(seq, task);
                                 continue;
                             }
                         }
@@ -501,9 +502,10 @@ fn ride_out(
 ) {
     let gate = Rc::new(Notify::new());
     link.gate_slots(&[slot], &gate);
-    let (shared, reply_q, link) = (shared.clone(), reply_q.clone(), link.clone());
-    // detached deliberately: bounded by the hops and one backend reply each
-    tokio::task::spawn_local(async move {
+    let (s, q, l) = (shared.clone(), reply_q.clone(), link.clone());
+    // detached: bounded by the hops and one backend reply each, aborted at teardown
+    let task = tokio::task::spawn_local(async move {
+        let (shared, reply_q, link) = (s, q, l);
         let lane = link.lane_with(client_id, db);
         let req = retry.0.clone();
         let (mut reply, last) = follow_slot(&shared, lane, slot, reply, retry).await;
@@ -521,6 +523,7 @@ fn ride_out(
         gate.notify_waiters();
         let _ = reply_q.send(Reply::At(seq, reply));
     });
+    link.track(seq, task);
 }
 
 // what a reload sends ahead of the rerun on the same pipe, and how many replies that adds:

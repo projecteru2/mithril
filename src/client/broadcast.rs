@@ -89,9 +89,7 @@ impl Session {
             link.hold.set(false);
             let _ = reply_q.send(Reply::At(seq, merged.unwrap_or_else(|e| e)));
         });
-        let mut tasks = self.link.blocking.borrow_mut();
-        tasks.retain(|(_, t)| !t.is_finished());
-        tasks.push((seq, task));
+        self.link.track(seq, task);
     }
 }
 

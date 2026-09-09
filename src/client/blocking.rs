@@ -56,9 +56,7 @@ impl Session {
             let reply = blocking_round(&shared, db, slot, frame, None, false).await;
             let _ = reply_q.send(Reply::At(seq, reply));
         });
-        let mut blocking = self.link.blocking.borrow_mut();
-        blocking.retain(|(_, t)| !t.is_finished());
-        blocking.push((seq, task));
+        self.link.track(seq, task);
     }
 }
 

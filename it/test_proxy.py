@@ -957,14 +957,15 @@ def test_keyless_write_rides_out_a_failover(r, cluster_direct, new_conn, key_pre
     finally:
         stop.set()
         worker.join(30)
-        if master.info("replication")["role"] != "master" and synced(master):
+        restored = master.info("replication")["role"] == "master"
+        if not restored and synced(master):
             master.execute_command("CLUSTER", "FAILOVER", "TAKEOVER")
-            role_is(master, "master")
-            role_is(replica, "slave")
+            restored = role_is(master, "master") and role_is(replica, "slave")
         master.close()
         replica.close()
     assert errors == []
     assert loads[0] > 0
+    assert restored, "the original master was not restored"
 
 
 def test_evalsha_reloads_after_a_redirect(r, cluster_direct, key_prefix):
