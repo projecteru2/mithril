@@ -32,9 +32,11 @@ const KEEP_GAIN_PCT: u64 = 5;
 // commands per second per worker under which the proxy is idle and its rates say nothing
 const MIN_RATE_PER_SEC: u64 = 100;
 // ticks to the next probe, doubling while decisions confirm the current state
-const PROBE_BACKOFF_TICKS: u32 = 300;
+const PROBE_BACKOFF_TICKS: u32 = 600;
 const PROBE_BACKOFF_MAX_TICKS: u32 = 4800;
 const PROBE_DOUBLINGS: u32 = (PROBE_BACKOFF_MAX_TICKS / PROBE_BACKOFF_TICKS).ilog2();
+// a rate this far from the one the current state was chosen on is a changed workload
+const RATE_SHIFT_PCT: u64 = 25;
 
 impl Session {
     // an unpipelined session gains from the deeper batches of the shared pipe, a
@@ -76,6 +78,7 @@ struct Probe {
     streak: u32,
     wait: u32,
     confirmed: u32,
+    decided: u64,
     floor: u64,
     ring: [u64; RATE_TICKS],
     at: usize,
@@ -94,6 +97,12 @@ impl Probe {
     fn tick(&mut self, busy_thin: bool, still_busy: bool, commands_now: u64) -> bool {
         self.record(commands_now);
         self.wait = self.wait.saturating_sub(1);
+        if self.decided > 0
+            && self.rate().abs_diff(self.decided) * 100 > self.decided * RATE_SHIFT_PCT
+        {
+            self.decided = 0;
+            self.wait = 0;
+        }
         match self.phase {
             Phase::Probing { baseline, ticks } => self.probing(baseline, ticks),
             Phase::Steady if self.prefer => self.leave(still_busy),
@@ -141,6 +150,7 @@ impl Probe {
             // the load went away rather than a measurement: the next busy stretch probes at once
             self.streak = 0;
             self.wait = 0;
+            self.decided = 0;
             self.prefer = false;
         }
     }
@@ -182,6 +192,7 @@ impl Probe {
         } else {
             self.reverts += 1;
         }
+        self.decided = if keep { shared } else { local };
         self.prefer = keep;
         self.phase = Phase::Steady;
     }
@@ -395,6 +406,19 @@ mod tests {
         assert!(!rig.run(1, 1_200, false, true));
         assert_eq!((rig.probe.keeps, rig.probe.reverts), (1, 1));
         assert_eq!(rig.probe.wait, PROBE_BACKOFF_TICKS);
+    }
+
+    #[test]
+    fn a_changed_workload_reprobes_at_once() {
+        let mut rig = Rig::new();
+        rig.run(RATE_TICKS as u32, 1_000, true, true);
+        assert!(rig.run(PROBE_TICKS, 1_200, true, true));
+        assert_eq!(rig.probe.wait, PROBE_BACKOFF_TICKS);
+        assert!(rig.run(RATE_TICKS as u32, 1_200, true, true));
+        assert!(rig.run(RATE_TICKS as u32, 600, false, false));
+        assert_eq!(rig.probe.wait, 0);
+        assert!(!rig.run(1, 600, true, true));
+        assert_eq!(rig.probe.probes, 2);
     }
 
     #[test]
