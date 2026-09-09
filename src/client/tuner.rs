@@ -38,16 +38,17 @@ const PROBE_DOUBLINGS: u32 = (PROBE_BACKOFF_MAX_TICKS / PROBE_BACKOFF_TICKS).ilo
 
 impl Session {
     // an unpipelined session gains from the deeper batches of the shared pipe, a
-    // pipelined one from its worker-local connection; a switch waits for the session
-    // to drain, and a session that never idles is paused until it has
+    // pipelined one from its worker-local connection; a switch happens while nothing
+    // is in flight
     pub(super) fn adapt_pipes(&self) {
         let depth = self.outstanding();
         let score = self.pipelined.get();
         self.pipelined.set(pipelining_score(score, depth));
         let sharded = self.link.sharded.get();
-        let switch = switch_pipes(sharded, score, self.shared.prefer_shared.get());
-        self.switch_pending.set(switch && depth > 0);
-        if switch && depth == 0 && !self.fanouts_pending() {
+        let prefer_shared = self.shared.prefer_shared.get();
+        self.switch_pending
+            .set(depth > 0 && must_drain(sharded, score, prefer_shared));
+        if depth == 0 && switch_pipes(sharded, score, prefer_shared) && !self.fanouts_pending() {
             self.link.sharded.set(!sharded);
             self.conns.borrow_mut().by_node.clear();
         }
@@ -223,6 +224,15 @@ fn switch_pipes(sharded: bool, score: u8, worker_prefers_shared: bool) -> bool {
     }
 }
 
+// a never-idle session is paused to move only for a switch still wanted once it drains
+fn must_drain(sharded: bool, score: u8, worker_prefers_shared: bool) -> bool {
+    if worker_prefers_shared {
+        !sharded
+    } else {
+        sharded && score >= PIPELINED_LOCAL
+    }
+}
+
 // the measured local batch while local traffic flows; with none, the in-flight
 // commands spread over the masters — an estimate that errs toward staying on the
 // shared pipes, which at saturation batch at least as well as local connections
@@ -269,6 +279,17 @@ mod tests {
         assert!(!switch_pipes(true, pipelining_score(score, 0), false) || score > PIPELINED_LOCAL);
         assert_eq!(pipelining_score(PIPELINED_MAX, 9), PIPELINED_MAX);
         assert_eq!(pipelining_score(0, 0), 0);
+    }
+
+    #[test]
+    fn only_a_stable_switch_pauses_a_session_to_drain() {
+        assert!(must_drain(false, 0, true));
+        assert!(must_drain(false, PIPELINED_MAX, true));
+        assert!(!must_drain(true, PIPELINED_MAX, true));
+        assert!(must_drain(true, PIPELINED_LOCAL, false));
+        assert!(!must_drain(true, PIPELINED_LOCAL - 1, false));
+        assert!(!must_drain(false, 1, false));
+        assert!(switch_pipes(false, 1, false));
     }
 
     #[test]
