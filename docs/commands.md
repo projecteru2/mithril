@@ -127,7 +127,8 @@ PING, ECHO, SELECT, TIME, AUTH, HELLO, RESET, QUIT, INFO,
 CONFIG (GET; SET accepts `loglevel`, `acl-pubsub-default`, `acllog-max-len`,
 `slowlog-log-slower-than`, `slowlog-max-len`),
 SLOWLOG (GET/LEN/RESET/HELP over the proxy's own slow log, see
-operations.md), CLIENT (ID/SETNAME/GETNAME/LIST),
+operations.md), PSLOWLOG (the same subcommands forwarded to every node,
+answered as `[address, reply]` pairs), CLIENT (ID/SETNAME/GETNAME/LIST),
 COMMAND (COUNT, INFO with flags and ACL categories, GETKEYS covering
 ranges, numkeys blocks, STREAMS lists and STORE targets), ACL (CAT,
 SETUSER, GETUSER, DELUSER, USERS, LIST, WHOAMI, GENPASS, LOG),

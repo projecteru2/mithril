@@ -78,6 +78,8 @@ pub enum Kind {
     Exec,
     /// SCRIPT and FUNCTION management: broadcast, or answered by one master.
     Script,
+    /// Forwarded to every node as the plain command, the replies listed per node.
+    Nodes,
 }
 
 /// One table row: keys at `first_key..=last_key` by `step`, then `numkeys` counted ones; `scan_from` starts the option scan.

@@ -469,6 +469,21 @@ impl Session {
                     Box::pin(self.run_script(spec, frame, argc)).await;
                 }
             }
+            Kind::Nodes => {
+                let mut args: Vec<&[u8]> = resp::Args::new(&frame, argc).collect();
+                args[0] = &spec.name.as_bytes()[1..];
+                let mut plain = Vec::with_capacity(frame.len());
+                resp::write_command(&mut plain, &args);
+                if Box::pin(self.gates_clear()).await {
+                    Box::pin(self.run_broadcast(
+                        Bytes::from(plain),
+                        Targets::AllNodes,
+                        Gather::PerNode,
+                        None,
+                    ))
+                    .await;
+                }
+            }
         }
     }
 

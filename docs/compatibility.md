@@ -101,7 +101,6 @@ CONFIG parameter, never a silent approximation:
   time from the servers' own COMMAND INFO;
 - PAUTH and `redis-user` / `redis-pass`: backend credentials come from the
   config file (`backend-auth-user`, `backend-auth-pass`);
-- PSLOWLOG, the per-node fan-out of SLOWLOG;
 - CONFIG SET of `worker-threads`, `proxy-redis-conn`, `proxy-slave-mode`,
   `readonly`, `protected-mode`, `maxclients`, `requirepass`, `timeout`,
   `tcp-backlog`, `tcp-keepalive`, `client-query-buffer-limit` at runtime;

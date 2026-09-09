@@ -36,7 +36,7 @@ KIND = {
     **{n: "Subscribe" for n in ["subscribe", "psubscribe", "unsubscribe", "punsubscribe"]},
     **{n: "AnyMaster" for n in ["publish", "pubsub", "randomkey"]},
     "scan": "Scan", "dbsize": "Dbsize", "flushall": "Flushall", "exec": "Exec", "select": "Select",
-    "script": "Script", "function": "Script",
+    "script": "Script", "function": "Script", "pslowlog": "Nodes",
     **{n: "Local" for n in ["acl", "auth", "client", "cluster", "command", "config", "discard", "echo",
                             "hello", "info", "multi", "ping", "quit", "reset", "slowlog", "time"]},
 }
@@ -161,6 +161,10 @@ def main():
         cats = " | ".join(f"A_{c.upper()}" for c in cats_order if c in cats) or "0"
         key = (prefix64(name), len(name), name.encode()[8:])
         table.append((key, f'"{name}", {r["arity"]}, {" | ".join(m) or "0"}, {first}, {last}, {step}, {numkeys}, {scan_from(name, keys)}, Kind::{kind}, {info}, {cats}),'))
+    # proxy-only commands the servers do not report: (name, arity, categories)
+    for name, arity, cats in [("pslowlog", -2, "A_ADMIN | A_SLOW | A_DANGEROUS")]:
+        key = (prefix64(name), len(name), name.encode()[8:])
+        table.append((key, f'"{name}", {arity}, 0, 0, 0, 0, 0, 0, Kind::{KIND[name]}, 0, {cats}),'))
     table.sort()
     subs_of = {}
     for tag in ("redis", "valkey"):

@@ -1358,6 +1358,17 @@ def test_slowlog_keeps_commands_over_the_threshold(r, new_conn, key_prefix):
         r.delete(k)
 
 
+def test_pslowlog_lists_every_node(r, cluster_direct):
+    nodes = {f"{n.host}:{n.port}" for n in cluster_direct.get_nodes()}
+    lens = r.execute_command("PSLOWLOG", "LEN")
+    assert {addr for addr, _ in lens} == nodes
+    assert all(isinstance(n, int) for _, n in lens)
+    assert {reply for _, reply in r.execute_command("PSLOWLOG", "RESET")} == {True}
+    got = r.execute_command("PSLOWLOG", "GET", "1")
+    assert {addr for addr, _ in got} == nodes
+    assert all(isinstance(entries, list) for _, entries in got)
+
+
 def test_register_script_round_trips(r, key_prefix):
     key = f"{key_prefix}:reg"
     script = r.register_script("return redis.call('incr', KEYS[1])")

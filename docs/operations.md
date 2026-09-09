@@ -41,6 +41,9 @@ microseconds, up to 32 arguments of up to 128 bytes, client address, client
 name). The default threshold is 10 ms as in Redis; `-1` switches timing
 off, `0` keeps every command. Commands the proxy answers itself are timed
 too; a blocking command, a pubsub command and a cluster-wide command are not.
+`PSLOWLOG GET|LEN|RESET` forwards the same subcommand to every node and
+answers with one `[address, reply]` pair per node, the servers' own slow
+logs untouched by the proxy's.
 
 ## Shutdown
 

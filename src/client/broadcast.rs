@@ -30,6 +30,8 @@ pub(super) enum Gather {
     Ok,
     Same,
     Every,
+    /// An array of `[address, reply]` pairs, one per node, nothing merged.
+    PerNode,
 }
 
 impl Session {
@@ -77,6 +79,7 @@ impl Session {
                 Gather::Ok => multikey::merge_ok(replies.iter()),
                 Gather::Same => multikey::merge_same(replies.iter()),
                 Gather::Every => multikey::merge_every(replies.iter()),
+                Gather::PerNode => Ok(per_node(&topo, &nodes, &replies)),
             };
             if let (Ok(reply), Some((body, flushes))) = (&merged, remember)
                 && let Some(sha) = resp::bulk_payload(reply)
@@ -92,6 +95,17 @@ impl Session {
 
 // a master leg answered READONLY was demoted since the last refresh: after a refresh its
 // shard's new master gets the request; the replies of the other legs stand
+fn per_node(topo: &Topology, nodes: &[u16], replies: &[Bytes]) -> Bytes {
+    let mut out = Vec::new();
+    resp::array_header(&mut out, replies.len());
+    for (&i, reply) in nodes.iter().zip(replies) {
+        out.extend_from_slice(b"*2\r\n");
+        resp::bulk(&mut out, topo.nodes[i as usize].addr.as_bytes());
+        out.extend_from_slice(reply);
+    }
+    Bytes::from(out)
+}
+
 async fn ride_out_demoted(
     shared: &Rc<Shared>,
     topo: &Topology,
@@ -128,5 +142,36 @@ async fn ride_out_demoted(
         for (k, rx) in pending {
             replies[k] = recv_or_lost(rx).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::topology::Node;
+
+    #[test]
+    fn per_node_labels_each_reply_with_its_address() {
+        let node = |addr: &str| Node {
+            addr: addr.to_string(),
+            fail: false,
+            replicas: Vec::new(),
+        };
+        let topo = Topology {
+            epoch: 1,
+            nodes: vec![node("10.0.0.1:7001"), node("10.0.0.2:7002")],
+            slots: Vec::new(),
+            masters: Vec::new(),
+        };
+        let replies = [
+            Bytes::from_static(b":3\r\n"),
+            Bytes::from_static(b"-ERR x\r\n"),
+        ];
+        let out = per_node(&topo, &[1, 0], &replies);
+        assert_eq!(
+            &out[..],
+            &b"*2\r\n*2\r\n$13\r\n10.0.0.2:7002\r\n:3\r\n*2\r\n$13\r\n10.0.0.1:7001\r\n-ERR x\r\n"
+                [..]
+        );
     }
 }
