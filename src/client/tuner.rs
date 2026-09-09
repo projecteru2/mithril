@@ -79,6 +79,7 @@ struct Probe {
     wait: u32,
     confirmed: u32,
     decided: u64,
+    settling: u32,
     floor: u64,
     ring: [u64; RATE_TICKS],
     at: usize,
@@ -97,7 +98,10 @@ impl Probe {
     fn tick(&mut self, busy_thin: bool, still_busy: bool, commands_now: u64) -> bool {
         self.record(commands_now);
         self.wait = self.wait.saturating_sub(1);
-        if self.decided > 0
+        // the ring still holds the losing trial for one window after a decision
+        self.settling = self.settling.saturating_sub(1);
+        if self.settling == 0
+            && self.decided > 0
             && self.rate().abs_diff(self.decided) * 100 > self.decided * RATE_SHIFT_PCT
         {
             self.decided = 0;
@@ -193,6 +197,7 @@ impl Probe {
             self.reverts += 1;
         }
         self.decided = if keep { shared } else { local };
+        self.settling = RATE_TICKS as u32;
         self.prefer = keep;
         self.phase = Phase::Steady;
     }
@@ -419,6 +424,17 @@ mod tests {
         assert_eq!(rig.probe.wait, 0);
         assert!(!rig.run(1, 600, true, true));
         assert_eq!(rig.probe.probes, 2);
+    }
+
+    #[test]
+    fn a_losing_trial_left_in_the_ring_is_not_a_changed_workload() {
+        let mut rig = Rig::new();
+        rig.run(RATE_TICKS as u32, 1_000, true, true);
+        assert!(!rig.run(PROBE_TICKS, 600, true, true));
+        assert_eq!(rig.probe.reverts, 1);
+        assert!(!rig.run(RATE_TICKS as u32, 1_000, true, true));
+        assert_eq!(rig.probe.probes, 1);
+        assert_eq!(rig.probe.wait, PROBE_BACKOFF_TICKS - RATE_TICKS as u32);
     }
 
     #[test]
