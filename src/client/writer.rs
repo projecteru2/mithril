@@ -402,6 +402,9 @@ pub(super) async fn write_loop(
                     shared.stats.log_slow(client_id, started_us, frame);
                 }
             }
+            if timings.is_empty() && timings.capacity() > 256 {
+                *timings = VecDeque::new();
+            }
             swept_to = next_emit;
         }
         if !ready.is_empty() {

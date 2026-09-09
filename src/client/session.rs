@@ -46,7 +46,7 @@ pub(super) struct Session {
     cmd: Arc<AtomicU16>,
     started_us: Cell<u64>,
     // the accepted command's request while the slow log is on, until its sequence is allocated
-    timed: Cell<Option<Bytes>>,
+    pub(super) timed: Cell<Option<Bytes>>,
     pub(super) reply_q: Rc<ReplyQueue>,
     pub(super) link: Rc<WriterLink>,
     pub(super) proto: Cell<u8>,
@@ -342,8 +342,10 @@ impl Session {
         stats::bump(&self.shared.wstats.commands);
         stats::bump(self.shared.wstats.calls.at(id));
         self.cmd.store(id, Ordering::Relaxed);
+        let queued = self.in_multi.get() && spec.flags & command::FLAG_TXN_CTRL == 0;
         self.timed.set(
-            (self.started_us.get() != 0 && spec.kind != Kind::Blocking).then(|| frame.clone()),
+            (self.started_us.get() != 0 && spec.kind != Kind::Blocking && !queued)
+                .then(|| frame.clone()),
         );
         if self.auto {
             self.adapt_pipes();

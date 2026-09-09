@@ -20,6 +20,7 @@ impl Session {
             return None;
         };
         if blocking {
+            self.timed.set(None);
             return self.block_at(slot, frame);
         }
         let seq = self.alloc_seq();
