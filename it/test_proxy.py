@@ -1364,7 +1364,7 @@ def test_slowlog_keeps_commands_over_the_threshold(r, new_conn, key_prefix):
         assert r.slowlog_len() == 0
         assert r.config_get("slowlog-log-slower-than") == {"slowlog-log-slower-than": "-1"}
     finally:
-        r.config_set("slowlog-log-slower-than", 10000)
+        r.config_set("slowlog-log-slower-than", -1)
         r.config_set("slowlog-max-len", 128)
         r.delete(k)
 

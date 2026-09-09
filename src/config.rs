@@ -127,7 +127,7 @@ impl Default for Config {
             query_buffer_limit: 1024 * 1024 * 1024,
             topology_refresh_secs: 15,
             loglevel: crate::log::NOTICE,
-            slowlog_log_slower_than: 10_000,
+            slowlog_log_slower_than: -1,
             slowlog_max_len: 128,
         }
     }

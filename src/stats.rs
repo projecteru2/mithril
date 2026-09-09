@@ -128,7 +128,7 @@ impl Slowlog {
 impl Default for Slowlog {
     fn default() -> Slowlog {
         Slowlog {
-            slower_than: AtomicI64::new(10_000),
+            slower_than: AtomicI64::new(-1),
             max_len: AtomicUsize::new(128),
             ring: Mutex::new((VecDeque::new(), 0)),
         }
