@@ -120,9 +120,8 @@ impl Slowlog {
         entry.id = ring.1;
         ring.1 += 1;
         ring.0.push_back(entry);
-        while ring.0.len() > max {
-            ring.0.pop_front();
-        }
+        let excess = ring.0.len().saturating_sub(max);
+        ring.0.drain(..excess);
     }
 
     fn ring(&self) -> MutexGuard<'_, (VecDeque<SlowEntry>, u64)> {
@@ -217,20 +216,15 @@ pub fn add(counter: &AtomicU64, n: u64) {
     counter.store(counter.load(Ordering::Relaxed) + n, Ordering::Relaxed);
 }
 
-// the entry keeps at most 32 arguments of 128 bytes, credentials replaced, and a MULTI blob
-// as the EXEC it stands for
+// the entry keeps at most 32 arguments of 128 bytes, credentials replaced
 fn slow_args(frame: &[u8]) -> Vec<u8> {
     let mut cur = crate::resp::Cursor::default();
-    let (len, argc) = match crate::resp::scan_request_at(frame, &mut cur) {
-        crate::resp::ReqScan::Complete { len, argc } => (len, argc),
-        _ => (frame.len(), 0),
+    let argc = match crate::resp::scan_request_at(frame, &mut cur) {
+        crate::resp::ReqScan::Complete { argc, .. } => argc,
+        _ => 0,
     };
     let args: Vec<&[u8]> = crate::resp::Args::new(frame, argc).collect();
     let mut out = Vec::new();
-    if len < frame.len() && args.len() == 1 && args[0].eq_ignore_ascii_case(b"multi") {
-        crate::resp::write_command(&mut out, &[b"exec"]);
-        return out;
-    }
     let shown = args.len().min(SLOWLOG_ARGC_MAX);
     crate::resp::array_header(&mut out, shown);
     for (i, arg) in args.iter().take(shown).enumerate() {
@@ -309,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn slow_args_clip_redact_and_name_a_transaction() {
+    fn slow_args_clip_and_redact() {
         let text = |args: &[&str]| String::from_utf8_lossy(&slow_args(&frame(args))).into_owned();
         let long = "x".repeat(SLOWLOG_ARG_MAX + 5);
         assert!(text(&["set", "k", &long]).ends_with("... (5 more bytes)\r\n"));
@@ -343,13 +337,6 @@ mod tests {
         let t = text(&rules);
         assert!(t.ends_with("... (12 more arguments)\r\n"), "{t}");
         assert_eq!(t.matches("(redacted)").count(), 28, "{t}");
-        let mut blob = frame(&["multi"]).to_vec();
-        blob.extend_from_slice(&frame(&["set", "k", "v"]));
-        blob.extend_from_slice(&frame(&["exec"]));
-        assert_eq!(
-            String::from_utf8_lossy(&slow_args(&blob)),
-            "*1\r\n$4\r\nexec\r\n"
-        );
     }
 
     #[test]

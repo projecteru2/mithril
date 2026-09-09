@@ -261,6 +261,12 @@ impl Session {
         self.link.track(seq, task);
     }
 
+    async fn broadcast_gated(&self, frame: Bytes, targets: Targets, gather: Gather) {
+        if Box::pin(self.gates_clear()).await {
+            Box::pin(self.run_broadcast(frame, targets, gather, None)).await;
+        }
+    }
+
     pub(super) fn alloc_seq(&self) -> u64 {
         let seq = self.link.next_seq.get();
         self.link.next_seq.set(seq + 1);
@@ -472,9 +478,8 @@ impl Session {
                 }
             }
             Kind::Dbsize => {
-                if Box::pin(self.gates_clear()).await {
-                    Box::pin(self.run_broadcast(frame, Targets::Masters, Gather::Sum, None)).await;
-                }
+                self.broadcast_gated(frame, Targets::Masters, Gather::Sum)
+                    .await
             }
             Kind::Flushall => {
                 if let Some(w) = self.link.watch.borrow().as_ref()
@@ -482,9 +487,8 @@ impl Session {
                 {
                     w.mark_dirty();
                 }
-                if Box::pin(self.gates_clear()).await {
-                    Box::pin(self.run_broadcast(frame, Targets::Masters, Gather::Ok, None)).await;
-                }
+                self.broadcast_gated(frame, Targets::Masters, Gather::Ok)
+                    .await;
             }
             Kind::Script => {
                 if Box::pin(self.gates_clear()).await {
@@ -496,15 +500,8 @@ impl Session {
                 args[0] = spec.name.strip_prefix('p').unwrap_or(spec.name).as_bytes();
                 let mut plain = Vec::with_capacity(frame.len());
                 resp::write_command(&mut plain, &args);
-                if Box::pin(self.gates_clear()).await {
-                    Box::pin(self.run_broadcast(
-                        Bytes::from(plain),
-                        Targets::AllNodes,
-                        Gather::PerNode,
-                        None,
-                    ))
+                self.broadcast_gated(Bytes::from(plain), Targets::AllNodes, Gather::PerNode)
                     .await;
-                }
             }
         }
     }

@@ -12,7 +12,7 @@ use tokio::sync::{Notify, oneshot};
 
 use super::fanout::{Singles, multikey_plan, request_slot, resend_singles, write_keys};
 use super::link::{Fill, Hop, InFlight, InflightRing, WriterLink, mark_closed};
-use super::pipe::{parse_redirect, pipe_for, queue_on, recv_or_lost, scatter_expect, scatter_one};
+use super::pipe::{parse_redirect, pipe_for, queue_on, recv_or_lost, scatter_one, stage_expect};
 use super::pubsub::PUBSUB_PUSH_WINDOW;
 use super::queue::ReplyQueue;
 use super::scripting::evalsha_target;
@@ -522,7 +522,9 @@ fn ride_out(
             && let (Some(load), Some((asked, target))) = (shared.scripts.load_frame(&req), last)
         {
             let (head, replies) = reload_head(load, asked);
-            let rx = scatter_expect(&shared, &target, lane, head, req, 1 + replies).await;
+            let pipe = pipe_for(&shared, &target, lane, false);
+            let (staged, rx) = stage_expect(&pipe, Some(head), req, 1 + replies);
+            staged.send().await;
             reply = recv_or_lost(rx).await;
         }
         if parse_redirect(&reply).is_some() {

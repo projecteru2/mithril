@@ -198,20 +198,6 @@ pub(super) async fn scatter_one(
     scatter_pipe(&pipe_for(shared, addr, lane, false), head, frame).await
 }
 
-pub(super) async fn scatter_expect(
-    shared: &Rc<Shared>,
-    addr: &str,
-    lane: Lane,
-    head: Bytes,
-    frame: Bytes,
-    expect: u32,
-) -> oneshot::Receiver<Bytes> {
-    let pipe = pipe_for(shared, addr, lane, false);
-    let (staged, rx) = stage_expect(&pipe, Some(head), frame, expect);
-    staged.send().await;
-    rx
-}
-
 pub(super) async fn recv_or_lost(rx: oneshot::Receiver<Bytes>) -> Bytes {
     rx.await
         .unwrap_or_else(|_| Bytes::from_static(ERR_BACKEND_LOST))
