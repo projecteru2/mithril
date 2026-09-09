@@ -11,7 +11,7 @@ use tokio::sync::{Notify, oneshot};
 
 use super::fanout::{Singles, multikey_plan, request_slot, resend_singles, write_keys};
 use super::link::{Fill, Hop, InFlight, InflightRing, WriterLink, mark_closed};
-use super::pipe::{parse_redirect, pipe_for, queue_on, recv_or_lost, scatter_one};
+use super::pipe::{parse_redirect, pipe_for, queue_on, recv_or_lost, scatter_expect, scatter_one};
 use super::pubsub::PUBSUB_PUSH_WINDOW;
 use super::queue::ReplyQueue;
 use super::scripting::evalsha_target;
@@ -257,15 +257,16 @@ pub(super) async fn write_loop(
                         if let (Some(load), Some(target)) =
                             (shared.scripts.load_frame(&retry.0), target)
                         {
-                            let lane = link.lane_with(client_id, db);
-                            let head = reload_head(&shared, target, lane, load, asked).await;
+                            let (head, replies) = reload_head(load, asked);
                             let resend = Resend {
                                 shared: &shared,
                                 reply_q: &reply_q,
                                 link: &link,
                                 client_id,
                             };
-                            resend.requeue(target, seq, Some(head), retry, 1, db).await;
+                            resend
+                                .requeue(target, seq, Some(head), retry, replies, db)
+                                .await;
                             continue;
                         }
                     } else if frame.starts_with(b"-TRYAGAIN")
@@ -509,8 +510,8 @@ fn ride_out(
         if reply.starts_with(NOSCRIPT)
             && let (Some(load), Some((asked, target))) = (shared.scripts.load_frame(&req), last)
         {
-            let head = reload_head(&shared, &target, lane, load, asked).await;
-            let rx = scatter_one(&shared, &target, lane, Some(head), req).await;
+            let (head, replies) = reload_head(load, asked);
+            let rx = scatter_expect(&shared, &target, lane, head, req, 1 + replies).await;
             reply = recv_or_lost(rx).await;
         }
         if parse_redirect(&reply).is_some() {
@@ -522,20 +523,13 @@ fn ride_out(
     });
 }
 
-// the frame that precedes a rerun after a reload: the script goes ahead on its own when the
-// rerun must carry ASKING, otherwise the load itself leads
-async fn reload_head(
-    shared: &Rc<Shared>,
-    target: &str,
-    lane: Lane,
-    load: Bytes,
-    asked: bool,
-) -> Bytes {
+// what a reload sends ahead of the rerun on the same pipe, and how many replies that adds:
+// the script, then ASKING when the rerun must carry it
+fn reload_head(load: Bytes, asked: bool) -> (Bytes, u32) {
     if !asked {
-        return load;
+        return (load, 1);
     }
-    drop(scatter_one(shared, target, lane, None, load).await);
-    Bytes::from_static(ASKING_FRAME)
+    (Bytes::from([load.as_ref(), ASKING_FRAME].concat()), 2)
 }
 
 // each hop waits, then goes where the reply points (a redirect's target) or where the slot

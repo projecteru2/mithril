@@ -143,8 +143,18 @@ pub(super) fn stage_one(
     head: Option<Bytes>,
     frame: Bytes,
 ) -> (Staged, oneshot::Receiver<Bytes>) {
-    let (tx, rx) = oneshot::channel();
     let expect = 1 + u32::from(head.is_some());
+    stage_expect(pipe, head, frame, expect)
+}
+
+// `head` may carry several frames; `expect` counts every reply, and only the last is delivered
+pub(super) fn stage_expect(
+    pipe: &Pipe,
+    head: Option<Bytes>,
+    frame: Bytes,
+    expect: u32,
+) -> (Staged, oneshot::Receiver<Bytes>) {
+    let (tx, rx) = oneshot::channel();
     let staged = match pipe {
         Pipe::Local(conn) => Staged::Local(
             conn.clone(),
@@ -186,6 +196,20 @@ pub(super) async fn scatter_one(
     frame: Bytes,
 ) -> oneshot::Receiver<Bytes> {
     scatter_pipe(&pipe_for(shared, addr, lane, false), head, frame).await
+}
+
+pub(super) async fn scatter_expect(
+    shared: &Rc<Shared>,
+    addr: &str,
+    lane: Lane,
+    head: Bytes,
+    frame: Bytes,
+    expect: u32,
+) -> oneshot::Receiver<Bytes> {
+    let pipe = pipe_for(shared, addr, lane, false);
+    let (staged, rx) = stage_expect(&pipe, Some(head), frame, expect);
+    staged.send().await;
+    rx
 }
 
 pub(super) async fn recv_or_lost(rx: oneshot::Receiver<Bytes>) -> Bytes {

@@ -68,9 +68,9 @@ impl Session {
             receivers.push(scatter_one(&shared, addr, lane, None, frame.clone()).await);
         }
         link.hold.set(true);
-        // detached deliberately: completion is bounded by backend replies; the hold keeps
-        // later commands of the session behind it while its reader still sees a hang-up
-        tokio::task::spawn_local(async move {
+        // detached: the hold keeps later commands of the session behind it while its reader
+        // still sees a hang-up, and teardown aborts it like a blocking command
+        let task = tokio::task::spawn_local(async move {
             let mut replies = collect(receivers).await;
             if matches!(targets, Targets::Masters) {
                 ride_out_demoted(&shared, &topo, &topo.masters, lane, &frame, &mut replies).await;
@@ -89,6 +89,9 @@ impl Session {
             link.hold.set(false);
             let _ = reply_q.send(Reply::At(seq, merged.unwrap_or_else(|e| e)));
         });
+        let mut tasks = self.link.blocking.borrow_mut();
+        tasks.retain(|(_, t)| !t.is_finished());
+        tasks.push((seq, task));
     }
 }
 
