@@ -18,6 +18,11 @@ pub const NO_COMMAND: u16 = u16::MAX;
 
 /// Newest entries SLOWLOG GET returns without a count.
 pub const SLOWLOG_GET_DEFAULT: usize = 10;
+/// The slow log's defaults: off, and Redis's ring size once on.
+pub const SLOWLOG_OFF: i64 = -1;
+pub const SLOWLOG_MAX_LEN: usize = 128;
+/// Upper bound of `slowlog-max-len`, as in Redis.
+pub const SLOWLOG_MAX_LEN_LIMIT: usize = 1_000_000;
 /// Arguments a slow-log entry keeps; the rest is one summary, as in Redis.
 const SLOWLOG_ARGC_MAX: usize = 32;
 /// Bytes of one argument a slow-log entry keeps; the rest is summarized, as in Redis.
@@ -128,8 +133,8 @@ impl Slowlog {
 impl Default for Slowlog {
     fn default() -> Slowlog {
         Slowlog {
-            slower_than: AtomicI64::new(-1),
-            max_len: AtomicUsize::new(128),
+            slower_than: AtomicI64::new(SLOWLOG_OFF),
+            max_len: AtomicUsize::new(SLOWLOG_MAX_LEN),
             ring: Mutex::new((VecDeque::new(), 0)),
         }
     }
@@ -176,13 +181,9 @@ impl Stats {
             Some(c) => (Box::from(c.addr.to_string()), c.name.clone()),
             None => (Box::from(""), Box::from("")),
         };
-        let at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         self.slowlog.record(SlowEntry {
             id: 0,
-            at,
+            at: unix_secs(),
             micros,
             args: Bytes::from(slow_args(&frame)),
             addr,
@@ -196,6 +197,14 @@ impl Stats {
             .map(|w| field(w).load(Ordering::Relaxed))
             .sum()
     }
+}
+
+/// Seconds since the Unix epoch.
+pub fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Bumps a single-writer counter.

@@ -333,15 +333,13 @@ pub(super) async fn write_loop(
                             }
                         }
                     }
+                    stats::bump(&shared.wstats.errors);
                 }
                 if link.fills_armed.get() > 0
                     && let Some(fill) = take_fill(&link, seq)
                     && let Some(cache) = &shared.cache
                 {
                     fill.complete(cache, &frame);
-                }
-                if frame.first() == Some(&b'-') {
-                    stats::bump(&shared.wstats.errors);
                 }
                 if seq == next_emit {
                     link.proto_switches.apply(next_emit, &mut cur_proto);
@@ -396,14 +394,17 @@ pub(super) async fn write_loop(
                 }
             }
             drop(inf);
-            let mut timings = link.timings.borrow_mut();
-            while timings.front().is_some_and(|t| t.0 < next_emit) {
-                if let Some((_, started_us, frame)) = timings.pop_front() {
-                    shared.stats.log_slow(client_id, started_us, frame);
+            if link.timings_pending.get() > 0 {
+                let mut timings = link.timings.borrow_mut();
+                while timings.front().is_some_and(|t| t.0 < next_emit) {
+                    if let Some((_, started_us, frame)) = timings.pop_front() {
+                        link.timings_pending.set(link.timings_pending.get() - 1);
+                        shared.stats.log_slow(client_id, started_us, frame);
+                    }
                 }
-            }
-            if timings.is_empty() && timings.capacity() > 256 {
-                *timings = VecDeque::new();
+                if timings.is_empty() && timings.capacity() > 256 {
+                    *timings = VecDeque::new();
+                }
             }
             swept_to = next_emit;
         }

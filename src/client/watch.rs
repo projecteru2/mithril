@@ -523,9 +523,7 @@ async fn arm(
     (seq, frame): (u64, Bytes),
     (addr, db): (String, u8),
 ) {
-    link.fence_waiters.set(link.fence_waiters.get() + 1);
-    settled(&link.fence_notify, || link.emitted.get() < seq).await;
-    link.fence_waiters.set(link.fence_waiters.get() - 1);
+    link.fence_wait(seq).await;
     let Some(lease) = shared.backends.take_exclusive(&addr, db) else {
         watched.lose(link, reply_q, seq, error_frame(ERR_EXCLUSIVE_LIMIT));
         return;

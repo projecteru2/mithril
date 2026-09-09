@@ -18,7 +18,7 @@ client's current command in `cmd`.
 | Stats | `total_connections_received`, `total_commands_processed`, `total_net_input_bytes`, `total_net_output_bytes`, `total_error_replies`, `redirections`, `redirect_waits`, session lifecycle counters (`readers_exited`, `writers_exited`, `sessions_closed`) |
 | Mithril | `worker_threads`, `backend_conns_per_node`, `backend_sharding`, `slave_mode`, `reply_cache`, `cache_hits`, `cache_misses`, `cache_invalidations`, `cache_entries`, `cache_bytes`, `cache_flips`, `cache_armed_workers`, `worker_commands` (per-worker) |
 | Cluster | `cluster_enabled` (always 1) |
-| Commandstats | `cmdstat_<command>:calls=<n>` for every command run at least once, subcommands as `cmdstat_client\|list`; counted once accepted (known, well-formed, permitted), summed over workers |
+| Commandstats | `cmdstat_<command>:calls=<n>` for every command run at least once, subcommands as `cmdstat_client\|list`; counted once accepted, summed over workers |
 
 `CLIENT LIST` lists every connection across workers (id, addr, fd, name,
 age).
@@ -42,9 +42,8 @@ name). The log is off by default (`-1`): timing every command costs a clock
 read and a queue entry per command, measured at about 1% of peak throughput,
 so it is switched on when needed, at runtime or in the config file; `10000`
 is Redis's 10 ms, `0` keeps every command. While it is on, every accepted
-command is timed from the moment it is read to the moment its first reply
-is queued for the client: routed, fanned out, cluster-wide, run through a
-WATCH, answered by the proxy or served from the reply cache alike; only a
+command is timed, whether routed, fanned out, cluster-wide, run through a
+WATCH, answered by the proxy or served from the reply cache; only a
 blocking command, whose wait is the client's own, is left out. A transaction is one
 entry named `exec`; the arguments of AUTH and HELLO, the rules of ACL SETUSER
 and the password values of a CONFIG SET read `(redacted)`.

@@ -127,8 +127,8 @@ impl Default for Config {
             query_buffer_limit: 1024 * 1024 * 1024,
             topology_refresh_secs: 15,
             loglevel: crate::log::NOTICE,
-            slowlog_log_slower_than: -1,
-            slowlog_max_len: 128,
+            slowlog_log_slower_than: crate::stats::SLOWLOG_OFF,
+            slowlog_max_len: crate::stats::SLOWLOG_MAX_LEN,
         }
     }
 }
@@ -194,7 +194,10 @@ impl Config {
             }
             "loglevel" => self.loglevel = crate::log::parse_level(value)?,
             "slowlog-log-slower-than" => self.slowlog_log_slower_than = parse_slower_than(value)?,
-            "slowlog-max-len" => self.slowlog_max_len = parse_bounded(key, value, 0, 1_000_000)?,
+            "slowlog-max-len" => {
+                self.slowlog_max_len =
+                    parse_bounded(key, value, 0, crate::stats::SLOWLOG_MAX_LEN_LIMIT)?;
+            }
             _ => return Err(format!("unknown parameter '{key}'")),
         }
         Ok(())

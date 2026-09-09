@@ -23,7 +23,7 @@ use super::pipe::{ColdSend, Pipe, pipe_for, queue_on};
 use super::pubsub::{PubsubHandle, pubsub_allowed, settles_first};
 use super::queue::ReplyQueue;
 use super::tuner::PIPELINED_LOCAL;
-use super::watch::{NO_WATCH, settled};
+use super::watch::NO_WATCH;
 use super::writer::write_loop;
 use super::{
     Cold, ERR_CROSSSLOT, ERR_NO_OWNER, ERR_NOAUTH, Lane, MAX_INFLIGHT, Reply, Shared, error_frame,
@@ -46,9 +46,8 @@ pub(super) struct Session {
     pub(super) shared: Rc<Shared>,
     pub(super) id: u64,
     cmd: Arc<AtomicU16>,
-    started_us: Cell<u64>,
-    // the accepted command's request while the slow log is on, until its sequence is allocated
-    pub(super) timed: Cell<Option<Bytes>>,
+    // the accepted command's stamp and request while the slow log is on, until a sequence takes them
+    pub(super) timed: Cell<Option<(u64, Bytes)>>,
     pub(super) reply_q: Rc<ReplyQueue>,
     pub(super) link: Rc<WriterLink>,
     pub(super) proto: Cell<u8>,
@@ -253,9 +252,7 @@ impl Session {
             (self.shared.clone(), self.reply_q.clone(), self.link.clone());
         link.hold.set(true);
         let task = tokio::task::spawn_local(async move {
-            link.fence_waiters.set(link.fence_waiters.get() + 1);
-            settled(&link.fence_notify, || link.emitted.get() < seq).await;
-            link.fence_waiters.set(link.fence_waiters.get() - 1);
+            link.fence_wait(seq).await;
             let args: Vec<&[u8]> = resp::Args::new(&frame, argc).collect();
             let reply = admin::slowlog_cmd(&args, &shared.stats);
             link.hold.set(false);
@@ -270,11 +267,14 @@ impl Session {
         if !self.link.writer_blocked.get() {
             self.shared.inflight.set(self.shared.inflight.get() + 1);
         }
-        if let Some(frame) = self.timed.take() {
+        if let Some((started_us, frame)) = self.timed.take() {
             self.link
                 .timings
                 .borrow_mut()
-                .push_back((seq, self.started_us.get(), frame));
+                .push_back((seq, started_us, frame));
+            self.link
+                .timings_pending
+                .set(self.link.timings_pending.get() + 1);
         }
         seq
     }
@@ -302,12 +302,8 @@ impl Session {
             self.closing.set(true);
             return;
         }
-        self.started_us
-            .set(if self.shared.stats.slowlog.threshold() >= 0 {
-                self.shared.stats.micros()
-            } else {
-                0
-            });
+        let started_us =
+            (self.shared.stats.slowlog.threshold() >= 0).then(|| self.shared.stats.micros());
         if argc == 0 {
             return;
         }
@@ -365,9 +361,10 @@ impl Session {
         let queued = self.in_multi.get() && spec.flags & command::FLAG_TXN_CTRL == 0;
         let xread =
             (spec.kind == Kind::Xread).then(|| xread_slot(&frame, argc, spec.scan_from as usize));
-        let blocks = spec.kind == Kind::Blocking || matches!(xread, Some(Some((_, true))));
-        self.timed
-            .set((self.started_us.get() != 0 && !blocks && !queued).then(|| frame.clone()));
+        self.timed.set(started_us.and_then(|us| {
+            let blocks = spec.kind == Kind::Blocking || matches!(xread, Some(Some((_, true))));
+            (!blocks && !queued).then(|| (us, frame.clone()))
+        }));
         if self.auto {
             self.adapt_pipes();
         }
@@ -390,7 +387,7 @@ impl Session {
                 return;
             }
         }
-        if self.in_multi.get() && spec.flags & command::FLAG_TXN_CTRL == 0 {
+        if queued {
             self.queue_multi(spec, frame, argc);
             return;
         }
@@ -498,7 +495,7 @@ impl Session {
             }
             Kind::Nodes => {
                 let mut args: Vec<&[u8]> = resp::Args::new(&frame, argc).collect();
-                args[0] = &spec.name.as_bytes()[1..];
+                args[0] = spec.name.strip_prefix('p').unwrap_or(spec.name).as_bytes();
                 let mut plain = Vec::with_capacity(frame.len());
                 resp::write_command(&mut plain, &args);
                 if Box::pin(self.gates_clear()).await {
@@ -757,7 +754,6 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: SocketAddr, id: 
         shared: shared.clone(),
         id,
         cmd: listed.cmd.clone(),
-        started_us: Cell::new(0),
         timed: Cell::new(None),
         reply_q: reply_q.clone(),
         link: link.clone(),

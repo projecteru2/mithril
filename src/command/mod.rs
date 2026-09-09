@@ -78,7 +78,8 @@ pub enum Kind {
     Exec,
     /// SCRIPT and FUNCTION management: broadcast, or answered by one master.
     Script,
-    /// Forwarded to every node as the plain command, the replies listed per node.
+    /// A `p`-prefixed command forwarded to every node as the command it names, the replies
+    /// listed per node.
     Nodes,
 }
 

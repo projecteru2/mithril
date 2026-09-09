@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bytes::BytesMut;
@@ -17,7 +17,7 @@ use crate::backend::Backends;
 use crate::client::{Shared, auto_tuner, serve};
 use crate::config::{Config, Placement, Sharding};
 use crate::shard;
-use crate::stats::Stats;
+use crate::stats::{self, Stats};
 use crate::topology::Topology;
 use crate::{log_notice, log_warn, resp};
 
@@ -159,10 +159,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
         .slowlog
         .max_len
         .store(cfg.slowlog_max_len, Ordering::Relaxed);
-    let started = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let started = stats::unix_secs();
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

@@ -196,10 +196,7 @@ pub fn cluster(args: &[&[u8]], cfg: &Config, proto: u8) -> Vec<u8> {
 
 pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
     let (cpu_sys, cpu_user) = cpu_seconds();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = stats::unix_secs();
     let mut text = format!(
         "# Server\r\nredis_version:{SERVER_VERSION}\r\nredis_mode:cluster\r\n\
          mithril_version:{}\r\nprocess_id:{}\r\ntcp_port:{}\r\nuptime_in_seconds:{}\r\n\
@@ -431,9 +428,13 @@ fn config_set(acl: &Acl, stats: &Stats, key: &[u8], value: &[u8]) -> Result<(), 
         let v = crate::config::parse_slower_than(&value).map_err(|e| format!("ERR {e}"))?;
         stats.slowlog.slower_than.store(v, Ordering::Relaxed);
     } else if key.eq_ignore_ascii_case(b"slowlog-max-len") {
-        let v = value.parse::<usize>().ok().filter(|v| *v <= 1_000_000).ok_or_else(|| {
-            "ERR CONFIG SET failed (possibly related to argument 'slowlog-max-len') - argument must be between 0 and 1000000 inclusive".to_string()
-        })?;
+        let v = value
+            .parse::<usize>()
+            .ok()
+            .filter(|v| *v <= stats::SLOWLOG_MAX_LEN_LIMIT)
+            .ok_or_else(|| {
+                format!("ERR CONFIG SET failed (possibly related to argument 'slowlog-max-len') - argument must be between 0 and {} inclusive", stats::SLOWLOG_MAX_LEN_LIMIT)
+            })?;
         stats.slowlog.max_len.store(v, Ordering::Relaxed);
     } else if key.eq_ignore_ascii_case(b"loglevel") {
         crate::log::set_level(crate::log::parse_level(&value).map_err(|e| format!("ERR {e}"))?);

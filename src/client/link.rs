@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 
 use super::Lane;
 use super::pubsub::{PendingSub, PubsubSim};
+use super::watch::settled;
 use super::watch::{NO_WATCH, Watched};
 use crate::cache::ReplyCache;
 use crate::multikey;
@@ -47,6 +48,8 @@ pub(super) struct WriterLink {
     pub(super) hold: Cell<bool>,
     // (sequence, microsecond read, request) of each timed command, in sequence order
     pub(super) timings: RefCell<VecDeque<(u64, u64, Bytes)>>,
+    // timed commands not yet settled; the writer's sweep skips the queue at zero
+    pub(super) timings_pending: Cell<usize>,
     pub(super) closed_notify: Notify,
     pub(super) proto_switches: ProtoSwitchQueue,
     pub(super) oob_budget: Cell<usize>,
@@ -149,6 +152,13 @@ impl WriterLink {
         let mut slots = self.migrating.borrow_mut();
         slots.retain(|&s| keep(s));
         self.migrating_any.set(!slots.is_empty());
+    }
+
+    /// Waits until the writer has emitted every reply before `seq`.
+    pub(super) async fn fence_wait(&self, seq: u64) {
+        self.fence_waiters.set(self.fence_waiters.get() + 1);
+        settled(&self.fence_notify, || self.emitted.get() < seq).await;
+        self.fence_waiters.set(self.fence_waiters.get() - 1);
     }
 
     /// Registers a detached task answering at `seq`, so teardown can abort and backfill it.

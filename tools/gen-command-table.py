@@ -163,6 +163,7 @@ def main():
         table.append((key, f'"{name}", {r["arity"]}, {" | ".join(m) or "0"}, {first}, {last}, {step}, {numkeys}, {scan_from(name, keys)}, Kind::{kind}, {info}, {cats}),'))
     # proxy-only commands the servers do not report: (name, arity, categories)
     for name, arity, cats in [("pslowlog", -2, "A_ADMIN | A_SLOW | A_DANGEROUS")]:
+        assert KIND[name] != "Nodes" or (name[0] == "p" and name[1:] in {r.split('"')[1] for _, r in table}), name
         key = (prefix64(name), len(name), name.encode()[8:])
         table.append((key, f'"{name}", {arity}, 0, 0, 0, 0, 0, 0, Kind::{KIND[name]}, 0, {cats}),'))
     table.sort()
