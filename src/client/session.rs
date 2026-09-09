@@ -29,6 +29,7 @@ use super::{
     Cold, ERR_CROSSSLOT, ERR_NO_OWNER, ERR_NOAUTH, Lane, MAX_INFLIGHT, Reply, Shared, error_frame,
 };
 use crate::acl::User;
+use crate::admin;
 use crate::backend::{ERR_BACKEND_LOST, ensure_read_room};
 use crate::cache::{CACHING_FRAME, ReplyCache};
 use crate::command::{self, Kind, Spec};
@@ -245,16 +246,23 @@ impl Session {
             .saturating_sub(self.link.emitted.get())
     }
 
-    // SLOWLOG reads the log once every earlier reply of the session has settled into it
-    async fn settle_replies(&self) {
-        let seq = self.link.next_seq.get();
-        self.link
-            .fence_waiters
-            .set(self.link.fence_waiters.get() + 1);
-        settled(&self.link.fence_notify, || self.link.emitted.get() < seq).await;
-        self.link
-            .fence_waiters
-            .set(self.link.fence_waiters.get() - 1);
+    // SLOWLOG reads the log once every earlier reply of the session has settled into it: on
+    // a tracked task behind the hold, so the reader still sees a hang-up meanwhile
+    fn answer_slowlog(&self, frame: Bytes, argc: usize) {
+        let seq = self.alloc_seq();
+        let (shared, reply_q, link) =
+            (self.shared.clone(), self.reply_q.clone(), self.link.clone());
+        link.hold.set(true);
+        let task = tokio::task::spawn_local(async move {
+            link.fence_waiters.set(link.fence_waiters.get() + 1);
+            settled(&link.fence_notify, || link.emitted.get() < seq).await;
+            link.fence_waiters.set(link.fence_waiters.get() - 1);
+            let args: Vec<&[u8]> = resp::Args::new(&frame, argc).collect();
+            let reply = admin::slowlog_cmd(&args, &shared.stats);
+            link.hold.set(false);
+            let _ = reply_q.send(Reply::At(seq, Bytes::from(reply)));
+        });
+        self.link.track(seq, task);
     }
 
     pub(super) fn alloc_seq(&self) -> u64 {
@@ -356,9 +364,9 @@ impl Session {
         stats::bump(self.shared.wstats.calls.at(id));
         self.cmd.store(id, Ordering::Relaxed);
         let queued = self.in_multi.get() && spec.flags & command::FLAG_TXN_CTRL == 0;
-        let blocks = spec.kind == Kind::Blocking
-            || (spec.kind == Kind::Xread
-                && xread_slot(&frame, argc, spec.scan_from as usize).is_some_and(|(_, b)| b));
+        let xread =
+            (spec.kind == Kind::Xread).then(|| xread_slot(&frame, argc, spec.scan_from as usize));
+        let blocks = spec.kind == Kind::Blocking || matches!(xread, Some(Some((_, true))));
         self.timed
             .set((self.started_us.get() != 0 && !blocks && !queued).then(|| frame.clone()));
         if self.auto {
@@ -429,12 +437,8 @@ impl Session {
                     cold.await;
                 }
             }
-            Kind::Local => {
-                if spec.name == "slowlog" {
-                    self.settle_replies().await;
-                }
-                self.handle_local(spec, frame, argc)
-            }
+            Kind::Local if spec.name == "slowlog" => self.answer_slowlog(frame, argc),
+            Kind::Local => self.handle_local(spec, frame, argc),
             Kind::Exec => {
                 if let Some(cold) = self.handle_exec() {
                     cold.await;
@@ -463,7 +467,7 @@ impl Session {
                 }
             }
             Kind::Xread => {
-                if let Some(cold) = self.forward_xread(spec, frame, argc) {
+                if let Some(cold) = self.forward_xread(spec, frame, xread.flatten()) {
                     cold.await;
                 }
             }

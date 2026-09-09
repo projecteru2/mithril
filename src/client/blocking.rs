@@ -14,8 +14,13 @@ use crate::crc16;
 use crate::resp;
 
 impl Session {
-    pub(super) fn forward_xread(&self, spec: &Spec, frame: Bytes, argc: usize) -> Option<Cold<'_>> {
-        let Some((slot, blocking)) = xread_slot(&frame, argc, spec.scan_from as usize) else {
+    pub(super) fn forward_xread(
+        &self,
+        spec: &Spec,
+        frame: Bytes,
+        parsed: Option<(u16, bool)>,
+    ) -> Option<Cold<'_>> {
+        let Some((slot, blocking)) = parsed else {
             self.emit_error("ERR Unbalanced XREAD list of streams");
             return None;
         };

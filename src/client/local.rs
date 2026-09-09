@@ -281,7 +281,6 @@ impl Session {
                 &self.shared.acl,
                 &self.shared.stats,
             ))),
-            "slowlog" => Some(Bytes::from(admin::slowlog_cmd(args, &self.shared.stats))),
             "cluster" => Some(Bytes::from(admin::cluster(
                 args,
                 &self.shared.cfg,
