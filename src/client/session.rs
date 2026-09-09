@@ -14,6 +14,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::{Notify, oneshot};
 
+use super::blocking::xread_slot;
 use super::broadcast::{Gather, Targets};
 use super::fanout::write_keys;
 use super::link::{Fill, InFlight, WriterLink};
@@ -22,7 +23,7 @@ use super::pipe::{ColdSend, Pipe, pipe_for, queue_on};
 use super::pubsub::{PubsubHandle, pubsub_allowed, settles_first};
 use super::queue::ReplyQueue;
 use super::tuner::PIPELINED_LOCAL;
-use super::watch::NO_WATCH;
+use super::watch::{NO_WATCH, settled};
 use super::writer::write_loop;
 use super::{
     Cold, ERR_CROSSSLOT, ERR_NO_OWNER, ERR_NOAUTH, Lane, MAX_INFLIGHT, Reply, Shared, error_frame,
@@ -244,6 +245,18 @@ impl Session {
             .saturating_sub(self.link.emitted.get())
     }
 
+    // SLOWLOG reads the log once every earlier reply of the session has settled into it
+    async fn settle_replies(&self) {
+        let seq = self.link.next_seq.get();
+        self.link
+            .fence_waiters
+            .set(self.link.fence_waiters.get() + 1);
+        settled(&self.link.fence_notify, || self.link.emitted.get() < seq).await;
+        self.link
+            .fence_waiters
+            .set(self.link.fence_waiters.get() - 1);
+    }
+
     pub(super) fn alloc_seq(&self) -> u64 {
         let seq = self.link.next_seq.get();
         self.link.next_seq.set(seq + 1);
@@ -343,10 +356,11 @@ impl Session {
         stats::bump(self.shared.wstats.calls.at(id));
         self.cmd.store(id, Ordering::Relaxed);
         let queued = self.in_multi.get() && spec.flags & command::FLAG_TXN_CTRL == 0;
-        self.timed.set(
-            (self.started_us.get() != 0 && spec.kind != Kind::Blocking && !queued)
-                .then(|| frame.clone()),
-        );
+        let blocks = spec.kind == Kind::Blocking
+            || (spec.kind == Kind::Xread
+                && xread_slot(&frame, argc, spec.scan_from as usize).is_some_and(|(_, b)| b));
+        self.timed
+            .set((self.started_us.get() != 0 && !blocks && !queued).then(|| frame.clone()));
         if self.auto {
             self.adapt_pipes();
         }
@@ -415,7 +429,12 @@ impl Session {
                     cold.await;
                 }
             }
-            Kind::Local => self.handle_local(spec, frame, argc),
+            Kind::Local => {
+                if spec.name == "slowlog" {
+                    self.settle_replies().await;
+                }
+                self.handle_local(spec, frame, argc)
+            }
             Kind::Exec => {
                 if let Some(cold) = self.handle_exec() {
                     cold.await;

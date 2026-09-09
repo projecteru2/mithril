@@ -598,7 +598,7 @@ async fn unwatched(watched: &Watched, sent: Option<(oneshot::Receiver<Bytes>, u6
 }
 
 // a wait that cannot miss the notification between the check and the sleep
-async fn settled(notify: &Notify, pending: impl Fn() -> bool) {
+pub(super) async fn settled(notify: &Notify, pending: impl Fn() -> bool) {
     loop {
         let notified = notify.notified();
         tokio::pin!(notified);

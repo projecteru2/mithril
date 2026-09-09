@@ -46,7 +46,9 @@ proxy or served from the reply cache alike; only a blocking command, whose
 wait is the client's own, is left out. A transaction is one
 entry named `exec`; the arguments of AUTH and HELLO, the rules of ACL SETUSER
 and the password values of a CONFIG SET read `(redacted)`.
-`PSLOWLOG GET|LEN|RESET` forwards the same subcommand to every node and
+SLOWLOG answers once the session's earlier replies have settled into the
+log, so a pipelined command before a RESET is cleared by it and one before a
+LEN is counted by it. `PSLOWLOG GET|LEN|RESET` forwards the same subcommand to every node and
 answers with one `[address, reply]` pair per node, the servers' own slow
 logs untouched by the proxy's.
 

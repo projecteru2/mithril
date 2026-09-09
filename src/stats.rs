@@ -166,12 +166,8 @@ impl Stats {
         self.epoch.elapsed().as_micros() as u64
     }
 
-    /// Keeps a command that started at `started_us` when it ran at least the slow threshold;
-    /// a SLOWLOG RESET clears what settled before it, in the session's own order.
+    /// Keeps a command that started at `started_us` when it ran at least the slow threshold.
     pub fn log_slow(&self, client_id: u64, started_us: u64, frame: Bytes) {
-        if is_slowlog_reset(&frame) {
-            self.slowlog.reset();
-        }
         let micros = self.micros().saturating_sub(started_us);
         if micros < self.slowlog.threshold() as u64 {
             return;
@@ -245,18 +241,6 @@ fn slow_args(frame: &[u8]) -> Vec<u8> {
         }
     }
     out
-}
-
-fn is_slowlog_reset(frame: &[u8]) -> bool {
-    let argc = crate::resp::scan_int_line(frame, 1).map_or(0, |(n, _)| n.max(0) as usize);
-    let mut args = crate::resp::Args::new(frame, argc);
-    argc == 2
-        && args
-            .next()
-            .is_some_and(|a| a.eq_ignore_ascii_case(b"slowlog"))
-        && args
-            .next()
-            .is_some_and(|a| a.eq_ignore_ascii_case(b"reset"))
 }
 
 fn sensitive(args: &[&[u8]], i: usize) -> bool {
@@ -356,26 +340,6 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&slow_args(&blob)),
             "*1\r\n$4\r\nexec\r\n"
-        );
-    }
-
-    #[test]
-    fn a_settled_reset_clears_what_settled_before_it() {
-        let stats = Stats::new(1);
-        stats.slowlog.slower_than.store(0, Ordering::Relaxed);
-        stats.log_slow(7, 1, frame(&["ping"]));
-        stats.log_slow(7, 1, frame(&["SLOWLOG", "reset"]));
-        stats.log_slow(7, 1, frame(&["slowlog", "len"]));
-        let kept: Vec<String> = stats
-            .slowlog
-            .newest(10)
-            .iter()
-            .map(|e| String::from_utf8_lossy(&e.args).into_owned())
-            .collect();
-        assert_eq!(kept.len(), 2, "{kept:?}");
-        assert!(
-            kept[1].contains("reset") && kept[0].contains("len"),
-            "{kept:?}"
         );
     }
 

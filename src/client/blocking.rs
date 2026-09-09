@@ -20,7 +20,6 @@ impl Session {
             return None;
         };
         if blocking {
-            self.timed.set(None);
             return self.block_at(slot, frame);
         }
         let seq = self.alloc_seq();
@@ -62,7 +61,7 @@ impl Session {
 }
 
 // the first stream key's slot and whether BLOCK precedes STREAMS; None when unbalanced
-fn xread_slot(frame: &Bytes, argc: usize, start: usize) -> Option<(u16, bool)> {
+pub(super) fn xread_slot(frame: &Bytes, argc: usize, start: usize) -> Option<(u16, bool)> {
     let mut blocking = false;
     let mut streams = None;
     for (i, a) in resp::Args::new(frame, argc).enumerate().skip(start) {
