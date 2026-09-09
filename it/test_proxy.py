@@ -930,12 +930,21 @@ def test_keyless_write_rides_out_a_failover(r, cluster_direct, new_conn, key_pre
                 errors.append(repr(e))
 
     def role_is(node, role):
-        for _ in range(200):
+        for _ in range(600):
             if node.info("replication")["role"] == role:
                 return True
             time.sleep(0.05)
         return False
 
+    def synced(node):
+        for _ in range(600):
+            info = node.info("replication")
+            if info.get("master_link_status") == "up" and not info.get("master_sync_in_progress"):
+                return True
+            time.sleep(0.05)
+        return False
+
+    assert synced(replica), "the replica never caught up with its master"
     worker = threading.Thread(target=churn)
     worker.start()
     try:
@@ -947,7 +956,7 @@ def test_keyless_write_rides_out_a_failover(r, cluster_direct, new_conn, key_pre
     finally:
         stop.set()
         worker.join(30)
-        if master.info("replication")["role"] != "master":
+        if master.info("replication")["role"] != "master" and synced(master):
             master.execute_command("CLUSTER FAILOVER")
             role_is(master, "master")
         master.close()
