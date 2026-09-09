@@ -948,8 +948,9 @@ def test_keyless_write_rides_out_a_failover(r, cluster_direct, new_conn, key_pre
     worker = threading.Thread(target=churn)
     worker.start()
     try:
-        assert replica.execute_command("CLUSTER FAILOVER")
+        assert replica.execute_command("CLUSTER", "FAILOVER", "TAKEOVER")
         assert role_is(replica, "master"), "failover did not complete"
+        assert role_is(master, "slave"), "the old master was not demoted"
         time.sleep(0.5)
         stop.set()
         worker.join(30)
@@ -957,8 +958,9 @@ def test_keyless_write_rides_out_a_failover(r, cluster_direct, new_conn, key_pre
         stop.set()
         worker.join(30)
         if master.info("replication")["role"] != "master" and synced(master):
-            master.execute_command("CLUSTER FAILOVER")
+            master.execute_command("CLUSTER", "FAILOVER", "TAKEOVER")
             role_is(master, "master")
+            role_is(replica, "slave")
         master.close()
         replica.close()
     assert errors == []
