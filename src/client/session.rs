@@ -432,7 +432,15 @@ impl Session {
                     cold.await;
                 }
             }
-            Kind::Select => self.handle_select(frame, argc).await,
+            Kind::Select => {
+                let timed = (self.started_us.get() != 0).then(|| frame.clone());
+                self.handle_select(frame, argc).await;
+                if let Some(frame) = timed {
+                    self.shared
+                        .stats
+                        .log_slow(self.id, self.started_us.get(), frame);
+                }
+            }
             Kind::Eval => {
                 if let Some(cold) = self.forward_eval(frame, argc) {
                     cold.await;

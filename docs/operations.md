@@ -40,10 +40,10 @@ is kept, newest `slowlog-max-len` entries, and `SLOWLOG GET [count]`,
 microseconds, up to 32 arguments of up to 128 bytes, client address, client
 name). The default threshold is 10 ms as in Redis; `-1` switches timing
 off, `0` keeps every command. Commands the proxy answers itself are timed
-too; a blocking command, a pubsub command, a cluster-wide command, a SELECT
-and a reply served from the reply cache are not. A transaction is one entry
-named `exec`; the arguments of AUTH, HELLO, ACL SETUSER and a CONFIG SET of a
-password read `(redacted)`.
+too, SELECT included; a blocking command, a pubsub command, a cluster-wide
+command and a reply served from the reply cache are not. A transaction is one
+entry named `exec`; the arguments of AUTH and HELLO, the rules of ACL SETUSER
+and the password values of a CONFIG SET read `(redacted)`.
 `PSLOWLOG GET|LEN|RESET` forwards the same subcommand to every node and
 answers with one `[address, reply]` pair per node, the servers' own slow
 logs untouched by the proxy's.

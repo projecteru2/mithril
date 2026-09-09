@@ -211,41 +211,23 @@ pub fn add(counter: &AtomicU64, n: u64) {
 // the entry keeps at most 32 arguments of 128 bytes, credentials replaced, and a MULTI blob
 // as the EXEC it stands for
 fn slow_args(frame: &[u8]) -> Vec<u8> {
-    let argc = crate::resp::scan_int_line(frame, 1).map_or(0, |(n, _)| n.max(0) as usize);
+    let mut cur = crate::resp::Cursor::default();
+    let (len, argc) = match crate::resp::scan_request_at(frame, &mut cur) {
+        crate::resp::ReqScan::Complete { len, argc } => (len, argc),
+        _ => (frame.len(), 0),
+    };
     let args: Vec<&[u8]> = crate::resp::Args::new(frame, argc).collect();
     let mut out = Vec::new();
-    if args.len() == 1 && args[0].eq_ignore_ascii_case(b"multi") {
+    if len < frame.len() && args.len() == 1 && args[0].eq_ignore_ascii_case(b"multi") {
         crate::resp::write_command(&mut out, &[b"exec"]);
         return out;
     }
-    let keep = match args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
-        Some(b"auth" | b"hello") => 1,
-        Some(b"acl")
-            if args
-                .get(1)
-                .is_some_and(|a| a.eq_ignore_ascii_case(b"setuser")) =>
-        {
-            3
-        }
-        Some(b"config")
-            if args.get(1).is_some_and(|a| a.eq_ignore_ascii_case(b"set"))
-                && args.get(2).is_some_and(|k| {
-                    k.eq_ignore_ascii_case(b"requirepass")
-                        || k.eq_ignore_ascii_case(b"backend-auth-pass")
-                }) =>
-        {
-            3
-        }
-        _ => usize::MAX,
-    };
     let shown = args.len().min(SLOWLOG_ARGC_MAX);
-    crate::resp::array_header(&mut out, if keep < args.len() { keep + 1 } else { shown });
+    crate::resp::array_header(&mut out, shown);
     for (i, arg) in args.iter().take(shown).enumerate() {
-        if i == keep {
+        if sensitive(&args, i) {
             crate::resp::bulk(&mut out, b"(redacted)");
-            break;
-        }
-        if i + 1 == SLOWLOG_ARGC_MAX && args.len() > SLOWLOG_ARGC_MAX {
+        } else if i + 1 == SLOWLOG_ARGC_MAX && args.len() > SLOWLOG_ARGC_MAX {
             let more = format!("... ({} more arguments)", args.len() - SLOWLOG_ARGC_MAX + 1);
             crate::resp::bulk(&mut out, more.as_bytes());
         } else if arg.len() > SLOWLOG_ARG_MAX {
@@ -259,6 +241,23 @@ fn slow_args(frame: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+// a credential argument: everything after AUTH or HELLO, an ACL SETUSER rule, the value of a
+// password key in CONFIG SET
+fn sensitive(args: &[&[u8]], i: usize) -> bool {
+    let is = |k: usize, name: &[u8]| args.get(k).is_some_and(|a| a.eq_ignore_ascii_case(name));
+    if is(0, b"auth") || is(0, b"hello") {
+        return i >= 1;
+    }
+    if is(0, b"acl") && is(1, b"setuser") {
+        return i >= 3;
+    }
+    is(0, b"config")
+        && is(1, b"set")
+        && i >= 3
+        && (i - 3).is_multiple_of(2)
+        && (is(i - 1, b"requirepass") || is(i - 1, b"backend-auth-pass"))
 }
 
 /// This thread's user+system CPU time in USER_HZ ticks; None where /proc is absent.
@@ -314,19 +313,24 @@ mod tests {
             t.starts_with("*32\r\n") && t.ends_with("... (5 more arguments)\r\n"),
             "{t}"
         );
+        let redacted = "$10\r\n(redacted)\r\n";
         assert_eq!(
             text(&["AUTH", "user", "pw"]),
-            "*2\r\n$4\r\nAUTH\r\n$10\r\n(redacted)\r\n"
+            format!("*3\r\n$4\r\nAUTH\r\n{redacted}{redacted}")
+        );
+        assert!(text(&["hello", "3", "auth", "u", "pw"]).ends_with(&redacted.repeat(4)));
+        assert!(
+            text(&["acl", "setuser", "bob", ">pw", "on"])
+                .ends_with(&format!("$3\r\nbob\r\n{redacted}{redacted}"))
         );
         assert_eq!(
-            text(&["hello", "3", "auth", "u", "pw"]),
-            "*2\r\n$5\r\nhello\r\n$10\r\n(redacted)\r\n"
+            text(&["config", "set", "loglevel", "notice", "requirepass", "pw"]),
+            format!(
+                "*6\r\n$6\r\nconfig\r\n$3\r\nset\r\n$8\r\nloglevel\r\n$6\r\nnotice\r\n$11\r\nrequirepass\r\n{redacted}"
+            )
         );
-        assert!(
-            text(&["acl", "setuser", "bob", ">pw"]).ends_with("$3\r\nbob\r\n$10\r\n(redacted)\r\n")
-        );
-        assert!(text(&["config", "set", "requirepass", "pw"]).ends_with("$10\r\n(redacted)\r\n"));
         assert!(text(&["config", "set", "loglevel", "debug"]).ends_with("$5\r\ndebug\r\n"));
+        assert_eq!(text(&["multi"]), "*1\r\n$5\r\nmulti\r\n");
         let mut blob = frame(&["multi"]).to_vec();
         blob.extend_from_slice(&frame(&["set", "k", "v"]));
         blob.extend_from_slice(&frame(&["exec"]));
