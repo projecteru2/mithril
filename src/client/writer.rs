@@ -10,7 +10,7 @@ use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{Notify, oneshot};
 
 use super::fanout::{Singles, multikey_plan, request_slot, resend_singles, write_keys};
-use super::link::{Fill, InFlight, InflightRing, WriterLink, mark_closed};
+use super::link::{Fill, Hop, InFlight, InflightRing, WriterLink, mark_closed};
 use super::pipe::{parse_redirect, pipe_for, queue_on, recv_or_lost, scatter_one};
 use super::pubsub::PUBSUB_PUSH_WINDOW;
 use super::queue::ReplyQueue;
@@ -250,20 +250,22 @@ pub(super) async fn write_loop(
                         && let Some((retry, db, target)) = take_reload(&link, seq)
                     {
                         let topo = shared.topo.load_full();
-                        let target = match target.as_deref() {
-                            Some(t) => Some(t),
-                            None => evalsha_target(&topo, &retry.0),
+                        let (asked, target) = match &target {
+                            Some((asked, t)) => (*asked, Some(t.as_ref())),
+                            None => (false, evalsha_target(&topo, &retry.0)),
                         };
                         if let (Some(load), Some(target)) =
                             (shared.scripts.load_frame(&retry.0), target)
                         {
+                            let lane = link.lane_with(client_id, db);
+                            let head = reload_head(&shared, target, lane, load, asked).await;
                             let resend = Resend {
                                 shared: &shared,
                                 reply_q: &reply_q,
                                 link: &link,
                                 client_id,
                             };
-                            resend.requeue(target, seq, Some(load), retry, 1, db).await;
+                            resend.requeue(target, seq, Some(head), retry, 1, db).await;
                             continue;
                         }
                     } else if frame.starts_with(b"-TRYAGAIN")
@@ -445,7 +447,7 @@ fn rerunnable(link: &WriterLink, seq: u64) -> bool {
 }
 
 // one script reload per request, at the node a redirect sent it to when one did
-fn take_reload(link: &WriterLink, seq: u64) -> Option<(Retry, u8, Option<Box<str>>)> {
+fn take_reload(link: &WriterLink, seq: u64) -> Option<(Retry, u8, Option<Hop>)> {
     let mut entry = entry_at(&link.inflight, seq)?;
     if entry.reloaded {
         return None;
@@ -464,7 +466,7 @@ fn take_retry(link: &WriterLink, seq: u64, ask: bool, target: &str) -> Option<(R
         return None;
     }
     entry.retried = true;
-    entry.target = Some(Box::from(target));
+    entry.target = Some((ask, Box::from(target)));
     let db = entry.db;
     let fill = link.detach_fill(&mut entry);
     Some(((entry.frame.clone(), entry.expect, fill), db))
@@ -505,9 +507,10 @@ fn ride_out(
         let req = retry.0.clone();
         let (mut reply, last) = follow_slot(&shared, lane, slot, reply, retry).await;
         if reply.starts_with(NOSCRIPT)
-            && let (Some(load), Some(target)) = (shared.scripts.load_frame(&req), last)
+            && let (Some(load), Some((asked, target))) = (shared.scripts.load_frame(&req), last)
         {
-            let rx = scatter_one(&shared, &target, lane, Some(load), req).await;
+            let head = reload_head(&shared, &target, lane, load, asked).await;
+            let rx = scatter_one(&shared, &target, lane, Some(head), req).await;
             reply = recv_or_lost(rx).await;
         }
         if parse_redirect(&reply).is_some() {
@@ -519,16 +522,32 @@ fn ride_out(
     });
 }
 
+// the frame that precedes a rerun after a reload: the script goes ahead on its own when the
+// rerun must carry ASKING, otherwise the load itself leads
+async fn reload_head(
+    shared: &Rc<Shared>,
+    target: &str,
+    lane: Lane,
+    load: Bytes,
+    asked: bool,
+) -> Bytes {
+    if !asked {
+        return load;
+    }
+    drop(scatter_one(shared, target, lane, None, load).await);
+    Bytes::from_static(ASKING_FRAME)
+}
+
 // each hop waits, then goes where the reply points (a redirect's target) or where the slot
 // lives now (TRYAGAIN under an atomic migration); the first real answer stands, with the
-// node that gave it, and an error outlasting the hops is the caller's to judge
+// hop that got it, and an error outlasting the hops is the caller's to judge
 async fn follow_slot(
     shared: &Rc<Shared>,
     lane: Lane,
     slot: u16,
     mut reply: Bytes,
     (req, _, fill): Retry,
-) -> (Bytes, Option<String>) {
+) -> (Bytes, Option<(bool, String)>) {
     if let Some(fill) = fill
         && let Some(cache) = &shared.cache
     {
@@ -551,7 +570,7 @@ async fn follow_slot(
         let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
         let rx = scatter_one(shared, &target, lane, head, req.clone()).await;
         reply = recv_or_lost(rx).await;
-        last = Some(target);
+        last = Some((ask, target));
     }
     (reply, last)
 }

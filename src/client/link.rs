@@ -25,12 +25,15 @@ pub(super) struct InFlight {
     pub(super) waited: bool,
     pub(super) fill: Option<Fill>,
     pub(super) db: u8,
-    // where a redirect sent the request, for a reload the topology cannot place yet
-    pub(super) target: Option<Box<str>>,
+    // where a redirect sent the request and whether it was ASK, for a reload there
+    pub(super) target: Option<Hop>,
 }
 
 // sequences are allocated monotonically, so the ring stays sorted
 pub(super) type InflightRing = RefCell<VecDeque<InFlight>>;
+
+// a redirect's target and whether it was ASK
+pub(super) type Hop = (bool, Box<str>);
 
 // state shared between a session's reader, writer, and pubsub relay
 #[derive(Default)]
@@ -41,6 +44,8 @@ pub(super) struct WriterLink {
     pub(super) emitted: Cell<u64>,
     // set when no reply can ever be written again; reader must stop dispatching
     pub(super) closed: Cell<bool>,
+    // a cluster-wide command in flight: the reader keeps reading but dispatches nothing
+    pub(super) hold: Cell<bool>,
     pub(super) closed_notify: Notify,
     pub(super) proto_switches: ProtoSwitchQueue,
     pub(super) oob_budget: Cell<usize>,

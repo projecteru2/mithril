@@ -621,7 +621,8 @@ impl Session {
 
     fn window_full(&self) -> bool {
         let outstanding = self.outstanding();
-        outstanding >= MAX_INFLIGHT as u64 || (self.switch_pending.get() && outstanding > 0)
+        outstanding >= MAX_INFLIGHT as u64
+            || ((self.switch_pending.get() || self.link.hold.get()) && outstanding > 0)
     }
 }
 
