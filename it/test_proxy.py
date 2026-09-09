@@ -1340,7 +1340,7 @@ def test_slowlog_keeps_commands_over_the_threshold(r, new_conn, key_prefix):
         assert b":" in mine["client_address"]
         assert mine["duration"] >= 0
         assert [e["id"] for e in entries] == sorted((e["id"] for e in entries), reverse=True)
-        assert r.slowlog_len() == len(entries)
+        assert r.slowlog_len() == len(entries) + 1
         assert r.config_set("slowlog-max-len", 2)
         assert c.get(k) == "v"
         assert r.slowlog_len() == 2
