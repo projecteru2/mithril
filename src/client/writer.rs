@@ -206,6 +206,9 @@ pub(super) async fn write_loop(
                     }
                     Reply::Ack(seq, frame) => {
                         if seq >= next_emit {
+                            if frame.first() == Some(&b'-') {
+                                stats::bump(&shared.wstats.errors);
+                            }
                             parked.put(seq, frame, true);
                         }
                         continue;
