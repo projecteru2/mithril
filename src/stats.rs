@@ -48,6 +48,10 @@ pub struct WorkerStats {
     pub cache_entries: AtomicU64,
     pub cache_bytes: AtomicU64,
     pub cache_flips: AtomicU64,
+    pub pipe_shared: AtomicU64,
+    pub pipe_probes: AtomicU64,
+    pub pipe_keeps: AtomicU64,
+    pub pipe_reverts: AtomicU64,
     pub calls: Calls,
 }
 

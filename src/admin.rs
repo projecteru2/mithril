@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::fmt::Write;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::acl::Acl;
@@ -211,7 +211,8 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
          backend_sharding:{}\r\nslave_mode:{}\r\nreply_cache:{}\r\n\
          cache_hits:{}\r\ncache_misses:{}\r\ncache_invalidations:{}\r\n\
          cache_armed_workers:{}\r\ncache_entries:{}\r\ncache_bytes:{}\r\n\
-         cache_flips:{}\r\nworker_commands:{}\r\n",
+         cache_flips:{}\r\npipe_probes:{}\r\npipe_keeps:{}\r\npipe_reverts:{}\r\n\
+         worker_commands:{}\r\nworker_shared:{}\r\n",
         crate::VERSION,
         std::process::id(),
         cfg.port,
@@ -242,12 +243,11 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
         stats.sum(|w| &w.cache_entries),
         stats.sum(|w| &w.cache_bytes),
         stats.sum(|w| &w.cache_flips),
-        stats
-            .workers
-            .iter()
-            .map(|w| w.commands.load(Ordering::Relaxed).to_string())
-            .collect::<Vec<_>>()
-            .join(","),
+        stats.sum(|w| &w.pipe_probes),
+        stats.sum(|w| &w.pipe_keeps),
+        stats.sum(|w| &w.pipe_reverts),
+        per_worker(stats, |w| &w.commands),
+        per_worker(stats, |w| &w.pipe_shared),
     );
     text.push_str("\r\n# Cluster\r\ncluster_enabled:1\r\n\r\n# Commandstats\r\n");
     for id in 0..command::entries() as u16 {
@@ -418,6 +418,15 @@ fn split_announce(announce: &str) -> (&str, u16) {
     }
 }
 
+fn per_worker<F: Fn(&stats::WorkerStats) -> &AtomicU64>(stats: &Stats, field: F) -> String {
+    stats
+        .workers
+        .iter()
+        .map(|w| field(w).load(Ordering::Relaxed).to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn yesno(v: bool) -> &'static str {
     if v { "yes" } else { "no" }
 }
@@ -525,6 +534,9 @@ mod tests {
         let get = command::lookup(b"get").unwrap().id;
         stats.workers[0].calls.at(get).store(3, Ordering::Relaxed);
         stats.workers[1].calls.at(get).store(4, Ordering::Relaxed);
+        stats.workers[1].pipe_shared.store(1, Ordering::Relaxed);
+        stats.workers[0].pipe_probes.store(5, Ordering::Relaxed);
+        stats.workers[1].pipe_keeps.store(2, Ordering::Relaxed);
         let out = info(&cfg, &stats, 0);
         let text = String::from_utf8_lossy(&out);
         let field = |k: &str| {
@@ -535,6 +547,11 @@ mod tests {
         assert_eq!(field("connected_clients").as_deref(), Some("7"));
         assert_eq!(field("mithril_version").as_deref(), Some(crate::VERSION));
         assert_eq!(field("cache_flips").as_deref(), Some("0"));
+        assert_eq!(field("worker_commands").as_deref(), Some("0,0"));
+        assert_eq!(field("worker_shared").as_deref(), Some("0,1"));
+        assert_eq!(field("pipe_probes").as_deref(), Some("5"));
+        assert_eq!(field("pipe_keeps").as_deref(), Some("2"));
+        assert_eq!(field("pipe_reverts").as_deref(), Some("0"));
         assert_eq!(field("total_error_replies").as_deref(), Some("0"));
         assert_eq!(field("cluster_enabled").as_deref(), Some("1"));
         assert_eq!(field("cmdstat_get").as_deref(), Some("calls=7"));

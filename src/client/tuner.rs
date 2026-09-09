@@ -1,17 +1,18 @@
 //! Pipe selection under auto sharding: the session score and the worker-level tuner.
 
 use std::rc::Rc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use super::Shared;
 use super::session::Session;
-use crate::stats;
+use crate::stats::{self, WorkerStats};
 
 // pipelining score: a local session shares at 0, a shared one returns at PIPELINED_LOCAL
 pub(super) const PIPELINED_LOCAL: u8 = 4;
 const PIPELINED_MAX: u8 = 8;
-// auto sharding moves a worker's sessions to the shared pipes while the worker is
-// busy and its local backend batches would stay thin (in-flight commands per master)
+// what triggers a probe: the worker is busy and its local backend batches would
+// stay thin (in-flight commands per master)
 const TUNE_PERIOD: Duration = Duration::from_millis(100);
 const BUSY_ENTER: u32 = 85;
 const BUSY_LEAVE: u32 = 60;
@@ -21,6 +22,19 @@ const DEPTH_LEAVE: u64 = 16;
 // lowers its own busyness, so leaving is slow and entering prompt
 const ENTER_TICKS: u32 = 3;
 const LEAVE_TICKS: u32 = 30;
+// the command-rate window, ten ticks of 100 ms, so a rate is commands per second
+const RATE_TICKS: usize = 10;
+// ticks the probe gives the sessions to move before it measures
+const SETTLE_TICKS: u32 = 10;
+const PROBE_TICKS: u32 = SETTLE_TICKS + RATE_TICKS as u32;
+// the shared pipes are kept only where they measure this much faster
+const KEEP_GAIN_PCT: u64 = 5;
+// commands per second under which the worker is idle and its rates say nothing
+const MIN_RATE_PER_SEC: u64 = 100;
+// ticks to the next probe, doubling while decisions confirm the current state
+const PROBE_BACKOFF_TICKS: u32 = 300;
+const PROBE_BACKOFF_MAX_TICKS: u32 = 4800;
+const PROBE_DOUBLINGS: u32 = (PROBE_BACKOFF_MAX_TICKS / PROBE_BACKOFF_TICKS).ilog2();
 
 impl Session {
     // an unpipelined session gains from the deeper batches of the shared pipe, a
@@ -40,13 +54,140 @@ impl Session {
     }
 }
 
-/// Samples this worker's CPU busyness and in-flight depth per master and publishes
+#[derive(Clone, Copy, Default)]
+enum Phase {
+    #[default]
+    Steady,
+    Probing {
+        baseline: u64,
+        ticks: u32,
+    },
+}
+
+// the worker's experiment: the busy-and-thin rule triggers it, the measured command rate decides
+#[derive(Default)]
+struct Probe {
+    prefer: bool,
+    probes: u64,
+    keeps: u64,
+    reverts: u64,
+    phase: Phase,
+    streak: u32,
+    wait: u32,
+    confirmed: u32,
+    ring: [u64; RATE_TICKS],
+    at: usize,
+    seen: usize,
+    last: u64,
+}
+
+impl Probe {
+    fn tick(&mut self, busy_pct: u32, depth: u64, commands_now: u64) -> bool {
+        self.record(commands_now);
+        self.wait = self.wait.saturating_sub(1);
+        match self.phase {
+            Phase::Probing { baseline, ticks } => self.probing(baseline, ticks),
+            Phase::Steady if self.prefer => self.leave(busy_pct, depth),
+            Phase::Steady => self.enter(busy_pct, depth),
+        }
+        self.prefer
+    }
+
+    fn publish(&self, wstats: &WorkerStats) {
+        wstats
+            .pipe_shared
+            .store(u64::from(self.prefer), Ordering::Relaxed);
+        wstats.pipe_probes.store(self.probes, Ordering::Relaxed);
+        wstats.pipe_keeps.store(self.keeps, Ordering::Relaxed);
+        wstats.pipe_reverts.store(self.reverts, Ordering::Relaxed);
+    }
+
+    fn record(&mut self, commands_now: u64) {
+        self.ring[self.at] = commands_now.saturating_sub(self.last);
+        self.at = (self.at + 1) % RATE_TICKS;
+        self.last = commands_now;
+        self.seen = (self.seen + 1).min(RATE_TICKS);
+    }
+
+    fn rate(&self) -> u64 {
+        self.ring.iter().sum()
+    }
+
+    fn enter(&mut self, busy_pct: u32, depth: u64) {
+        if busy_pct < BUSY_ENTER || depth >= DEPTH_ENTER {
+            self.streak = 0;
+            return;
+        }
+        self.streak = (self.streak + 1).min(ENTER_TICKS);
+        if self.streak == ENTER_TICKS {
+            self.start_probe();
+        }
+    }
+
+    fn leave(&mut self, busy_pct: u32, depth: u64) {
+        if busy_pct > BUSY_LEAVE && depth < DEPTH_LEAVE {
+            self.streak = 0;
+            self.start_probe();
+            return;
+        }
+        self.streak += 1;
+        if self.streak >= LEAVE_TICKS {
+            // the load went away rather than a measurement: the next busy stretch probes at once
+            self.streak = 0;
+            self.wait = 0;
+            self.prefer = false;
+        }
+    }
+
+    fn start_probe(&mut self) {
+        let baseline = self.rate();
+        if self.wait > 0 || self.seen < RATE_TICKS || baseline < MIN_RATE_PER_SEC {
+            return;
+        }
+        self.probes += 1;
+        self.streak = 0;
+        self.prefer = !self.prefer;
+        self.phase = Phase::Probing { baseline, ticks: 0 };
+    }
+
+    fn probing(&mut self, baseline: u64, ticks: u32) {
+        let ticks = ticks + 1;
+        if ticks < PROBE_TICKS {
+            self.phase = Phase::Probing { baseline, ticks };
+            return;
+        }
+        let measured = self.rate();
+        let (shared, local) = if self.prefer {
+            (measured, baseline)
+        } else {
+            (baseline, measured)
+        };
+        let keep = shared * 100 >= local * (100 + KEEP_GAIN_PCT);
+        // a decision that flips the state starts the schedule over, one that confirms it waits longer
+        if keep == self.prefer {
+            self.confirmed = 0;
+            self.wait = PROBE_BACKOFF_TICKS;
+        } else {
+            self.wait = PROBE_BACKOFF_TICKS << self.confirmed;
+            self.confirmed = (self.confirmed + 1).min(PROBE_DOUBLINGS);
+        }
+        if keep {
+            self.keeps += 1;
+        } else {
+            self.reverts += 1;
+        }
+        self.prefer = keep;
+        self.phase = Phase::Steady;
+    }
+}
+
+/// Samples this worker's CPU busyness, batch depth and command rate, and publishes
 /// whether its sessions should prefer the shared pipes.
 pub async fn auto_tuner(shared: Rc<Shared>) {
     let mut last_ticks = stats::thread_cpu_ticks();
     let mut last_at = Instant::now();
     let mut busy_x16 = 0u32;
-    let mut streak = 0u32;
+    let mut probe = Probe::default();
     loop {
         tokio::time::sleep(TUNE_PERIOD).await;
         let now = Instant::now();
@@ -62,9 +203,11 @@ pub async fn auto_tuner(shared: Rc<Shared>) {
         let masters = shared.topo.load().masters.len().max(1) as u64;
         let (measured, writes) = shared.backends.batch_depth();
         let depth = tune_depth(measured, writes, shared.inflight.get(), masters);
-        let cur = shared.prefer_shared.get();
-        let wanted = prefer_shared(cur, (busy_x16 + 8) / 16, depth);
-        shared.prefer_shared.set(settle(cur, wanted, &mut streak));
+        let commands = shared.wstats.commands.load(Ordering::Relaxed);
+        shared
+            .prefer_shared
+            .set(probe.tick((busy_x16 + 8) / 16, depth, commands));
+        probe.publish(&shared.wstats);
     }
 }
 
@@ -78,30 +221,6 @@ fn switch_pipes(sharded: bool, score: u8, worker_prefers_shared: bool) -> bool {
     } else {
         score <= 1
     }
-}
-
-// hysteresis on both signals so a worker does not flap its sessions between pipe kinds
-fn prefer_shared(current: bool, busy_pct: u32, depth: u64) -> bool {
-    if current {
-        busy_pct > BUSY_LEAVE && depth < DEPTH_LEAVE
-    } else {
-        busy_pct >= BUSY_ENTER && depth < DEPTH_ENTER
-    }
-}
-
-// a change of preference must hold for ENTER_TICKS or LEAVE_TICKS samples
-fn settle(current: bool, wanted: bool, streak: &mut u32) -> bool {
-    if wanted == current {
-        *streak = 0;
-        return current;
-    }
-    *streak += 1;
-    let need = if current { LEAVE_TICKS } else { ENTER_TICKS };
-    if *streak < need {
-        return current;
-    }
-    *streak = 0;
-    wanted
 }
 
 // the measured local batch while local traffic flows; with none, the in-flight
@@ -153,15 +272,9 @@ mod tests {
     }
 
     #[test]
-    fn worker_preference_overrides_the_score_with_hysteresis() {
+    fn worker_preference_overrides_the_score() {
         assert!(switch_pipes(false, PIPELINED_MAX, true));
         assert!(!switch_pipes(true, PIPELINED_MAX, true));
-        assert!(!prefer_shared(false, 84, 2));
-        assert!(!prefer_shared(false, 90, DEPTH_ENTER));
-        assert!(prefer_shared(false, 90, DEPTH_ENTER - 1));
-        assert!(prefer_shared(true, 61, DEPTH_LEAVE - 1));
-        assert!(!prefer_shared(true, 60, 1));
-        assert!(!prefer_shared(true, 99, DEPTH_LEAVE));
         let mut b = 0;
         for _ in 0..64 {
             b = busy_ewma(b, BUSY_ENTER);
@@ -169,16 +282,83 @@ mod tests {
         assert_eq!((b + 8) / 16, BUSY_ENTER);
         assert_eq!(tune_depth(3, 10, 900, 128), 3);
         assert_eq!(tune_depth(3, 0, 900, 128), 7);
-        let mut streak = 0;
-        for _ in 0..ENTER_TICKS - 1 {
-            assert!(!settle(false, true, &mut streak));
+    }
+
+    #[test]
+    fn a_probe_that_gains_keeps_the_shared_pipes() {
+        let mut rig = Rig::default();
+        assert!(!rig.run(RATE_TICKS as u32 - 1, 1_000, 90, 1));
+        assert!(rig.run(1, 1_000, 90, 1));
+        assert_eq!(rig.probe.probes, 1);
+        rig.run(SETTLE_TICKS, 1_000, 90, 1);
+        assert!(rig.run(RATE_TICKS as u32, 1_200, 90, 1));
+        assert_eq!((rig.probe.keeps, rig.probe.reverts), (1, 0));
+        assert_eq!(rig.probe.wait, PROBE_BACKOFF_TICKS);
+    }
+
+    #[test]
+    fn a_probe_that_loses_reverts_and_waits_twice_as_long_after_the_second() {
+        let mut rig = Rig::default();
+        rig.run(RATE_TICKS as u32, 1_000, 90, 1);
+        rig.run(PROBE_TICKS - 1, 800, 90, 1);
+        assert!(!rig.run(1, 800, 90, 1));
+        assert_eq!((rig.probe.keeps, rig.probe.reverts), (0, 1));
+        assert_eq!(rig.probe.wait, PROBE_BACKOFF_TICKS);
+        assert!(!rig.run(PROBE_BACKOFF_TICKS - 1, 1_000, 90, 1));
+        assert_eq!(rig.probe.probes, 1);
+        assert!(rig.run(1, 1_000, 90, 1));
+        assert_eq!(rig.probe.probes, 2);
+        rig.run(PROBE_TICKS - 1, 500, 90, 1);
+        assert!(!rig.run(1, 500, 90, 1));
+        assert_eq!(rig.probe.reverts, 2);
+        assert_eq!(rig.probe.wait, PROBE_BACKOFF_TICKS * 2);
+    }
+
+    #[test]
+    fn low_busyness_leaves_the_shared_pipes_without_a_backoff() {
+        let mut rig = Rig::default();
+        rig.run(RATE_TICKS as u32, 1_000, 90, 1);
+        assert!(rig.run(PROBE_TICKS, 1_200, 90, 1));
+        assert!(rig.run(LEAVE_TICKS - 1, 1_200, BUSY_LEAVE, 1));
+        assert!(!rig.run(1, 1_200, BUSY_LEAVE, 1));
+        assert_eq!(rig.probe.wait, 0);
+        assert_eq!((rig.probe.probes, rig.probe.keeps), (1, 1));
+    }
+
+    #[test]
+    fn a_reverse_probe_returns_to_local_when_the_shared_pipes_are_not_faster() {
+        let mut rig = Rig::default();
+        rig.run(RATE_TICKS as u32, 1_000, 90, 1);
+        rig.run(PROBE_TICKS, 1_200, 90, 1);
+        assert!(!rig.run(PROBE_BACKOFF_TICKS, 1_200, 90, 1));
+        assert_eq!(rig.probe.probes, 2);
+        rig.run(PROBE_TICKS - 1, 1_200, 90, 1);
+        assert!(!rig.run(1, 1_200, 90, 1));
+        assert_eq!((rig.probe.keeps, rig.probe.reverts), (1, 1));
+        assert_eq!(rig.probe.wait, PROBE_BACKOFF_TICKS);
+    }
+
+    #[test]
+    fn an_idle_worker_never_probes() {
+        let mut rig = Rig::default();
+        assert!(!rig.run(PROBE_BACKOFF_TICKS, MIN_RATE_PER_SEC - 10, 90, 1));
+        assert_eq!(rig.probe.probes, 0);
+    }
+
+    #[derive(Default)]
+    struct Rig {
+        probe: Probe,
+        commands: u64,
+    }
+
+    impl Rig {
+        fn run(&mut self, ticks: u32, per_sec: u64, busy_pct: u32, depth: u64) -> bool {
+            let mut prefer = self.probe.prefer;
+            for _ in 0..ticks {
+                self.commands += per_sec / RATE_TICKS as u64;
+                prefer = self.probe.tick(busy_pct, depth, self.commands);
+            }
+            prefer
         }
-        assert!(settle(false, true, &mut streak));
-        for _ in 0..LEAVE_TICKS - 1 {
-            assert!(settle(true, false, &mut streak));
-        }
-        assert!(!settle(true, false, &mut streak));
-        assert!(settle(true, true, &mut streak));
-        assert_eq!(streak, 0);
     }
 }
