@@ -2,6 +2,7 @@
 
 use std::cell::RefMut;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -283,13 +284,9 @@ pub(super) async fn write_loop(
                             link.mark_migrating(slot);
                             // otherwise the client retries and this slot takes the gated path
                             if rerunnable(&link, seq) {
-                                let gate = Rc::new(Notify::new());
-                                link.gate_slots(&[slot], &gate);
-                                let (s, q, l) = (shared.clone(), reply_q.clone(), link.clone());
-                                // detached: bounded by backend replies, aborted at teardown
-                                let task = tokio::task::spawn_local(async move {
-                                    let (shared, reply_q, link) = (s, q, l);
-                                    let lane = link.lane_with(client_id, db);
+                                let shared = shared.clone();
+                                let lane = link.lane_with(client_id, db);
+                                ride(&link, &reply_q, seq, slot, async move {
                                     // an atomic migration hands the slot over whole: ride it out
                                     // first; split only if the keys really sit on two nodes
                                     let (whole, _) = follow_slot(
@@ -327,11 +324,8 @@ pub(super) async fn write_loop(
                                             cache.invalidate(k)
                                         });
                                     }
-                                    link.release_gates(&[slot]);
-                                    gate.notify_waiters();
-                                    let _ = reply_q.send(Reply::At(seq, reply));
+                                    reply
                                 });
-                                link.track(seq, task);
                                 continue;
                             }
                         }
@@ -490,8 +484,8 @@ fn take_bounce(link: &WriterLink, seq: u64) -> Option<(Retry, u16, u8)> {
     Some(((entry.frame.clone(), entry.expect, fill), slot, db))
 }
 
-// gates the slot and rides the change out on a detached task; the answer lands at the
-// request's own sequence, a redirect never
+// rides a topology change out: the request follows the slot, a script it needs is reloaded
+// where it landed, and a redirect never reaches the client
 fn ride_out(
     shared: &Rc<Shared>,
     reply_q: &Rc<ReplyQueue>,
@@ -500,13 +494,9 @@ fn ride_out(
     reply: Bytes,
     retry: Retry,
 ) {
-    let gate = Rc::new(Notify::new());
-    link.gate_slots(&[slot], &gate);
-    let (s, q, l) = (shared.clone(), reply_q.clone(), link.clone());
-    // detached: bounded by the hops and one backend reply each, aborted at teardown
-    let task = tokio::task::spawn_local(async move {
-        let (shared, reply_q, link) = (s, q, l);
-        let lane = link.lane_with(client_id, db);
+    let shared = shared.clone();
+    let lane = link.lane_with(client_id, db);
+    ride(link, reply_q, seq, slot, async move {
         let req = retry.0.clone();
         let (mut reply, last) = follow_slot(&shared, lane, slot, reply, retry).await;
         if reply.starts_with(NOSCRIPT)
@@ -519,10 +509,30 @@ fn ride_out(
         if parse_redirect(&reply).is_some() {
             reply = Bytes::from_static(ERR_TRYAGAIN);
         }
-        link.release_gates(&[slot]);
-        gate.notify_waiters();
-        let _ = reply_q.send(Reply::At(seq, reply));
+        reply
     });
+}
+
+// runs `work` on a detached task gated on `slot`: its answer lands at `seq`, later commands
+// of the slot wait for it, and teardown aborts it like a blocking command
+fn ride(
+    link: &Rc<WriterLink>,
+    reply_q: &Rc<ReplyQueue>,
+    seq: u64,
+    slot: u16,
+    work: impl Future<Output = Bytes> + 'static,
+) {
+    let gate = Rc::new(Notify::new());
+    link.gate_slots(&[slot], &gate);
+    let task = {
+        let (link, reply_q) = (link.clone(), reply_q.clone());
+        tokio::task::spawn_local(async move {
+            let reply = work.await;
+            link.release_gates(&[slot]);
+            gate.notify_waiters();
+            let _ = reply_q.send(Reply::At(seq, reply));
+        })
+    };
     link.track(seq, task);
 }
 
@@ -544,7 +554,7 @@ async fn follow_slot(
     slot: u16,
     mut reply: Bytes,
     (req, _, fill): Retry,
-) -> (Bytes, Option<(bool, String)>) {
+) -> (Bytes, Option<Hop>) {
     if let Some(fill) = fill
         && let Some(cache) = &shared.cache
     {
@@ -553,10 +563,10 @@ async fn follow_slot(
     let mut last = None;
     let mut wait = REDIRECT_WAIT;
     for _ in 0..REDIRECT_HOPS {
-        let (ask, target) = match parse_redirect(&reply) {
-            Some((ask, target)) => (ask, target.to_owned()),
+        let (ask, target): Hop = match parse_redirect(&reply) {
+            Some((ask, target)) => (ask, Box::from(target)),
             None if reply.starts_with(b"-TRYAGAIN") => match shared.topo.load().owner_addr(slot) {
-                Some(addr) => (false, addr.to_owned()),
+                Some(addr) => (false, Box::from(addr)),
                 None => break,
             },
             None => break,

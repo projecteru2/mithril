@@ -739,12 +739,7 @@ def test_multikey_survives_a_migrating_slot(r, cluster_direct, key_prefix):
     a, b, other = f"{{{key_prefix}}}a", f"{{{key_prefix}}}b", f"{key_prefix}:other"
     slot = key_slot(a.encode())
     assert key_slot(other.encode()) != slot
-    src_node = cluster_direct.get_node_from_key(a)
-    dst_node = next(
-        n for n in cluster_direct.get_primaries() if (n.host, n.port) != (src_node.host, src_node.port)
-    )
-    src = redis.Redis(host=src_node.host, port=src_node.port, decode_responses=True)
-    dst = redis.Redis(host=dst_node.host, port=dst_node.port, decode_responses=True)
+    src_node, dst_node, src, dst = _shard_pair(cluster_direct, a)
     src_id = src.execute_command("CLUSTER MYID")
     dst_id = dst.execute_command("CLUSTER MYID")
     assert r.mset({a: "1", b: "2", other: "3"})
@@ -781,6 +776,26 @@ def test_multikey_survives_a_migrating_slot(r, cluster_direct, key_prefix):
         dst.close()
 
 
+def _shard_pair(cluster_direct, key):
+    """The master owning `key` and another master, as nodes and as direct clients."""
+    src_node = cluster_direct.get_node_from_key(key)
+    dst_node = next(
+        n for n in cluster_direct.get_primaries() if (n.host, n.port) != (src_node.host, src_node.port)
+    )
+    src = redis.Redis(host=src_node.host, port=src_node.port, decode_responses=True)
+    dst = redis.Redis(host=dst_node.host, port=dst_node.port, decode_responses=True)
+    return src_node, dst_node, src, dst
+
+
+def _until(cond, seconds=30):
+    deadline = time.time() + seconds
+    while not cond():
+        if time.time() > deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
 def _migrate_slot(source, target, slot, probe):
     """Atomic slot migration of `slot` to `target`, waited until `source` redirects."""
     if "valkey_version" in target.info("server"):
@@ -808,12 +823,7 @@ def test_atomic_slot_migration_under_traffic(r, cluster_direct, new_conn, key_pr
     counter = f"{{{key_prefix}}}:n"
     keys = [f"{{{key_prefix}}}:{i}" for i in range(20000)]
     slot = key_slot(counter.encode())
-    src_node = cluster_direct.get_node_from_key(counter)
-    dst_node = next(
-        n for n in cluster_direct.get_primaries() if (n.host, n.port) != (src_node.host, src_node.port)
-    )
-    src = redis.Redis(host=src_node.host, port=src_node.port, decode_responses=True)
-    dst = redis.Redis(host=dst_node.host, port=dst_node.port, decode_responses=True)
+    _, _, src, dst = _shard_pair(cluster_direct, counter)
     bulk = new_conn()
     pipe = bulk.pipeline(transaction=False)
     for k in keys:
@@ -857,12 +867,7 @@ def test_mset_stays_atomic_under_slot_migration(r, cluster_direct, new_conn, key
     _needs(cluster_direct, (8, 4))
     a, b, probe = f"{{{key_prefix}}}:ma", f"{{{key_prefix}}}:mb", f"{{{key_prefix}}}:mp"
     slot = key_slot(probe.encode())
-    src_node = cluster_direct.get_node_from_key(probe)
-    dst_node = next(
-        n for n in cluster_direct.get_primaries() if (n.host, n.port) != (src_node.host, src_node.port)
-    )
-    src = redis.Redis(host=src_node.host, port=src_node.port, decode_responses=True)
-    dst = redis.Redis(host=dst_node.host, port=dst_node.port, decode_responses=True)
+    _, _, src, dst = _shard_pair(cluster_direct, probe)
     assert r.set(probe, "p")
     assert r.mset({a: "0", b: "0"})
     stop, errors, torn, rounds = threading.Event(), [], [], [0]
@@ -930,19 +935,14 @@ def test_keyless_write_rides_out_a_failover(r, cluster_direct, new_conn, key_pre
                 errors.append(repr(e))
 
     def role_is(node, role):
-        for _ in range(600):
-            if node.info("replication")["role"] == role:
-                return True
-            time.sleep(0.05)
-        return False
+        return _until(lambda: node.info("replication")["role"] == role)
 
     def synced(node):
-        for _ in range(600):
+        def caught_up():
             info = node.info("replication")
-            if info.get("master_link_status") == "up" and not info.get("master_sync_in_progress"):
-                return True
-            time.sleep(0.05)
-        return False
+            return info.get("master_link_status") == "up" and not info.get("master_sync_in_progress")
+
+        return _until(caught_up)
 
     assert synced(replica), "the replica never caught up with its master"
     worker = threading.Thread(target=churn)
@@ -972,12 +972,7 @@ def test_evalsha_reloads_after_a_redirect(r, cluster_direct, key_prefix):
     _needs(cluster_direct, (8, 4))
     key = f"{key_prefix}:reload"
     slot = key_slot(key.encode())
-    src_node = cluster_direct.get_node_from_key(key)
-    dst_node = next(
-        n for n in cluster_direct.get_primaries() if (n.host, n.port) != (src_node.host, src_node.port)
-    )
-    src = redis.Redis(host=src_node.host, port=src_node.port, decode_responses=True)
-    dst = redis.Redis(host=dst_node.host, port=dst_node.port, decode_responses=True)
+    _, _, src, dst = _shard_pair(cluster_direct, key)
     sha = r.script_load("return redis.call('set', KEYS[1], ARGV[1])")
     assert r.evalsha(sha, 1, key, "v1") == "OK"
     try:
@@ -1887,12 +1882,7 @@ def test_sharded_channel_follows_its_slot_away(cluster_direct, raw_socket, key_p
     _needs(cluster_direct, (7, 0))
     ch = f"{key_prefix}:{{mv}}:news"
     slot = key_slot(ch.encode())
-    src_node = cluster_direct.get_node_from_key(ch)
-    dst_node = next(
-        n for n in cluster_direct.get_primaries() if (n.host, n.port) != (src_node.host, src_node.port)
-    )
-    src = redis.Redis(host=src_node.host, port=src_node.port, decode_responses=True)
-    dst = redis.Redis(host=dst_node.host, port=dst_node.port, decode_responses=True)
+    _, _, src, dst = _shard_pair(cluster_direct, ch)
     src_id, dst_id = src.execute_command("CLUSTER MYID"), dst.execute_command("CLUSTER MYID")
     s = raw_socket()
     reader = _RespReader(s)

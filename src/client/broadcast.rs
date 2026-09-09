@@ -4,8 +4,6 @@ use std::rc::Rc;
 
 use bytes::Bytes;
 
-use tokio::sync::oneshot;
-
 use super::pipe::{recv_or_lost, scatter_one};
 use super::session::Session;
 use super::writer::{REDIRECT_HOPS, REDIRECT_WAIT};
@@ -49,8 +47,8 @@ impl Session {
         let link = self.link.clone();
         let topo = shared.topo.load_full();
         let lane = self.lane();
-        let all: Vec<u16> = match targets {
-            Targets::Masters => Vec::new(),
+        let nodes: Vec<u16> = match targets {
+            Targets::Masters => topo.masters.clone(),
             Targets::LiveNodes | Targets::AllNodes => {
                 let live_only = matches!(targets, Targets::LiveNodes);
                 (0..topo.nodes.len() as u16)
@@ -58,12 +56,8 @@ impl Session {
                     .collect()
             }
         };
-        let nodes: &[u16] = match targets {
-            Targets::Masters => &topo.masters,
-            _ => &all,
-        };
         let mut receivers = Vec::with_capacity(nodes.len());
-        for &i in nodes {
+        for &i in &nodes {
             let addr = &topo.nodes[i as usize].addr;
             receivers.push(scatter_one(&shared, addr, lane, None, frame.clone()).await);
         }
@@ -71,9 +65,12 @@ impl Session {
         // detached: the hold keeps later commands of the session behind it while its reader
         // still sees a hang-up, and teardown aborts it like a blocking command
         let task = tokio::task::spawn_local(async move {
-            let mut replies = collect(receivers).await;
+            let mut replies = Vec::with_capacity(receivers.len());
+            for rx in receivers {
+                replies.push(recv_or_lost(rx).await);
+            }
             if matches!(targets, Targets::Masters) {
-                ride_out_demoted(&shared, &topo, &topo.masters, lane, &frame, &mut replies).await;
+                ride_out_demoted(&shared, &topo, lane, &frame, &mut replies).await;
             }
             let merged = match gather {
                 Gather::Sum => multikey::merge_sum(replies.iter(), 0),
@@ -93,12 +90,11 @@ impl Session {
     }
 }
 
-// a leg answered READONLY is a master demoted since the last refresh: after a refresh its
+// a master leg answered READONLY was demoted since the last refresh: after a refresh its
 // shard's new master gets the request; the replies of the other legs stand
 async fn ride_out_demoted(
     shared: &Rc<Shared>,
     topo: &Topology,
-    nodes: &[u16],
     lane: Lane,
     frame: &Bytes,
     replies: &mut [Bytes],
@@ -116,23 +112,21 @@ async fn ride_out_demoted(
         tokio::time::sleep(wait).await;
         wait *= 2;
         let fresh = shared.topo.load_full();
+        let mut pending = Vec::with_capacity(demoted.len());
         for k in demoted {
-            let Some(slot) = topo.slots.iter().position(|&o| o == nodes[k]) else {
+            let Some(slot) = topo.slots.iter().position(|&o| o == topo.masters[k]) else {
                 continue;
             };
             let Some(addr) = fresh.owner_addr(slot as u16) else {
                 continue;
             };
-            let rx = scatter_one(shared, addr, lane, None, frame.clone()).await;
+            pending.push((
+                k,
+                scatter_one(shared, addr, lane, None, frame.clone()).await,
+            ));
+        }
+        for (k, rx) in pending {
             replies[k] = recv_or_lost(rx).await;
         }
     }
-}
-
-async fn collect(receivers: Vec<oneshot::Receiver<Bytes>>) -> Vec<Bytes> {
-    let mut replies = Vec::with_capacity(receivers.len());
-    for rx in receivers {
-        replies.push(recv_or_lost(rx).await);
-    }
-    replies
 }

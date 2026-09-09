@@ -32,7 +32,6 @@ pub(super) struct InFlight {
 // sequences are allocated monotonically, so the ring stays sorted
 pub(super) type InflightRing = RefCell<VecDeque<InFlight>>;
 
-// a redirect's target and whether it was ASK
 pub(super) type Hop = (bool, Box<str>);
 
 // state shared between a session's reader, writer, and pubsub relay

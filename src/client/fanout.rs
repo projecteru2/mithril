@@ -214,8 +214,8 @@ impl Session {
         let shared = self.shared.clone();
         let reply_q = self.reply_q.clone();
         let lane = self.lane();
-        // detached deliberately: completion is bounded by backend replies
-        tokio::task::spawn_local(async move {
+        // detached: bounded by backend replies, aborted at teardown
+        let task = tokio::task::spawn_local(async move {
             let topo = shared.topo.load_full();
             if master_idx >= topo.masters.len() {
                 let done = multikey::rebuild_scan_reply(0, b"*0\r\n");
@@ -250,6 +250,7 @@ impl Session {
             };
             let _ = reply_q.send(Reply::At(seq, out));
         });
+        self.link.track(seq, task);
     }
 
     async fn fan_out_resume(
@@ -445,8 +446,8 @@ impl Session {
         let reply_q = self.reply_q.clone();
         // the lane is snapshotted here: a later SELECT must not move these parts
         let lane = self.lane();
-        // detached deliberately: completion is bounded by backend replies
-        tokio::task::spawn_local(async move {
+        // detached: bounded by backend replies, aborted at teardown
+        let task = tokio::task::spawn_local(async move {
             let _marks = marks;
             let mut results: Vec<(Vec<usize>, Bytes)> = Vec::with_capacity(parts.len());
             let mut retries: Vec<(multikey::Part, oneshot::Receiver<Bytes>)> = Vec::new();
@@ -508,6 +509,7 @@ impl Session {
             gate.notify_waiters();
             let _ = reply_q.send(Reply::At(seq, singles.merge(total, &results)));
         });
+        self.link.track(seq, task);
     }
 }
 
