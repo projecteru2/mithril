@@ -41,11 +41,11 @@ microseconds, up to 32 arguments of up to 128 bytes, client address, client
 name). The log is off by default (`-1`): timing every command costs a clock
 read and a queue entry per command, measured at about 1% of peak throughput,
 so it is switched on when needed, at runtime or in the config file; `10000`
-is Redis's 10 ms, `0` keeps every command. Every accepted command is timed from the
-moment it is read to the moment its first reply is queued for the client:
-routed, fanned out, cluster-wide, run through a WATCH, answered by the
-proxy or served from the reply cache alike; only a blocking command, whose
-wait is the client's own, is left out. A transaction is one
+is Redis's 10 ms, `0` keeps every command. While it is on, every accepted
+command is timed from the moment it is read to the moment its first reply
+is queued for the client: routed, fanned out, cluster-wide, run through a
+WATCH, answered by the proxy or served from the reply cache alike; only a
+blocking command, whose wait is the client's own, is left out. A transaction is one
 entry named `exec`; the arguments of AUTH and HELLO, the rules of ACL SETUSER
 and the password values of a CONFIG SET read `(redacted)`.
 SLOWLOG answers once the session's earlier replies have settled into the
