@@ -1325,7 +1325,7 @@ def test_info_counts_commands_and_client_list_names_the_last(r, new_conn, key_pr
 def test_slowlog_keeps_commands_over_the_threshold(r, new_conn, key_prefix):
     k = f"{key_prefix}:slow"
     assert r.config_set("slowlog-log-slower-than", 0)
-    assert r.config_set("slowlog-max-len", 8)
+    assert r.config_set("slowlog-max-len", 64)
     try:
         assert r.slowlog_reset()
         c = new_conn()
