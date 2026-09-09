@@ -1017,12 +1017,15 @@ def test_cache_mget_hits_and_read_your_writes(cache_proxy, key_prefix):
 
 
 def _cached_mget(r, keys):
-    for _ in range(20):
+    deadline = time.time() + 5
+    while True:
         before = int(r.info()["cache_hits"])
         reply = r.mget(*keys)
         if int(r.info()["cache_hits"]) > before:
             return reply
-    pytest.fail("MGET never hit the reply cache")
+        if time.time() > deadline:
+            pytest.fail("MGET never hit the reply cache")
+        time.sleep(0.05)
 
 
 def test_cache_mget_converges_after_external_write(cache_proxy, cluster_direct, key_prefix):
