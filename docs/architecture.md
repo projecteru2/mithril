@@ -50,10 +50,13 @@ binary search, retries it transparently against the named target (with
 `ASKING` when required), and the client never sees a redirect — an
 unretryable one is converted to `-TRYAGAIN`.
 
-A slot under migration answers a multi-key request with `-TRYAGAIN` once
-its keys are split across source and target. The request is then re-issued
-key by key with the same command name — each single-key request follows
-`ASK` on its own, at most 256 in flight — and the replies merge as usual
+A slot under migration answers a multi-key request with `-TRYAGAIN`. The
+request is first retried whole with the redirect waits (2 ms, doubling, up
+to six), which carries it through an atomic migration's handoff with its
+atomicity intact; a `TRYAGAIN` that outlasts the waits means the keys are
+split across source and target, and the request is then re-issued key by
+key with the same command name — each single-key request follows `ASK` on
+its own, at most 256 in flight — and the replies merge as usual
 (MGET keeps every item, sums and OKs fold as they arrive). A fan-out part
 does this inside the fan-out task before its gate is released. A
 single-slot command does it from the writer only when nothing was

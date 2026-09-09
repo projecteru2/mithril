@@ -27,10 +27,12 @@ thread-per-core runtime and zero-copy frame forwarding.
   pipelining is preserved end to end
 - **Full cluster absorption** — slot routing with per-slot multi-key fan-out,
   transparent MOVED/ASK retry, multi-key commands that ride out a migrating
-  slot (a `TRYAGAIN` part is re-issued key by key), atomic slot migrations
-  ridden out through their handoff, all verified against live migrations,
-  Valkey 9 cluster databases (`SELECT n`), and single-virtual-node cluster
-  emulation so cluster-aware clients work unchanged against one endpoint
+  slot (a `TRYAGAIN` is retried whole through the handoff and split key by
+  key only if it persists), failovers ridden out (a keyless write answered
+  `READONLY` is resent to the shard's new master), all verified against live
+  migrations, Valkey 9 cluster databases (`SELECT n`), and
+  single-virtual-node cluster emulation so cluster-aware clients work
+  unchanged against one endpoint
 - **Reply cache** — optional worker-local GET/MGET cache kept coherent by the
   cluster itself: every backend connection redirects RESP3 key tracking to
   a per-worker tracker and opts each cached read in, so the servers
@@ -47,6 +49,10 @@ thread-per-core runtime and zero-copy frame forwarding.
   commands), `SCRIPT`/`FUNCTION` management is cluster-wide with `NOSCRIPT`
   reloads behind the client's back, and an ACL user table enforces command,
   key and channel rules per session
+- **Operable** — `INFO` with per-command call counts, per-worker and cluster
+  sections, `CLIENT LIST` with each connection's last command, `ACL LOG`, and
+  a proxy-side slow log (`SLOWLOG`, and `PSLOWLOG` across every node) with
+  thresholds changeable at runtime through `CONFIG SET`
 - **Fast** — on a 32-node cluster with 8-worker proxies, mithril with the
   reply cache leads every cell of an 8-cell memtier/redis-benchmark matrix
   against mt-proxy and predixy (pipeline 1 through 16, 64 B to 4 KiB values,

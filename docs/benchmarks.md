@@ -75,6 +75,14 @@ sliding-pipeline client at moderate concurrency on a partly idle proxy
 runs 14% slower than default, because the shared pipes cost a hop those
 sessions cannot hide. If that is your only workload, set `no`.
 
+Re-measured at v0.1.6 on the same rig (four rotated rounds, default /
+shard / auto): P16 1000 conns GET 5.55M / 8.87M / 8.76M and SET 5.54M /
+8.93M / 9.05M, P1 2000 conns GET 2.18M / 2.60M / 2.61M, the sliding
+memtier cell 4.39M / 3.56M / 3.70M — the picture above stands. Every batch
+since v0.1.5 was A/B-measured against its base on the default-mode P16
+1000-conns cell and sits within the A/A noise floor, so the release adds no
+per-request cost.
+
 ## Bare-metal reference (2026-08, 4-worker proxies, 6-node cluster)
 
 Method: memtier_benchmark on a 16-core bare-metal Linux host, cpuset-pinned

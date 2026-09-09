@@ -17,6 +17,20 @@ docker run --rm -p 7979:7979 ghcr.io/projecteru2/mithril \
 `announce-addr` must be an address clients can reach: it is what the cluster
 emulation advertises, and the sample config binds the wildcard address.
 
+## Release binaries
+
+Every GitHub release carries static Linux binaries (x86_64 and arm64, musl)
+and a macOS arm64 binary, each as a tarball with the sample config, plus a
+`checksums.txt`:
+
+```shell
+V=0.1.6
+curl -LO https://github.com/projecteru2/mithril/releases/download/v$V/mithril_${V}_Linux_x86_64.tar.gz
+curl -LO https://github.com/projecteru2/mithril/releases/download/v$V/checksums.txt
+grep "mithril_${V}_Linux_x86_64" checksums.txt | sha256sum -c
+tar xzf mithril_${V}_Linux_x86_64.tar.gz && ./mithril --version
+```
+
 ## Building from source
 
 Requires the Rust toolchain pinned in `rust-toolchain.toml` (rustup picks it
