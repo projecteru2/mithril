@@ -246,8 +246,7 @@ impl Session {
             .saturating_sub(self.link.emitted.get())
     }
 
-    // SLOWLOG reads the log once every earlier reply of the session has settled into it: on
-    // a tracked task behind the hold, so the reader still sees a hang-up meanwhile
+    // SLOWLOG reads the log once every earlier reply of the session has settled into it
     fn answer_slowlog(&self, frame: Bytes, argc: usize) {
         let seq = self.alloc_seq();
         let (shared, reply_q, link) =
