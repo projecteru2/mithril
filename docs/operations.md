@@ -2,9 +2,13 @@
 
 ## Observability
 
-`INFO` reports five sections. Counters are cumulative since start and
+`INFO` reports seven sections. Counters are cumulative since start and
 aggregated across workers; `worker_commands` breaks commands down per worker
-so placement skew is visible at a glance.
+so placement skew is visible at a glance. `total_commands_processed` and
+the `cmdstat_*` calls count accepted commands (known, well-formed,
+permitted); `total_error_replies` counts every error reply the proxy
+writes to a client, the servers' included. CLIENT LIST names each
+client's current command in `cmd`.
 
 | section | fields |
 |---|---|

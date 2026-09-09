@@ -337,6 +337,9 @@ pub(super) async fn write_loop(
                 {
                     fill.complete(cache, &frame);
                 }
+                if frame.first() == Some(&b'-') {
+                    stats::bump(&shared.wstats.errors);
+                }
                 if seq == next_emit {
                     link.proto_switches.apply(next_emit, &mut cur_proto);
                     ready.push(convert_nil(frame, cur_proto));

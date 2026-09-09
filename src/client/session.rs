@@ -260,7 +260,6 @@ impl Session {
     }
 
     pub(super) fn emit_error_frame(&self, frame: Bytes) {
-        stats::bump(&self.shared.wstats.errors);
         self.emit_local(frame);
     }
 
@@ -274,7 +273,6 @@ impl Session {
             self.closing.set(true);
             return;
         }
-        stats::bump(&self.shared.wstats.commands);
         if argc == 0 {
             return;
         }
@@ -326,6 +324,7 @@ impl Session {
                 .and_then(|sub| spec.subcommand(sub))
                 .map_or(spec.id, |sub| sub.id)
         };
+        stats::bump(&self.shared.wstats.commands);
         stats::bump(self.shared.wstats.calls.at(id));
         self.cmd.store(id, Ordering::Relaxed);
         if self.auto {

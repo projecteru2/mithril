@@ -81,7 +81,7 @@ See [`mithril.conf.sample`](mithril.conf.sample) and the
 make test lint fmt-check   # the CI gate
 ```
 
-The integration suite lives in [`it/`](it/): 95 dockerized tests driving a
+The integration suite lives in [`it/`](it/): 96 dockerized tests driving a
 real 3-master/3-replica cluster through the proxy with redis-py — including
 live slot migrations (legacy and atomic) under traffic — run against redis 6.2
 through 8.10 and valkey 9.1 in every mode combination (`backend-sharding`,
