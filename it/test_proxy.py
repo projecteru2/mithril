@@ -903,8 +903,9 @@ def test_mset_stays_atomic_under_slot_migration(r, cluster_direct, new_conn, key
 def test_keyless_write_rides_out_a_failover(r, cluster_direct, new_conn, key_prefix):
     _needs(cluster_direct, (7, 0))
     k = f"{key_prefix}:fo"
-    nodes = cluster_direct.nodes_manager.slots_cache[key_slot(k.encode())]
-    assert len(nodes) > 1, "the slot's master has no replica"
+    nodes = _slot_nodes(cluster_direct, key_slot(k.encode()))
+    if len(nodes) < 2:
+        pytest.skip("the slot's master has no replica")
     master = redis.Redis(host=nodes[0].host, port=nodes[0].port, decode_responses=True)
     replica = redis.Redis(host=nodes[1].host, port=nodes[1].port, decode_responses=True)
     lib = f"#!lua name={key_prefix.replace(':', '_')}\nredis.register_function('f_{key_prefix.replace(':', '_')}', function() return 1 end)"
@@ -944,6 +945,16 @@ def test_keyless_write_rides_out_a_failover(r, cluster_direct, new_conn, key_pre
         replica.close()
     assert errors == []
     assert loads[0] > 0
+
+
+def _slot_nodes(cluster_direct, slot):
+    deadline = time.time() + 10
+    while True:
+        nodes = cluster_direct.nodes_manager.slots_cache[slot]
+        if len(nodes) > 1 or time.time() > deadline:
+            return nodes
+        time.sleep(0.5)
+        cluster_direct.nodes_manager.initialize()
 
 
 def test_cache_mget_hits_and_read_your_writes(cache_proxy, key_prefix):
