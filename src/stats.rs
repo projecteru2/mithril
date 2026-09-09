@@ -225,11 +225,11 @@ fn slow_args(frame: &[u8]) -> Vec<u8> {
     let shown = args.len().min(SLOWLOG_ARGC_MAX);
     crate::resp::array_header(&mut out, shown);
     for (i, arg) in args.iter().take(shown).enumerate() {
-        if sensitive(&args, i) {
-            crate::resp::bulk(&mut out, b"(redacted)");
-        } else if i + 1 == SLOWLOG_ARGC_MAX && args.len() > SLOWLOG_ARGC_MAX {
+        if i + 1 == SLOWLOG_ARGC_MAX && args.len() > SLOWLOG_ARGC_MAX {
             let more = format!("... ({} more arguments)", args.len() - SLOWLOG_ARGC_MAX + 1);
             crate::resp::bulk(&mut out, more.as_bytes());
+        } else if sensitive(&args, i) {
+            crate::resp::bulk(&mut out, b"(redacted)");
         } else if arg.len() > SLOWLOG_ARG_MAX {
             let mut clipped = arg[..SLOWLOG_ARG_MAX].to_vec();
             clipped.extend_from_slice(
@@ -243,8 +243,6 @@ fn slow_args(frame: &[u8]) -> Vec<u8> {
     out
 }
 
-// a credential argument: everything after AUTH or HELLO, an ACL SETUSER rule, the value of a
-// password key in CONFIG SET
 fn sensitive(args: &[&[u8]], i: usize) -> bool {
     let is = |k: usize, name: &[u8]| args.get(k).is_some_and(|a| a.eq_ignore_ascii_case(name));
     if is(0, b"auth") || is(0, b"hello") {
@@ -331,6 +329,11 @@ mod tests {
         );
         assert!(text(&["config", "set", "loglevel", "debug"]).ends_with("$5\r\ndebug\r\n"));
         assert_eq!(text(&["multi"]), "*1\r\n$5\r\nmulti\r\n");
+        let mut rules = vec!["acl", "setuser", "bob"];
+        rules.extend(std::iter::repeat_n(">pw", 40));
+        let t = text(&rules);
+        assert!(t.ends_with("... (12 more arguments)\r\n"), "{t}");
+        assert_eq!(t.matches("(redacted)").count(), 28, "{t}");
         let mut blob = frame(&["multi"]).to_vec();
         blob.extend_from_slice(&frame(&["set", "k", "v"]));
         blob.extend_from_slice(&frame(&["exec"]));
