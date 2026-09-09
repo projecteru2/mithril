@@ -44,6 +44,7 @@ pub(super) struct Session {
     pub(super) shared: Rc<Shared>,
     pub(super) id: u64,
     cmd: Arc<AtomicU16>,
+    started_us: Cell<u64>,
     pub(super) reply_q: Rc<ReplyQueue>,
     pub(super) link: Rc<WriterLink>,
     pub(super) proto: Cell<u8>,
@@ -273,6 +274,12 @@ impl Session {
             self.closing.set(true);
             return;
         }
+        self.started_us
+            .set(if self.shared.stats.slowlog.threshold() >= 0 {
+                self.shared.stats.micros()
+            } else {
+                0
+            });
         if argc == 0 {
             return;
         }
@@ -395,7 +402,15 @@ impl Session {
                     cold.await;
                 }
             }
-            Kind::Local => self.handle_local(spec, frame, argc),
+            Kind::Local => {
+                let timed = (self.started_us.get() != 0).then(|| frame.clone());
+                self.handle_local(spec, frame, argc);
+                if let Some(frame) = timed {
+                    self.shared
+                        .stats
+                        .log_slow(self.id, self.started_us.get(), frame);
+                }
+            }
             Kind::Exec => {
                 if let Some(cold) = self.handle_exec() {
                     cold.await;
@@ -542,6 +557,7 @@ impl Session {
             fill,
             db: self.link.db.get(),
             target: None,
+            started_us: self.started_us.get(),
         });
     }
 
@@ -700,6 +716,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: SocketAddr, id: 
         shared: shared.clone(),
         id,
         cmd: listed.cmd.clone(),
+        started_us: Cell::new(0),
         reply_q: reply_q.clone(),
         link: link.clone(),
         proto: Cell::new(2),

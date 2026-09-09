@@ -10,7 +10,7 @@ use crate::command::{self, Spec};
 use crate::config::Config;
 use crate::crc16::{self, SLOTS};
 use crate::resp;
-use crate::stats::{self, ClientInfo, Stats};
+use crate::stats::{self, ClientInfo, SlowEntry, Stats};
 
 pub const SERVER_VERSION: &str = "7.4.0";
 
@@ -21,7 +21,7 @@ const CLUSTER_INFO: &str = "cluster_enabled:1\r\ncluster_state:ok\r\ncluster_slo
      cluster_slots_ok:16384\r\ncluster_slots_pfail:0\r\ncluster_slots_fail:0\r\n\
      cluster_known_nodes:1\r\ncluster_size:1\r\n";
 
-const CONFIG_KEYS: [&str; 20] = [
+const CONFIG_KEYS: [&str; 22] = [
     "bind",
     "port",
     "announce-addr",
@@ -42,7 +42,14 @@ const CONFIG_KEYS: [&str; 20] = [
     "loglevel",
     "acl-pubsub-default",
     "acllog-max-len",
+    "slowlog-log-slower-than",
+    "slowlog-max-len",
 ];
+
+/// Arguments SLOWLOG GET reproduces per entry; the rest is one summary, as in Redis.
+const SLOWLOG_ARGC_MAX: usize = 32;
+/// Bytes of one argument SLOWLOG GET reproduces; the rest is summarized, as in Redis.
+const SLOWLOG_ARG_MAX: usize = 128;
 
 pub fn ping(args: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -262,7 +269,7 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
     out
 }
 
-pub fn config_cmd(args: &[&[u8]], cfg: &Config, acl: &Acl) -> Vec<u8> {
+pub fn config_cmd(args: &[&[u8]], cfg: &Config, acl: &Acl, stats: &Stats) -> Vec<u8> {
     let mut out = Vec::new();
     if sub_is(args, 1, b"get") && args.len() == 3 {
         let want = args[2];
@@ -270,10 +277,10 @@ pub fn config_cmd(args: &[&[u8]], cfg: &Config, acl: &Acl) -> Vec<u8> {
         resp::array_header(&mut out, CONFIG_KEYS.iter().filter(wanted).count() * 2);
         for k in CONFIG_KEYS.iter().filter(wanted) {
             resp::bulk(&mut out, k.as_bytes());
-            resp::bulk(&mut out, config_value(cfg, acl, k).as_bytes());
+            resp::bulk(&mut out, config_value(cfg, acl, stats, k).as_bytes());
         }
     } else if sub_is(args, 1, b"set") && args.len() == 4 {
-        match config_set(acl, args[2], args[3]) {
+        match config_set(acl, stats, args[2], args[3]) {
             Ok(()) => out.extend_from_slice(resp::OK),
             Err(e) => resp::write_error(&mut out, &e),
         }
@@ -281,6 +288,80 @@ pub fn config_cmd(args: &[&[u8]], cfg: &Config, acl: &Acl) -> Vec<u8> {
         resp::write_error(&mut out, "ERR unsupported CONFIG subcommand");
     }
     out
+}
+
+/// SLOWLOG GET/LEN/RESET/HELP over the proxy's own slow log.
+pub fn slowlog_cmd(args: &[&[u8]], stats: &Stats) -> Vec<u8> {
+    let mut out = Vec::new();
+    let log = &stats.slowlog;
+    if sub_is(args, 1, b"get") && args.len() <= 3 {
+        let count = match args.get(2) {
+            None => Some(stats::SLOWLOG_GET_DEFAULT),
+            Some(arg) => match command::arg_int(arg) {
+                Some(-1) => Some(usize::MAX),
+                Some(n) if n >= 0 => Some(n as usize),
+                _ => None,
+            },
+        };
+        let Some(count) = count else {
+            resp::write_error(&mut out, "ERR count should be greater than or equal to -1");
+            return out;
+        };
+        let entries = log.newest(count);
+        resp::array_header(&mut out, entries.len());
+        for entry in &entries {
+            slow_entry(&mut out, entry);
+        }
+    } else if sub_is(args, 1, b"len") && args.len() == 2 {
+        resp::integer(&mut out, log.count() as i64);
+    } else if sub_is(args, 1, b"reset") && args.len() == 2 {
+        log.reset();
+        out.extend_from_slice(resp::OK);
+    } else if sub_is(args, 1, b"help") && args.len() == 2 {
+        status_array(
+            &mut out,
+            4,
+            [
+                "SLOWLOG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                "GET [<count>] -- Return the newest <count> entries, all for -1 (default 10).",
+                "LEN -- Return the number of entries.",
+                "RESET -- Drop every entry.",
+            ]
+            .into_iter(),
+        );
+    } else {
+        resp::write_error(
+            &mut out,
+            "ERR unknown subcommand or wrong number of arguments for 'SLOWLOG'",
+        );
+    }
+    out
+}
+
+fn slow_entry(out: &mut Vec<u8>, entry: &SlowEntry) {
+    out.extend_from_slice(b"*6\r\n");
+    resp::integer(out, entry.id as i64);
+    resp::integer(out, entry.at as i64);
+    resp::integer(out, entry.micros as i64);
+    let argc = resp::scan_int_line(&entry.frame, 1).map_or(0, |(n, _)| n.max(0) as usize);
+    let shown = argc.min(SLOWLOG_ARGC_MAX);
+    resp::array_header(out, shown);
+    for (i, arg) in resp::Args::new(&entry.frame, argc).take(shown).enumerate() {
+        if i + 1 == SLOWLOG_ARGC_MAX && argc > SLOWLOG_ARGC_MAX {
+            let more = format!("... ({} more arguments)", argc - SLOWLOG_ARGC_MAX + 1);
+            resp::bulk(out, more.as_bytes());
+        } else if arg.len() > SLOWLOG_ARG_MAX {
+            let mut clipped = arg[..SLOWLOG_ARG_MAX].to_vec();
+            clipped.extend_from_slice(
+                format!("... ({} more bytes)", arg.len() - SLOWLOG_ARG_MAX).as_bytes(),
+            );
+            resp::bulk(out, &clipped);
+        } else {
+            resp::bulk(out, arg);
+        }
+    }
+    resp::bulk(out, entry.addr.as_bytes());
+    resp::bulk(out, entry.name.as_bytes());
 }
 
 /// Emulated node id: 40 hex chars derived from the announce address.
@@ -365,9 +446,17 @@ fn yesno(v: bool) -> &'static str {
     if v { "yes" } else { "no" }
 }
 
-fn config_set(acl: &Acl, key: &[u8], value: &[u8]) -> Result<(), String> {
+fn config_set(acl: &Acl, stats: &Stats, key: &[u8], value: &[u8]) -> Result<(), String> {
     let value = String::from_utf8_lossy(value);
-    if key.eq_ignore_ascii_case(b"loglevel") {
+    if key.eq_ignore_ascii_case(b"slowlog-log-slower-than") {
+        let v = crate::config::parse_slower_than(&value).map_err(|e| format!("ERR {e}"))?;
+        stats.slowlog.slower_than.store(v, Ordering::Relaxed);
+    } else if key.eq_ignore_ascii_case(b"slowlog-max-len") {
+        let v = value.parse::<usize>().ok().filter(|v| *v <= 1_000_000).ok_or_else(|| {
+            "ERR CONFIG SET failed (possibly related to argument 'slowlog-max-len') - argument must be between 0 and 1000000 inclusive".to_string()
+        })?;
+        stats.slowlog.max_len.store(v, Ordering::Relaxed);
+    } else if key.eq_ignore_ascii_case(b"loglevel") {
         crate::log::set_level(crate::log::parse_level(&value).map_err(|e| format!("ERR {e}"))?);
     } else if key.eq_ignore_ascii_case(b"acl-pubsub-default") {
         acl.set_all_channels_default(match &*value {
@@ -385,8 +474,15 @@ fn config_set(acl: &Acl, key: &[u8], value: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn config_value<'a>(cfg: &'a Config, acl: &Acl, key: &str) -> Cow<'a, str> {
+fn config_value<'a>(cfg: &'a Config, acl: &Acl, stats: &Stats, key: &str) -> Cow<'a, str> {
     match key {
+        "slowlog-log-slower-than" => stats.slowlog.threshold().to_string().into(),
+        "slowlog-max-len" => stats
+            .slowlog
+            .max_len
+            .load(Ordering::Relaxed)
+            .to_string()
+            .into(),
         "bind" => Cow::Borrowed(&cfg.bind),
         "port" => cfg.port.to_string().into(),
         "announce-addr" => Cow::Borrowed(&cfg.announce_addr),
@@ -434,10 +530,11 @@ mod tests {
         let mut cfg = test_cfg();
         cfg.requirepass = "x".to_string();
         let acl = Acl::new(&cfg).unwrap();
+        let stats = crate::stats::Stats::new(1);
         for key in CONFIG_KEYS {
-            assert!(!config_value(&cfg, &acl, key).is_empty(), "{key}");
+            assert!(!config_value(&cfg, &acl, &stats, key).is_empty(), "{key}");
         }
-        assert!(config_value(&cfg, &acl, "no-such-key").is_empty());
+        assert!(config_value(&cfg, &acl, &stats, "no-such-key").is_empty());
     }
 
     #[test]
@@ -504,6 +601,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn slowlog_get_reproduces_and_clips_arguments() {
+        let stats = crate::stats::Stats::new(1);
+        stats.slowlog.slower_than.store(0, Ordering::Relaxed);
+        let long = "x".repeat(SLOWLOG_ARG_MAX + 5);
+        let mut wide: Vec<&str> = vec!["mget"];
+        wide.extend(std::iter::repeat_n("k", SLOWLOG_ARGC_MAX + 3));
+        for args in [vec!["set", "k", long.as_str()], wide] {
+            let mut out = Vec::new();
+            let raw: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
+            resp::write_command(&mut out, &raw);
+            stats.log_slow(1, 1, bytes::Bytes::from(out));
+        }
+        let text =
+            String::from_utf8_lossy(&slowlog_cmd(&[b"slowlog", b"get"], &stats)).into_owned();
+        assert!(text.starts_with("*2\r\n*6\r\n:1\r\n"), "{text}");
+        assert!(text.contains("... (5 more bytes)\r\n"), "{text}");
+        assert!(text.contains("*32\r\n"), "{text}");
+        assert!(text.contains("... (5 more arguments)\r\n"), "{text}");
+        assert!(text.ends_with("$0\r\n\r\n$0\r\n\r\n"), "{text}");
+        assert_eq!(slowlog_cmd(&[b"slowlog", b"len"], &stats), b":2\r\n");
+        assert_eq!(
+            slowlog_cmd(&[b"slowlog", b"get", b"1"], &stats)[..4],
+            b"*1\r\n"[..]
+        );
+        assert!(slowlog_cmd(&[b"slowlog", b"get", b"-2"], &stats).starts_with(b"-ERR count"));
+        assert_eq!(slowlog_cmd(&[b"slowlog", b"reset"], &stats), b"+OK\r\n");
+        assert_eq!(slowlog_cmd(&[b"slowlog", b"len"], &stats), b":0\r\n");
+        assert!(slowlog_cmd(&[b"slowlog", b"help"], &stats).starts_with(b"*4\r\n+SLOWLOG"));
+    }
+
+    #[test]
+    fn config_set_moves_the_slowlog_thresholds() {
+        let cfg = test_cfg();
+        let acl = Acl::new(&cfg).unwrap();
+        let stats = crate::stats::Stats::new(1);
+        assert_eq!(
+            config_cmd(
+                &[b"config", b"set", b"slowlog-log-slower-than", b"-1"],
+                &cfg,
+                &acl,
+                &stats
+            ),
+            b"+OK\r\n"
+        );
+        assert_eq!(stats.slowlog.threshold(), -1);
+        assert!(
+            config_cmd(
+                &[b"config", b"set", b"slowlog-log-slower-than", b"-2"],
+                &cfg,
+                &acl,
+                &stats
+            )
+            .starts_with(b"-ERR")
+        );
+        assert_eq!(
+            config_cmd(
+                &[b"config", b"set", b"slowlog-max-len", b"5"],
+                &cfg,
+                &acl,
+                &stats
+            ),
+            b"+OK\r\n"
+        );
+        assert!(
+            config_cmd(
+                &[b"config", b"set", b"slowlog-max-len", b"-1"],
+                &cfg,
+                &acl,
+                &stats
+            )
+            .starts_with(b"-ERR")
+        );
+        let get = |key: &[u8]| {
+            String::from_utf8_lossy(&config_cmd(&[b"config", b"get", key], &cfg, &acl, &stats))
+                .into_owned()
+        };
+        assert!(get(b"slowlog-log-slower-than").ends_with("$2\r\n-1\r\n"));
+        assert!(get(b"slowlog-max-len").ends_with("$1\r\n5\r\n"));
+    }
+
     fn test_cfg() -> Config {
         let mut cfg = Config::default();
         cfg.set("bootstrap", "127.0.0.1:7001").unwrap();
@@ -537,7 +715,8 @@ mod tests {
         let mut cfg = test_cfg();
         cfg.requirepass = "secret".to_string();
         let acl = Acl::new(&cfg).unwrap();
-        let reply = config_cmd(&[b"config", b"get", b"requirepass"], &cfg, &acl);
+        let stats = crate::stats::Stats::new(1);
+        let reply = config_cmd(&[b"config", b"get", b"requirepass"], &cfg, &acl, &stats);
         let text = String::from_utf8_lossy(&reply);
         assert!(!text.contains("secret"), "{text}");
     }

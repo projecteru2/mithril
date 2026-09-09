@@ -41,8 +41,8 @@ memtier_benchmark, redis-benchmark.
 - Aggregate replies to RESP3 clients keep RESP2 shape (flat arrays, not
   maps); every mainstream client parses by wire type and accepts this.
 - Pubsub delivery to a slow subscriber is windowed (4096 pushes).
-- Config hot-reload covers `loglevel` only; CONFIG SET rejects every other
-  parameter.
+- Config hot-reload covers `loglevel`, `acl-pubsub-default`, `acllog-max-len`
+  and the two `slowlog-*` keys; CONFIG SET rejects every other parameter.
 - SCRIPT KILL, SCRIPT DEBUG and FUNCTION KILL are not proxied. The
   transparent reload on `NOSCRIPT` covers scripts the proxy loaded itself,
   redirected or not, and only while nothing later from the same session is
@@ -82,5 +82,5 @@ memtier_benchmark, redis-benchmark.
   unknown-command. OBJECT routes by its key.
 - CLIENT supports ID, SETNAME, GETNAME and LIST (id, addr, fd, name, age,
   cmd).
-- No TLS, no unix-domain listener, no slowlog, no keyspace notifications,
+- No TLS, no unix-domain listener, no keyspace notifications,
   no Prometheus endpoint (stats via INFO).

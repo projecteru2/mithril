@@ -96,6 +96,8 @@ pub struct Config {
     pub query_buffer_limit: usize,
     pub topology_refresh_secs: u64,
     pub loglevel: u8,
+    pub slowlog_log_slower_than: i64,
+    pub slowlog_max_len: usize,
 }
 
 impl Default for Config {
@@ -125,6 +127,8 @@ impl Default for Config {
             query_buffer_limit: 1024 * 1024 * 1024,
             topology_refresh_secs: 15,
             loglevel: crate::log::NOTICE,
+            slowlog_log_slower_than: 10_000,
+            slowlog_max_len: 128,
         }
     }
 }
@@ -189,6 +193,8 @@ impl Config {
                 self.topology_refresh_secs = parse_bounded(key, value, 1, 3600)? as u64;
             }
             "loglevel" => self.loglevel = crate::log::parse_level(value)?,
+            "slowlog-log-slower-than" => self.slowlog_log_slower_than = parse_slower_than(value)?,
+            "slowlog-max-len" => self.slowlog_max_len = parse_bounded(key, value, 0, 1_000_000)?,
             _ => return Err(format!("unknown parameter '{key}'")),
         }
         Ok(())
@@ -219,6 +225,15 @@ fn parse<T: std::str::FromStr>(key: &str, value: &str) -> Result<T, String> {
     value
         .parse()
         .map_err(|_| format!("bad value for '{key}': {value}"))
+}
+
+/// Microseconds from which a command is logged; -1 disables the slow log.
+pub fn parse_slower_than(value: &str) -> Result<i64, String> {
+    value
+        .parse::<i64>()
+        .ok()
+        .filter(|v| *v >= -1)
+        .ok_or_else(|| "slowlog-log-slower-than: expected an integer >= -1".to_string())
 }
 
 fn parse_bounded(key: &str, value: &str, min: usize, max: usize) -> Result<usize, String> {

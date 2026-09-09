@@ -38,7 +38,7 @@ KIND = {
     "scan": "Scan", "dbsize": "Dbsize", "flushall": "Flushall", "exec": "Exec", "select": "Select",
     "script": "Script", "function": "Script",
     **{n: "Local" for n in ["acl", "auth", "client", "cluster", "command", "config", "discard", "echo",
-                            "hello", "info", "multi", "ping", "quit", "reset", "time"]},
+                            "hello", "info", "multi", "ping", "quit", "reset", "slowlog", "time"]},
 }
 MFLAGS = {
     "get": ["C"], "mget": ["C"], "eval": ["W"], "evalsha": ["W"], "fcall": ["W"], "sort": ["S"], "georadius": ["S"], "georadiusbymember": ["S"], "pfcount": ["U"],
@@ -55,7 +55,7 @@ SKIP = {
     "asking", "bgrewriteaof", "bgsave", "clusterscan", "commandlog", "debug", "failover", "flushdb",
     "keys", "lastsave", "latency", "lolwut", "memory", "migrate", "module", "monitor",
     "move", "pfdebug", "pfselftest", "psync", "readonly", "readwrite", "replconf", "replicaof",
-    "restore-asking", "role", "save", "shutdown", "slaveof", "slowlog",
+    "restore-asking", "role", "save", "shutdown", "slaveof",
     "swapdb", "sync", "wait", "waitaof",
     "ts.mget", "ts.mrange", "ts.mrevrange", "ts.queryindex",
 }

@@ -27,6 +27,8 @@ pub(super) struct InFlight {
     pub(super) db: u8,
     // where a redirect sent the request and whether it was ASK, for a reload there
     pub(super) target: Option<Hop>,
+    // when the slow log is on, the microsecond the command was read; 0 otherwise
+    pub(super) started_us: u64,
 }
 
 // sequences are allocated monotonically, so the ring stays sorted

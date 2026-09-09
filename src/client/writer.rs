@@ -394,6 +394,9 @@ pub(super) async fn write_loop(
                     link.fills_armed.set(link.fills_armed.get() - 1);
                     fill.abandon(cache);
                 }
+                if e.started_us != 0 {
+                    shared.stats.log_slow(client_id, e.started_us, e.frame);
+                }
             }
             swept_to = next_emit;
         }

@@ -151,6 +151,14 @@ pub fn run(cfg: Config) -> Result<(), String> {
     crate::log::set_level(cfg.loglevel);
     let cfg = Arc::new(cfg);
     let stats = Stats::new(cfg.workers);
+    stats
+        .slowlog
+        .slower_than
+        .store(cfg.slowlog_log_slower_than, Ordering::Relaxed);
+    stats
+        .slowlog
+        .max_len
+        .store(cfg.slowlog_max_len, Ordering::Relaxed);
     let started = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

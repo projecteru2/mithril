@@ -28,8 +28,19 @@ The lifecycle counters exist for deploy verification: after a binary swap,
 actually serving — a lesson from a benchmark campaign where three different
 deploy-chain failures each silently kept an old binary running.
 
-`CONFIG SET loglevel <level>` changes log verbosity at runtime; every other
+`CONFIG SET` changes `loglevel`, `acl-pubsub-default`, `acllog-max-len`,
+`slowlog-log-slower-than` and `slowlog-max-len` at runtime; every other
 parameter requires a restart.
+
+The proxy keeps its own slow log: a command whose reply took at least
+`slowlog-log-slower-than` microseconds from the moment it was read to the
+moment its reply was queued for the client (the backend round trip included)
+is kept, newest `slowlog-max-len` entries, and `SLOWLOG GET [count]`,
+`SLOWLOG LEN` and `SLOWLOG RESET` read it in the Redis format (id, unix time,
+microseconds, up to 32 arguments of up to 128 bytes, client address, client
+name). The default threshold is 10 ms as in Redis; `-1` switches timing
+off, `0` keeps every command. Commands the proxy answers itself are timed
+too; a blocking command, a pubsub command and a cluster-wide command are not.
 
 ## Shutdown
 

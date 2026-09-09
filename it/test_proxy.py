@@ -1322,6 +1322,42 @@ def test_info_counts_commands_and_client_list_names_the_last(r, new_conn, key_pr
     assert r.info("commandstats")["cmdstat_client|list"]["calls"] >= 1
 
 
+def test_slowlog_keeps_commands_over_the_threshold(r, new_conn, key_prefix):
+    k = f"{key_prefix}:slow"
+    assert r.config_set("slowlog-log-slower-than", 0)
+    assert r.config_set("slowlog-max-len", 8)
+    try:
+        assert r.slowlog_reset()
+        c = new_conn()
+        assert c.client_setname("slowprobe")
+        assert c.set(k, "v")
+        assert c.get(k) == "v"
+        entries = r.slowlog_get()
+        commands = [e["command"] for e in entries]
+        assert f"get {k}" in commands and f"set {k} v" in commands
+        mine = next(e for e in entries if e["command"] == f"get {k}")
+        assert mine["client_name"] == "slowprobe"
+        assert ":" in mine["client_address"]
+        assert mine["duration"] >= 0
+        assert [e["id"] for e in entries] == sorted((e["id"] for e in entries), reverse=True)
+        assert r.slowlog_len() == len(entries)
+        assert r.config_set("slowlog-max-len", 2)
+        assert c.get(k) == "v"
+        assert r.slowlog_len() == 2
+        assert len(r.slowlog_get(1)) == 1
+        with pytest.raises(redis.exceptions.ResponseError):
+            r.execute_command("SLOWLOG", "GET", "-2")
+        assert r.config_set("slowlog-log-slower-than", -1)
+        assert r.slowlog_reset()
+        assert c.get(k) == "v"
+        assert r.slowlog_len() == 0
+        assert r.config_get("slowlog-log-slower-than") == {"slowlog-log-slower-than": "-1"}
+    finally:
+        r.config_set("slowlog-log-slower-than", 10000)
+        r.config_set("slowlog-max-len", 128)
+        r.delete(k)
+
+
 def test_register_script_round_trips(r, key_prefix):
     key = f"{key_prefix}:reg"
     script = r.register_script("return redis.call('incr', KEYS[1])")
