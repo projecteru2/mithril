@@ -18,6 +18,10 @@ pub const NO_COMMAND: u16 = u16::MAX;
 
 /// Newest entries SLOWLOG GET returns without a count.
 pub const SLOWLOG_GET_DEFAULT: usize = 10;
+/// Arguments a slow-log entry keeps; the rest is one summary, as in Redis.
+const SLOWLOG_ARGC_MAX: usize = 32;
+/// Bytes of one argument a slow-log entry keeps; the rest is summarized, as in Redis.
+const SLOWLOG_ARG_MAX: usize = 128;
 
 /// One worker's counters; padding keeps writers on distinct cachelines.
 #[repr(align(64))]
@@ -67,13 +71,14 @@ pub struct ClientInfo {
     pub cmd: Arc<AtomicU16>,
 }
 
-/// One command the slow log kept, as SLOWLOG GET reports it.
+/// One command the slow log kept, as SLOWLOG GET reports it; `args` is the RESP array of
+/// its clipped, redacted arguments.
 #[derive(Clone)]
 pub struct SlowEntry {
     pub id: u64,
     pub at: u64,
     pub micros: u64,
-    pub frame: Bytes,
+    pub args: Bytes,
     pub addr: Box<str>,
     pub name: Box<str>,
 }
@@ -101,7 +106,7 @@ impl Slowlog {
     }
 
     pub fn reset(&self) {
-        self.ring().0.clear();
+        self.ring().0 = VecDeque::new();
     }
 
     fn record(&self, mut entry: SlowEntry) {
@@ -179,7 +184,7 @@ impl Stats {
             id: 0,
             at,
             micros,
-            frame,
+            args: Bytes::from(slow_args(&frame)),
             addr,
             name,
         });
@@ -201,6 +206,59 @@ pub fn bump(counter: &AtomicU64) {
 /// Adds to a single-writer counter; cross-thread readers use relaxed loads.
 pub fn add(counter: &AtomicU64, n: u64) {
     counter.store(counter.load(Ordering::Relaxed) + n, Ordering::Relaxed);
+}
+
+// the entry keeps at most 32 arguments of 128 bytes, credentials replaced, and a MULTI blob
+// as the EXEC it stands for
+fn slow_args(frame: &[u8]) -> Vec<u8> {
+    let argc = crate::resp::scan_int_line(frame, 1).map_or(0, |(n, _)| n.max(0) as usize);
+    let args: Vec<&[u8]> = crate::resp::Args::new(frame, argc).collect();
+    let mut out = Vec::new();
+    if args.len() == 1 && args[0].eq_ignore_ascii_case(b"multi") {
+        crate::resp::write_command(&mut out, &[b"exec"]);
+        return out;
+    }
+    let keep = match args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
+        Some(b"auth" | b"hello") => 1,
+        Some(b"acl")
+            if args
+                .get(1)
+                .is_some_and(|a| a.eq_ignore_ascii_case(b"setuser")) =>
+        {
+            3
+        }
+        Some(b"config")
+            if args.get(1).is_some_and(|a| a.eq_ignore_ascii_case(b"set"))
+                && args.get(2).is_some_and(|k| {
+                    k.eq_ignore_ascii_case(b"requirepass")
+                        || k.eq_ignore_ascii_case(b"backend-auth-pass")
+                }) =>
+        {
+            3
+        }
+        _ => usize::MAX,
+    };
+    let shown = args.len().min(SLOWLOG_ARGC_MAX);
+    crate::resp::array_header(&mut out, if keep < args.len() { keep + 1 } else { shown });
+    for (i, arg) in args.iter().take(shown).enumerate() {
+        if i == keep {
+            crate::resp::bulk(&mut out, b"(redacted)");
+            break;
+        }
+        if i + 1 == SLOWLOG_ARGC_MAX && args.len() > SLOWLOG_ARGC_MAX {
+            let more = format!("... ({} more arguments)", args.len() - SLOWLOG_ARGC_MAX + 1);
+            crate::resp::bulk(&mut out, more.as_bytes());
+        } else if arg.len() > SLOWLOG_ARG_MAX {
+            let mut clipped = arg[..SLOWLOG_ARG_MAX].to_vec();
+            clipped.extend_from_slice(
+                format!("... ({} more bytes)", arg.len() - SLOWLOG_ARG_MAX).as_bytes(),
+            );
+            crate::resp::bulk(&mut out, &clipped);
+        } else {
+            crate::resp::bulk(&mut out, arg);
+        }
+    }
+    out
 }
 
 /// This thread's user+system CPU time in USER_HZ ticks; None where /proc is absent.
@@ -242,6 +300,40 @@ mod tests {
         assert_eq!(stats.slowlog.count(), 0);
         stats.log_slow(7, 1, frame(&["get", "d"]));
         assert_eq!(stats.slowlog.newest(10)[0].id, 3);
+    }
+
+    #[test]
+    fn slow_args_clip_redact_and_name_a_transaction() {
+        let text = |args: &[&str]| String::from_utf8_lossy(&slow_args(&frame(args))).into_owned();
+        let long = "x".repeat(SLOWLOG_ARG_MAX + 5);
+        assert!(text(&["set", "k", &long]).ends_with("... (5 more bytes)\r\n"));
+        let mut wide = vec!["mget"];
+        wide.extend(std::iter::repeat_n("k", SLOWLOG_ARGC_MAX + 3));
+        let t = text(&wide);
+        assert!(
+            t.starts_with("*32\r\n") && t.ends_with("... (5 more arguments)\r\n"),
+            "{t}"
+        );
+        assert_eq!(
+            text(&["AUTH", "user", "pw"]),
+            "*2\r\n$4\r\nAUTH\r\n$10\r\n(redacted)\r\n"
+        );
+        assert_eq!(
+            text(&["hello", "3", "auth", "u", "pw"]),
+            "*2\r\n$5\r\nhello\r\n$10\r\n(redacted)\r\n"
+        );
+        assert!(
+            text(&["acl", "setuser", "bob", ">pw"]).ends_with("$3\r\nbob\r\n$10\r\n(redacted)\r\n")
+        );
+        assert!(text(&["config", "set", "requirepass", "pw"]).ends_with("$10\r\n(redacted)\r\n"));
+        assert!(text(&["config", "set", "loglevel", "debug"]).ends_with("$5\r\ndebug\r\n"));
+        let mut blob = frame(&["multi"]).to_vec();
+        blob.extend_from_slice(&frame(&["set", "k", "v"]));
+        blob.extend_from_slice(&frame(&["exec"]));
+        assert_eq!(
+            String::from_utf8_lossy(&slow_args(&blob)),
+            "*1\r\n$4\r\nexec\r\n"
+        );
     }
 
     #[test]

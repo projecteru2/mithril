@@ -46,11 +46,6 @@ const CONFIG_KEYS: [&str; 22] = [
     "slowlog-max-len",
 ];
 
-/// Arguments SLOWLOG GET reproduces per entry; the rest is one summary, as in Redis.
-const SLOWLOG_ARGC_MAX: usize = 32;
-/// Bytes of one argument SLOWLOG GET reproduces; the rest is summarized, as in Redis.
-const SLOWLOG_ARG_MAX: usize = 128;
-
 pub fn ping(args: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::new();
     match args.len() {
@@ -343,23 +338,7 @@ fn slow_entry(out: &mut Vec<u8>, entry: &SlowEntry) {
     resp::integer(out, entry.id as i64);
     resp::integer(out, entry.at as i64);
     resp::integer(out, entry.micros as i64);
-    let argc = resp::scan_int_line(&entry.frame, 1).map_or(0, |(n, _)| n.max(0) as usize);
-    let shown = argc.min(SLOWLOG_ARGC_MAX);
-    resp::array_header(out, shown);
-    for (i, arg) in resp::Args::new(&entry.frame, argc).take(shown).enumerate() {
-        if i + 1 == SLOWLOG_ARGC_MAX && argc > SLOWLOG_ARGC_MAX {
-            let more = format!("... ({} more arguments)", argc - SLOWLOG_ARGC_MAX + 1);
-            resp::bulk(out, more.as_bytes());
-        } else if arg.len() > SLOWLOG_ARG_MAX {
-            let mut clipped = arg[..SLOWLOG_ARG_MAX].to_vec();
-            clipped.extend_from_slice(
-                format!("... ({} more bytes)", arg.len() - SLOWLOG_ARG_MAX).as_bytes(),
-            );
-            resp::bulk(out, &clipped);
-        } else {
-            resp::bulk(out, arg);
-        }
-    }
+    out.extend_from_slice(&entry.args);
     resp::bulk(out, entry.addr.as_bytes());
     resp::bulk(out, entry.name.as_bytes());
 }
@@ -602,13 +581,10 @@ mod tests {
     }
 
     #[test]
-    fn slowlog_get_reproduces_and_clips_arguments() {
+    fn slowlog_get_lists_the_kept_entries() {
         let stats = crate::stats::Stats::new(1);
         stats.slowlog.slower_than.store(0, Ordering::Relaxed);
-        let long = "x".repeat(SLOWLOG_ARG_MAX + 5);
-        let mut wide: Vec<&str> = vec!["mget"];
-        wide.extend(std::iter::repeat_n("k", SLOWLOG_ARGC_MAX + 3));
-        for args in [vec!["set", "k", long.as_str()], wide] {
+        for args in [["get", "a"], ["get", "b"]] {
             let mut out = Vec::new();
             let raw: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
             resp::write_command(&mut out, &raw);
@@ -617,9 +593,10 @@ mod tests {
         let text =
             String::from_utf8_lossy(&slowlog_cmd(&[b"slowlog", b"get"], &stats)).into_owned();
         assert!(text.starts_with("*2\r\n*6\r\n:1\r\n"), "{text}");
-        assert!(text.contains("... (5 more bytes)\r\n"), "{text}");
-        assert!(text.contains("*32\r\n"), "{text}");
-        assert!(text.contains("... (5 more arguments)\r\n"), "{text}");
+        assert!(
+            text.contains("*2\r\n$3\r\nget\r\n$1\r\nb\r\n$0\r\n\r\n$0\r\n\r\n"),
+            "{text}"
+        );
         assert!(text.ends_with("$0\r\n\r\n$0\r\n\r\n"), "{text}");
         assert_eq!(slowlog_cmd(&[b"slowlog", b"len"], &stats), b":2\r\n");
         assert_eq!(

@@ -93,8 +93,6 @@ impl Session {
     }
 }
 
-// a master leg answered READONLY was demoted since the last refresh: after a refresh its
-// shard's new master gets the request; the replies of the other legs stand
 fn per_node(topo: &Topology, nodes: &[u16], replies: &[Bytes]) -> Bytes {
     let mut out = Vec::new();
     resp::array_header(&mut out, replies.len());
@@ -106,6 +104,8 @@ fn per_node(topo: &Topology, nodes: &[u16], replies: &[Bytes]) -> Bytes {
     Bytes::from(out)
 }
 
+// a master leg answered READONLY was demoted since the last refresh: after a refresh its
+// shard's new master gets the request; the replies of the other legs stand
 async fn ride_out_demoted(
     shared: &Rc<Shared>,
     topo: &Topology,

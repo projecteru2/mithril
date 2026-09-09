@@ -30,6 +30,8 @@ backend-conns 1
 # user app on >secret ~app:* &* -@all +@read +@string
 # acl-pubsub-default allchannels
 # acllog-max-len 128
+# slowlog-log-slower-than 10000
+# slowlog-max-len 128
 # backend-auth-user default
 # backend-auth-pass secret
 

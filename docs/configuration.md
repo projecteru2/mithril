@@ -22,6 +22,8 @@ See [`mithril.conf.sample`](https://github.com/projecteru2/mithril/blob/master/m
 | `user` | line | none | an ACL user, repeatable: `user <name> <rules...>` in Redis ACL SETUSER syntax (`user app on >secret ~app:* &* -@all +@read +@string`); applied at startup, editable afterwards with ACL SETUSER |
 | `acl-pubsub-default` | enum | `allchannels` | channels a new or `reset` user starts with: `allchannels` or `resetchannels`; changeable at runtime via `CONFIG SET` |
 | `acllog-max-len` | 0..1000000 | `128` | entries kept by ACL LOG; changeable at runtime via `CONFIG SET` |
+| `slowlog-log-slower-than` | µs, -1 off | `10000` | a command whose reply took at least this long, from being read to being queued for the client, enters the slow log; `0` keeps every command; changeable at runtime via `CONFIG SET` |
+| `slowlog-max-len` | 0..1000000 | `128` | entries the slow log keeps, newest first; changeable at runtime via `CONFIG SET` |
 | `backend-auth-user` | string | empty | username sent to backends (`AUTH user pass`) |
 | `backend-auth-pass` | string | empty | password sent to backends |
 | `slave-mode` | enum | `off` | replica read splitting: `off`, `master_readwrite`, `master_writeonly` |

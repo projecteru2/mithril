@@ -1363,7 +1363,7 @@ def test_pslowlog_lists_every_node(r, cluster_direct):
     lens = r.execute_command("PSLOWLOG", "LEN")
     assert {addr for addr, _ in lens} == nodes
     assert all(isinstance(n, int) for _, n in lens)
-    assert {reply for _, reply in r.execute_command("PSLOWLOG", "RESET")} == {True}
+    assert {reply for _, reply in r.execute_command("PSLOWLOG", "RESET")} == {"OK"}
     got = r.execute_command("PSLOWLOG", "GET", "1")
     assert {addr for addr, _ in got} == nodes
     assert all(isinstance(entries, list) for _, entries in got)
