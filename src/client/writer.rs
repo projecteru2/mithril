@@ -394,8 +394,12 @@ pub(super) async fn write_loop(
                     link.fills_armed.set(link.fills_armed.get() - 1);
                     fill.abandon(cache);
                 }
-                if e.started_us != 0 {
-                    shared.stats.log_slow(client_id, e.started_us, e.frame);
+            }
+            drop(inf);
+            let mut timings = link.timings.borrow_mut();
+            while timings.front().is_some_and(|t| t.0 < next_emit) {
+                if let Some((_, started_us, frame)) = timings.pop_front() {
+                    shared.stats.log_slow(client_id, started_us, frame);
                 }
             }
             swept_to = next_emit;

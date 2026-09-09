@@ -45,6 +45,8 @@ pub(super) struct Session {
     pub(super) id: u64,
     cmd: Arc<AtomicU16>,
     started_us: Cell<u64>,
+    // the accepted command's request while the slow log is on, until its sequence is allocated
+    timed: Cell<Option<Bytes>>,
     pub(super) reply_q: Rc<ReplyQueue>,
     pub(super) link: Rc<WriterLink>,
     pub(super) proto: Cell<u8>,
@@ -248,6 +250,12 @@ impl Session {
         if !self.link.writer_blocked.get() {
             self.shared.inflight.set(self.shared.inflight.get() + 1);
         }
+        if let Some(frame) = self.timed.take() {
+            self.link
+                .timings
+                .borrow_mut()
+                .push_back((seq, self.started_us.get(), frame));
+        }
         seq
     }
 
@@ -334,6 +342,9 @@ impl Session {
         stats::bump(&self.shared.wstats.commands);
         stats::bump(self.shared.wstats.calls.at(id));
         self.cmd.store(id, Ordering::Relaxed);
+        self.timed.set(
+            (self.started_us.get() != 0 && spec.kind != Kind::Blocking).then(|| frame.clone()),
+        );
         if self.auto {
             self.adapt_pipes();
         }
@@ -402,15 +413,7 @@ impl Session {
                     cold.await;
                 }
             }
-            Kind::Local => {
-                let timed = (self.started_us.get() != 0).then(|| frame.clone());
-                self.handle_local(spec, frame, argc);
-                if let Some(frame) = timed {
-                    self.shared
-                        .stats
-                        .log_slow(self.id, self.started_us.get(), frame);
-                }
-            }
+            Kind::Local => self.handle_local(spec, frame, argc),
             Kind::Exec => {
                 if let Some(cold) = self.handle_exec() {
                     cold.await;
@@ -432,15 +435,7 @@ impl Session {
                     cold.await;
                 }
             }
-            Kind::Select => {
-                let timed = (self.started_us.get() != 0).then(|| frame.clone());
-                self.handle_select(frame, argc).await;
-                if let Some(frame) = timed {
-                    self.shared
-                        .stats
-                        .log_slow(self.id, self.started_us.get(), frame);
-                }
-            }
+            Kind::Select => self.handle_select(frame, argc).await,
             Kind::Eval => {
                 if let Some(cold) = self.forward_eval(frame, argc) {
                     cold.await;
@@ -580,7 +575,6 @@ impl Session {
             fill,
             db: self.link.db.get(),
             target: None,
-            started_us: self.started_us.get(),
         });
     }
 
@@ -740,6 +734,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: SocketAddr, id: 
         id,
         cmd: listed.cmd.clone(),
         started_us: Cell::new(0),
+        timed: Cell::new(None),
         reply_q: reply_q.clone(),
         link: link.clone(),
         proto: Cell::new(2),

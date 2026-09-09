@@ -27,8 +27,6 @@ pub(super) struct InFlight {
     pub(super) db: u8,
     // where a redirect sent the request and whether it was ASK, for a reload there
     pub(super) target: Option<Hop>,
-    // when the slow log is on, the microsecond the command was read; 0 otherwise
-    pub(super) started_us: u64,
 }
 
 // sequences are allocated monotonically, so the ring stays sorted
@@ -47,6 +45,8 @@ pub(super) struct WriterLink {
     pub(super) closed: Cell<bool>,
     // a cluster-wide command in flight: the reader keeps reading but dispatches nothing
     pub(super) hold: Cell<bool>,
+    // (sequence, microsecond read, request) of each timed command, in sequence order
+    pub(super) timings: RefCell<VecDeque<(u64, u64, Bytes)>>,
     pub(super) closed_notify: Notify,
     pub(super) proto_switches: ProtoSwitchQueue,
     pub(super) oob_budget: Cell<usize>,

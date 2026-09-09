@@ -1332,9 +1332,14 @@ def test_slowlog_keeps_commands_over_the_threshold(r, new_conn, key_prefix):
         assert c.client_setname("slowprobe")
         assert c.set(k, "v")
         assert c.get(k) == "v"
+        other = f"{key_prefix}:slow2"
+        assert key_slot(other.encode()) != key_slot(k.encode())
+        assert c.mget(k, other) == ["v", None]
+        assert isinstance(c.dbsize(), int)
         entries = r.slowlog_get()
         commands = [e["command"] for e in entries]
         assert f"GET {k}".encode() in commands and f"SET {k} v".encode() in commands
+        assert f"MGET {k} {other}".encode() in commands and b"DBSIZE" in commands
         mine = next(e for e in entries if e["command"] == f"GET {k}".encode())
         assert mine["client_name"] == b"slowprobe"
         assert b":" in mine["client_address"]

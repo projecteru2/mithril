@@ -39,11 +39,11 @@ is kept, newest `slowlog-max-len` entries, and `SLOWLOG GET [count]`,
 `SLOWLOG LEN` and `SLOWLOG RESET` read it in the Redis format (id, unix time,
 microseconds, up to 32 arguments of up to 128 bytes, client address, client
 name). The default threshold is 10 ms as in Redis; `-1` switches timing
-off, `0` keeps every command. Commands the proxy answers itself are timed
-too, SELECT included (an UNWATCH or a database-changing SELECT whose reply
-waits for the watched connection is timed to the moment it is handed to it);
-a blocking command, a pubsub command, a cluster-wide command and a reply
-served from the reply cache are not. A transaction is one
+off, `0` keeps every command. Every accepted command is timed from the
+moment it is read to the moment its first reply is queued for the client:
+routed, fanned out, cluster-wide, run through a WATCH, answered by the
+proxy or served from the reply cache alike; only a blocking command, whose
+wait is the client's own, is left out. A transaction is one
 entry named `exec`; the arguments of AUTH and HELLO, the rules of ACL SETUSER
 and the password values of a CONFIG SET read `(redacted)`.
 `PSLOWLOG GET|LEN|RESET` forwards the same subcommand to every node and
