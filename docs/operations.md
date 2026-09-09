@@ -16,7 +16,7 @@ client's current command in `cmd`.
 | Clients | `connected_clients` |
 | CPU | `used_cpu_sys`, `used_cpu_user` |
 | Stats | `total_connections_received`, `total_commands_processed`, `total_net_input_bytes`, `total_net_output_bytes`, `total_error_replies`, `redirections`, `redirect_waits`, session lifecycle counters (`readers_exited`, `writers_exited`, `sessions_closed`) |
-| Mithril | `worker_threads`, `backend_conns_per_node`, `backend_sharding`, `slave_mode`, `reply_cache`, `cache_hits`, `cache_misses`, `cache_invalidations`, `cache_entries`, `cache_bytes`, `cache_flips`, `cache_armed_workers`, `pipes_shared` (1 while the auto tuner holds every session on the shared pipes), `pipe_probes`, `pipe_keeps`, `pipe_reverts` (its experiments and how they ended), `worker_commands` (per-worker), `worker_busy` (per-worker CPU busyness, the tuner's own sample) |
+| Mithril | `worker_threads`, `backend_conns_per_node`, `backend_sharding`, `slave_mode`, `reply_cache`, `cache_hits`, `cache_misses`, `cache_invalidations`, `cache_entries`, `cache_bytes`, `cache_flips`, `cache_armed_workers`, `pipes_prefer_shared` (the auto tuner's process-wide preference: 1 while it sends every session to the shared pipes; a session on them by its own score is not counted), `pipe_probes`, `pipe_keeps`, `pipe_reverts` (its experiments and how they ended), `worker_commands` (per-worker), `worker_busy` (per-worker CPU busyness, the tuner's own sample) |
 | Cluster | `cluster_enabled` (always 1) |
 | Commandstats | `cmdstat_<command>:calls=<n>` for every command run at least once, subcommands as `cmdstat_client\|list`; counted once accepted, summed over workers |
 

@@ -211,7 +211,7 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
          backend_sharding:{}\r\nslave_mode:{}\r\nreply_cache:{}\r\n\
          cache_hits:{}\r\ncache_misses:{}\r\ncache_invalidations:{}\r\n\
          cache_armed_workers:{}\r\ncache_entries:{}\r\ncache_bytes:{}\r\n\
-         cache_flips:{}\r\npipes_shared:{}\r\npipe_probes:{}\r\npipe_keeps:{}\r\n\
+         cache_flips:{}\r\npipes_prefer_shared:{}\r\npipe_probes:{}\r\npipe_keeps:{}\r\n\
          pipe_reverts:{}\r\nworker_commands:{}\r\nworker_busy:{}\r\n",
         crate::VERSION,
         std::process::id(),
@@ -551,7 +551,7 @@ mod tests {
         assert_eq!(field("cache_flips").as_deref(), Some("0"));
         assert_eq!(field("worker_commands").as_deref(), Some("0,0"));
         assert_eq!(field("worker_busy").as_deref(), Some("0,90"));
-        assert_eq!(field("pipes_shared").as_deref(), Some("1"));
+        assert_eq!(field("pipes_prefer_shared").as_deref(), Some("1"));
         assert_eq!(field("pipe_probes").as_deref(), Some("5"));
         assert_eq!(field("pipe_keeps").as_deref(), Some("2"));
         assert_eq!(field("pipe_reverts").as_deref(), Some("0"));
