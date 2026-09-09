@@ -84,3 +84,26 @@ memtier_benchmark, redis-benchmark.
   cmd).
 - No TLS, no unix-domain listener, no keyspace notifications,
   no Prometheus endpoint (stats via INFO).
+
+## mt-proxy features not carried over
+
+The mt-proxy functional suite exercises a proxy-specific surface that
+mithril does not reproduce; each returns unknown-command or an unsupported
+CONFIG parameter, never a silent approximation:
+
+- node- and slot-addressed commands: NODESCAN, NODESSCAN, NODEHSCAN,
+  NODEZSCAN, SLOTSCAN, FLUSHNODE (address the node directly instead);
+- PROXY INSPECT / CONNECTION LIST / MEMORY PURGE / CPU REBIND / CACHE
+  ADD|PADD|DELETE|PDELETE|PLIST, and the opt-in local-cache strategy with
+  its `local_cache_*` INFO fields (the reply cache is `reply-cache yes`,
+  reported as `cache_*`);
+- COMMAND SUPPORT ADD/DELETE/LIST: the command table is generated at build
+  time from the servers' own COMMAND INFO;
+- PAUTH and `redis-user` / `redis-pass`: backend credentials come from the
+  config file (`backend-auth-user`, `backend-auth-pass`);
+- PSLOWLOG, the per-node fan-out of SLOWLOG;
+- CONFIG SET of `worker-threads`, `proxy-redis-conn`, `proxy-slave-mode`,
+  `readonly`, `protected-mode`, `maxclients`, `requirepass`, `timeout`,
+  `tcp-backlog`, `tcp-keepalive`, `client-query-buffer-limit` at runtime;
+- CLUSTER NODES listing the backend nodes: the proxy presents itself as one
+  virtual node owning every slot.
