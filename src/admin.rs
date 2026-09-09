@@ -2,15 +2,15 @@
 
 use std::borrow::Cow;
 use std::fmt::Write;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::acl::Acl;
-use crate::command::Spec;
+use crate::command::{self, Spec};
 use crate::config::Config;
 use crate::crc16::{self, SLOTS};
 use crate::resp;
-use crate::stats::{ClientInfo, Stats};
+use crate::stats::{self, ClientInfo, Stats};
 
 pub const SERVER_VERSION: &str = "7.4.0";
 
@@ -87,11 +87,12 @@ pub fn client_list(stats: &Stats) -> Vec<u8> {
     for (id, c) in rows {
         let _ = writeln!(
             text,
-            "id={id} addr={} fd={} name={} age={} cmd=",
+            "id={id} addr={} fd={} name={} age={} cmd={}",
             c.addr,
             c.fd,
             c.name,
-            c.since.elapsed().as_secs()
+            c.since.elapsed().as_secs(),
+            last_cmd(&c.cmd)
         );
     }
     drop(registry);
@@ -197,7 +198,7 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let text = format!(
+    let mut text = format!(
         "# Server\r\nredis_version:{SERVER_VERSION}\r\nredis_mode:cluster\r\n\
          mithril_version:{}\r\nprocess_id:{}\r\ntcp_port:{}\r\nuptime_in_seconds:{}\r\n\
          config_file:{}\r\n\r\n\
@@ -205,7 +206,7 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
          # CPU\r\nused_cpu_sys:{:.3}\r\nused_cpu_user:{:.3}\r\n\r\n\
          # Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n\
          total_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\n\
-         total_errors:{}\r\nredirections:{}\r\nredirect_waits:{}\r\n\
+         total_error_replies:{}\r\nredirections:{}\r\nredirect_waits:{}\r\n\
          readers_exited:{}\r\nwriters_exited:{}\r\nsessions_closed:{}\r\n\r\n\
          # Mithril\r\nworker_threads:{}\r\nbackend_conns_per_node:{}\r\n\
          backend_sharding:{}\r\nslave_mode:{}\r\nreply_cache:{}\r\n\
@@ -249,6 +250,13 @@ pub fn info(cfg: &Config, stats: &Stats, started: u64) -> Vec<u8> {
             .collect::<Vec<_>>()
             .join(","),
     );
+    text.push_str("\r\n# Cluster\r\ncluster_enabled:1\r\n\r\n# Commandstats\r\n");
+    for id in 0..command::entries() as u16 {
+        let calls = stats.sum(|w| w.calls.at(id));
+        if calls > 0 {
+            let _ = write!(text, "cmdstat_{}:calls={calls}\r\n", command::name(id));
+        }
+    }
     let mut out = Vec::new();
     resp::bulk(&mut out, text.as_bytes());
     out
@@ -405,6 +413,13 @@ fn config_value<'a>(cfg: &'a Config, acl: &Acl, key: &str) -> Cow<'a, str> {
     }
 }
 
+fn last_cmd(cmd: &AtomicU16) -> &'static str {
+    match cmd.load(Ordering::Relaxed) {
+        stats::NO_COMMAND => "NULL",
+        id => command::name(id),
+    }
+}
+
 fn sub_is(args: &[&[u8]], i: usize, name: &[u8]) -> bool {
     args.get(i).is_some_and(|s| s.eq_ignore_ascii_case(name))
 }
@@ -430,6 +445,9 @@ mod tests {
         let cfg = test_cfg();
         let stats = crate::stats::Stats::new(2);
         stats.clients.store(7, Ordering::Relaxed);
+        let get = command::lookup(b"get").unwrap().id;
+        stats.workers[0].calls.at(get).store(3, Ordering::Relaxed);
+        stats.workers[1].calls.at(get).store(4, Ordering::Relaxed);
         let out = info(&cfg, &stats, 0);
         let text = String::from_utf8_lossy(&out);
         let field = |k: &str| {
@@ -440,6 +458,10 @@ mod tests {
         assert_eq!(field("connected_clients").as_deref(), Some("7"));
         assert_eq!(field("mithril_version").as_deref(), Some(crate::VERSION));
         assert_eq!(field("cache_flips").as_deref(), Some("0"));
+        assert_eq!(field("total_error_replies").as_deref(), Some("0"));
+        assert_eq!(field("cluster_enabled").as_deref(), Some("1"));
+        assert_eq!(field("cmdstat_get").as_deref(), Some("calls=7"));
+        assert!(!text.contains("cmdstat_set"), "{text}");
         assert_eq!(
             field("worker_threads").as_deref(),
             Some(cfg.workers.to_string().as_str())
@@ -449,6 +471,36 @@ mod tests {
         assert_eq!(
             field("config_file").as_deref(),
             Some(cfg.config_file.as_str())
+        );
+    }
+
+    #[test]
+    fn client_list_names_the_last_command() {
+        let stats = crate::stats::Stats::new(1);
+        let list = command::lookup(b"client")
+            .and_then(|c| c.subcommand(b"list"))
+            .unwrap()
+            .id;
+        for (id, cmd) in [(1, stats::NO_COMMAND), (2, list)] {
+            stats.registry().insert(
+                id,
+                ClientInfo {
+                    addr: "127.0.0.1:1".parse().unwrap(),
+                    fd: 9,
+                    name: Box::from(""),
+                    since: std::time::Instant::now(),
+                    cmd: std::sync::Arc::new(AtomicU16::new(cmd)),
+                },
+            );
+        }
+        let text = String::from_utf8_lossy(&client_list(&stats)).into_owned();
+        assert!(
+            text.contains("id=1 addr=127.0.0.1:1 fd=9 name= age=0 cmd=NULL\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("id=2 addr=127.0.0.1:1 fd=9 name= age=0 cmd=client|list\n"),
+            "{text}"
         );
     }
 

@@ -80,6 +80,7 @@ memtier_benchmark, redis-benchmark.
 - Server-management commands are not proxied: WAIT, DEBUG, LATENCY, MEMORY,
   SHUTDOWN, FAILOVER, REPLICAOF, SAVE/BGSAVE, MIGRATE and similar return
   unknown-command. OBJECT routes by its key.
-- CLIENT supports ID, SETNAME, GETNAME and LIST (id, addr, fd, name, age).
+- CLIENT supports ID, SETNAME, GETNAME and LIST (id, addr, fd, name, age,
+  cmd).
 - No TLS, no unix-domain listener, no slowlog, no keyspace notifications,
   no Prometheus endpoint (stats via INFO).

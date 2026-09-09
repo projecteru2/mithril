@@ -169,13 +169,15 @@ def main():
                 parent, sub = r["name"].split("|", 1)
                 subs_of.setdefault(parent, {}).setdefault(sub, r)
     next_id = len(table)
-    sub_blocks, rows = [], []
+    sub_blocks, rows, names, sub_names = [], [], [], []
     for i, (key, row) in enumerate(table):
         name = row.split('"')[1]
+        names.append(name)
         subs = subs_of.get(name, {})
         if subs:
             items = []
             for sub in sorted(subs):
+                sub_names.append(f"{name}|{sub}")
                 cats = []
                 for c in subs[sub]["cats"]:
                     c = c.lstrip("@")
@@ -204,7 +206,10 @@ def main():
             lines.append(f"const A_{c.upper()}: u32 = 1 << {i};")
     lines += ["", "pub(super) static INFO_NAMES: &[&str] = &[" + ", ".join(f'"{f}"' for f in STD_FLAGS) + "];", "",
               "pub(super) static CAT_NAMES: &[&str] = &[" + ", ".join(f'"@{c}"' for c in cats_order) + "];", "",
-              f"pub(super) const ENTRIES: usize = {next_id};", "", "#[rustfmt::skip]"] + sub_blocks + ["",
+              f"pub(super) const ENTRIES: usize = {next_id};", "",
+              "/// Command and `container|sub` names by dense id.",
+              "pub(super) static NAMES: &[&str] = &[" + ", ".join(f'"{n}"' for n in names + sub_names) + "];", "",
+              "#[rustfmt::skip]"] + sub_blocks + ["",
               "#[rustfmt::skip]", "pub(super) static TABLE: &[Spec] = &["] + [row for _, row in table] + ["];", ""]
     with open(OUT, "w", encoding="utf-8") as target:
         target.write("\n".join(lines))

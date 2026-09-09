@@ -6,6 +6,7 @@ use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -42,6 +43,7 @@ const GATE_PROBE: Duration = Duration::from_millis(100);
 pub(super) struct Session {
     pub(super) shared: Rc<Shared>,
     pub(super) id: u64,
+    cmd: Arc<AtomicU16>,
     pub(super) reply_q: Rc<ReplyQueue>,
     pub(super) link: Rc<WriterLink>,
     pub(super) proto: Cell<u8>,
@@ -316,6 +318,16 @@ impl Session {
             self.emit_error_frame(err);
             return;
         }
+        let id = if spec.subs.is_empty() {
+            spec.id
+        } else {
+            resp::Args::new(&frame, argc)
+                .nth(1)
+                .and_then(|sub| spec.subcommand(sub))
+                .map_or(spec.id, |sub| sub.id)
+        };
+        stats::bump(self.shared.wstats.calls.at(id));
+        self.cmd.store(id, Ordering::Relaxed);
         if self.auto {
             self.adapt_pipes();
         }
@@ -644,10 +656,12 @@ impl ConnCache {
 struct Listed<'a> {
     stats: &'a Stats,
     id: u64,
+    cmd: Arc<AtomicU16>,
 }
 
 impl<'a> Listed<'a> {
     fn new(stats: &'a Stats, id: u64, addr: SocketAddr, fd: i32) -> Listed<'a> {
+        let cmd = Arc::new(AtomicU16::new(stats::NO_COMMAND));
         stats.registry().insert(
             id,
             stats::ClientInfo {
@@ -655,9 +669,10 @@ impl<'a> Listed<'a> {
                 fd,
                 name: Box::from(""),
                 since: Instant::now(),
+                cmd: cmd.clone(),
             },
         );
-        Listed { stats, id }
+        Listed { stats, id, cmd }
     }
 }
 
@@ -672,7 +687,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: SocketAddr, id: 
     if stream.set_nodelay(true).is_err() {
         return;
     }
-    let _listed = Listed::new(&shared.stats, id, addr, stream.as_raw_fd());
+    let listed = Listed::new(&shared.stats, id, addr, stream.as_raw_fd());
     let (mut read_half, write_half) = stream.into_split();
     let reply_q = ReplyQueue::new(shared.fabric.is_some());
     let link: Rc<WriterLink> = Rc::new(WriterLink::default());
@@ -685,6 +700,7 @@ pub async fn serve(shared: Rc<Shared>, stream: TcpStream, addr: SocketAddr, id: 
     let session = Session {
         shared: shared.clone(),
         id,
+        cmd: listed.cmd.clone(),
         reply_q: reply_q.clone(),
         link: link.clone(),
         proto: Cell::new(2),

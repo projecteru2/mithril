@@ -2,7 +2,7 @@
 
 mod table;
 
-use table::{CAT_NAMES, ENTRIES, I_PUBSUB, INFO_NAMES, TABLE};
+use table::{CAT_NAMES, ENTRIES, I_PUBSUB, INFO_NAMES, NAMES, TABLE};
 
 const FLAG_WRITE: u8 = 1;
 const FLAG_READONLY: u8 = 1 << 1;
@@ -255,6 +255,11 @@ pub fn cat_names() -> &'static [&'static str] {
     CAT_NAMES
 }
 
+/// The name behind a dense id: a command's, or `container|sub`.
+pub fn name(id: u16) -> &'static str {
+    NAMES[usize::from(id)]
+}
+
 /// Case-insensitive lookup; the u64-prefix key makes a probe one integer compare.
 pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
     if name.is_empty() || name.len() > MAX_NAME {
@@ -438,6 +443,17 @@ mod tests {
                 lookup(spec.name.as_bytes()).map(|s| s.name),
                 Some(spec.name)
             );
+        }
+    }
+
+    #[test]
+    fn names_follow_the_ids() {
+        assert_eq!(NAMES.len(), ENTRIES);
+        for spec in TABLE {
+            assert_eq!(name(spec.id), spec.name);
+            for sub in spec.subs {
+                assert_eq!(name(sub.id), format!("{}|{}", spec.name, sub.name));
+            }
         }
     }
 

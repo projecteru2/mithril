@@ -11,8 +11,10 @@ so placement skew is visible at a glance.
 | Server | `mithril_version`, `process_id`, `tcp_port`, `uptime_in_seconds`, `config_file` |
 | Clients | `connected_clients` |
 | CPU | `used_cpu_sys`, `used_cpu_user` |
-| Stats | `total_connections_received`, `total_commands_processed`, `total_net_input_bytes`, `total_net_output_bytes`, `total_errors`, `redirections`, `redirect_waits`, session lifecycle counters (`readers_exited`, `writers_exited`, `sessions_closed`) |
+| Stats | `total_connections_received`, `total_commands_processed`, `total_net_input_bytes`, `total_net_output_bytes`, `total_error_replies`, `redirections`, `redirect_waits`, session lifecycle counters (`readers_exited`, `writers_exited`, `sessions_closed`) |
 | Mithril | `worker_threads`, `backend_conns_per_node`, `backend_sharding`, `slave_mode`, `reply_cache`, `cache_hits`, `cache_misses`, `cache_invalidations`, `cache_entries`, `cache_bytes`, `cache_flips`, `cache_armed_workers`, `worker_commands` (per-worker) |
+| Cluster | `cluster_enabled` (always 1) |
+| Commandstats | `cmdstat_<command>:calls=<n>` for every command run at least once, subcommands as `cmdstat_client\|list`; counted once accepted (known, well-formed, permitted), summed over workers |
 
 `CLIENT LIST` lists every connection across workers (id, addr, fd, name,
 age).

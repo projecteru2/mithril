@@ -1305,6 +1305,23 @@ def test_script_management_through_proxy(r, cluster_direct, key_prefix):
         r.execute_command("SCRIPT", "KILL")
 
 
+def test_info_counts_commands_and_client_list_names_the_last(r, new_conn, key_prefix):
+    k = f"{key_prefix}:cs"
+    c = new_conn()
+    assert c.get(k) is None
+    before = r.info("commandstats")["cmdstat_get"]["calls"]
+    assert c.get(k) is None
+    assert r.info("commandstats")["cmdstat_get"]["calls"] == before + 1
+    assert r.info("cluster")["cluster_enabled"] == 1
+    assert r.info("stats")["total_error_replies"] >= 0
+    rid, cid = r.client_id(), c.client_id()
+    assert c.get(k) is None
+    by_id = {int(row["id"]): row for row in r.client_list()}
+    assert by_id[rid]["cmd"] == "client|list"
+    assert by_id[cid]["cmd"] == "get"
+    assert r.info("commandstats")["cmdstat_client|list"]["calls"] >= 1
+
+
 def test_register_script_round_trips(r, key_prefix):
     key = f"{key_prefix}:reg"
     script = r.register_script("return redis.call('incr', KEYS[1])")

@@ -2,12 +2,17 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::command;
+
 /// Ticks per second in /proc stat fields (Linux USER_HZ).
 pub const USER_HZ: u64 = 100;
+
+/// The `cmd` of a client that has run nothing yet.
+pub const NO_COMMAND: u16 = u16::MAX;
 
 /// One worker's counters; padding keeps writers on distinct cachelines.
 #[repr(align(64))]
@@ -29,15 +34,32 @@ pub struct WorkerStats {
     pub cache_entries: AtomicU64,
     pub cache_bytes: AtomicU64,
     pub cache_flips: AtomicU64,
+    pub calls: Calls,
 }
 
-/// What CLIENT LIST reports about one connection; touched only on connect,
-/// disconnect and SETNAME.
+/// Calls per command, indexed by the dense command id.
+pub struct Calls(Box<[AtomicU64]>);
+
+impl Calls {
+    pub fn at(&self, id: u16) -> &AtomicU64 {
+        &self.0[usize::from(id)]
+    }
+}
+
+impl Default for Calls {
+    fn default() -> Calls {
+        Calls((0..command::entries()).map(|_| AtomicU64::new(0)).collect())
+    }
+}
+
+/// What CLIENT LIST reports about one connection; `cmd` is the session's
+/// own relaxed store, the rest is touched only on connect, disconnect and SETNAME.
 pub struct ClientInfo {
     pub addr: SocketAddr,
     pub fd: i32,
     pub name: Box<str>,
     pub since: Instant,
+    pub cmd: Arc<AtomicU16>,
 }
 
 /// Process-wide stats shared across workers.
