@@ -11,7 +11,6 @@ use tokio::task::JoinHandle;
 
 use super::Lane;
 use super::pubsub::{PendingSub, PubsubSim};
-use super::watch::settled;
 use super::watch::{NO_WATCH, Watched};
 use crate::cache::ReplyCache;
 use crate::multikey;
@@ -48,8 +47,8 @@ pub(super) struct WriterLink {
     pub(super) hold: Cell<bool>,
     // (sequence, microsecond read, request) of each timed command, in sequence order
     pub(super) timings: RefCell<VecDeque<(u64, u64, Bytes)>>,
-    // timed commands not yet settled; the writer's sweep skips the queue at zero
-    pub(super) timings_pending: Cell<usize>,
+    // a timed command is not yet settled; the writer's sweep skips the queue otherwise
+    pub(super) timings_pending: Cell<bool>,
     pub(super) closed_notify: Notify,
     pub(super) proto_switches: ProtoSwitchQueue,
     pub(super) oob_budget: Cell<usize>,
@@ -262,6 +261,19 @@ type FanoutGates = HashMap<u16, Rc<Notify>, BuildHasherDefault<multikey::SlotHas
 pub(super) fn mark_closed(link: &WriterLink) {
     link.closed.set(true);
     link.closed_notify.notify_one();
+}
+
+// a wait that cannot miss the notification between the check and the sleep
+async fn settled(notify: &Notify, pending: impl Fn() -> bool) {
+    loop {
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !pending() {
+            return;
+        }
+        notified.await;
+    }
 }
 
 #[cfg(test)]

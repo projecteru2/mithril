@@ -394,16 +394,18 @@ pub(super) async fn write_loop(
                 }
             }
             drop(inf);
-            if link.timings_pending.get() > 0 {
+            if link.timings_pending.get() {
                 let mut timings = link.timings.borrow_mut();
                 while timings.front().is_some_and(|t| t.0 < next_emit) {
                     if let Some((_, started_us, frame)) = timings.pop_front() {
-                        link.timings_pending.set(link.timings_pending.get() - 1);
                         shared.stats.log_slow(client_id, started_us, frame);
                     }
                 }
-                if timings.is_empty() && timings.capacity() > 256 {
-                    *timings = VecDeque::new();
+                if timings.is_empty() {
+                    link.timings_pending.set(false);
+                    if timings.capacity() > 256 {
+                        *timings = VecDeque::new();
+                    }
                 }
             }
             swept_to = next_emit;

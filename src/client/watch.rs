@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use bytes::Bytes;
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use super::fanout::write_keys;
@@ -593,19 +593,6 @@ async fn unwatched(watched: &Watched, sent: Option<(oneshot::Receiver<Bytes>, u6
     };
     recv_or_lost(rx).await;
     watched.accepted.get() > mark
-}
-
-// a wait that cannot miss the notification between the check and the sleep
-pub(super) async fn settled(notify: &Notify, pending: impl Fn() -> bool) {
-    loop {
-        let notified = notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if !pending() {
-            return;
-        }
-        notified.await;
-    }
 }
 
 async fn deliver_exec(

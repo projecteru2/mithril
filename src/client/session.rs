@@ -47,7 +47,7 @@ pub(super) struct Session {
     pub(super) id: u64,
     cmd: Arc<AtomicU16>,
     // the accepted command's stamp and request while the slow log is on, until a sequence takes them
-    pub(super) timed: Cell<Option<(u64, Bytes)>>,
+    timed: Cell<Option<(u64, Bytes)>>,
     pub(super) reply_q: Rc<ReplyQueue>,
     pub(super) link: Rc<WriterLink>,
     pub(super) proto: Cell<u8>,
@@ -272,9 +272,7 @@ impl Session {
                 .timings
                 .borrow_mut()
                 .push_back((seq, started_us, frame));
-            self.link
-                .timings_pending
-                .set(self.link.timings_pending.get() + 1);
+            self.link.timings_pending.set(true);
         }
         seq
     }
