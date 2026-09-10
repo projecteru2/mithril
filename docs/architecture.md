@@ -3,10 +3,12 @@
 ## Threading model
 
 Mithril is thread-per-core. Each worker thread runs a single-threaded tokio
-runtime with its own backend connection pools; nothing is shared between
-workers on the request path, so there are no locks and no atomic
-reference-count traffic per request (`Rc`, not `Arc`, everywhere inside a
-worker).
+runtime with its own backend connection pools; under `backend-sharding no`
+nothing is shared between workers on the request path, so there are no
+locks and no atomic reference-count traffic per request (`Rc`, not `Arc`,
+everywhere inside a worker). The shared pipes of `yes` and `auto` (the
+default) cross workers through the fabric and a mutex-backed reply queue,
+described under backend sharding below.
 
 One acceptor thread owns the listen socket and hands accepted connections to
 workers over bounded channels, placed least-loaded by default (configurable). Kernel `SO_REUSEPORT` hashing was

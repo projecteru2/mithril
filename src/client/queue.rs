@@ -1,4 +1,4 @@
-//! Per-session reply queue: worker-local by default, mutex-backed when owner workers deliver.
+//! Per-session reply queue: worker-local under `backend-sharding no`, mutex-backed when owner workers deliver.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
