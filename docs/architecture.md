@@ -160,7 +160,10 @@ tracking connection per master and learns its client id; every shared
 backend connection on that worker enables `CLIENT TRACKING ON REDIRECT <id>
 OPTIN`, and a fill-armed GET is preceded by `CLIENT CACHING YES`, so a server
 tracks exactly the keys this proxy cached and sends one invalidation when
-such a key changes. Writes through the proxy invalidate their keys
+such a key changes. A server that refuses the opt-in, because that
+connection's tracking is off, gets the tracking frame again on it and the
+request runs once more without the opt-in, so the client sees its reply and
+nothing fills. Writes through the proxy invalidate their keys
 synchronously at dispatch (including STORE destinations, script keys and
 queued transaction keys), so a session always reads its own writes. A fill
 that races an invalidation is poisoned rather than cached; a key carries at

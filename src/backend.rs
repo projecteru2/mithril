@@ -14,11 +14,11 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::cache::TrackingFrames;
+use crate::cache::{CACHING_REFUSED, TrackingFrames};
 use crate::client::{Reply, ReplyQueue};
 use crate::config::{Config, Sharding};
-use crate::log_debug;
 use crate::resp;
+use crate::{log_debug, log_warn};
 
 pub const OUTBOUND_QUEUE: usize = 8192;
 pub const READ_CHUNK: usize = 64 * 1024;
@@ -267,20 +267,23 @@ impl Backends {
             abort: tokio::sync::Notify::new(),
         });
         let task_conn = conn.clone();
-        let tracking = match &self.tracking {
-            Some(t) if role == Role::Master && db == 0 => t.borrow().get(addr).cloned(),
-            _ => None,
-        };
-        log_debug!(
-            "dial {addr} db{db} exclusive={} tracking={}",
-            role == Role::Exclusive,
-            tracking.is_some()
-        );
+        let tracking = (role == Role::Master)
+            .then(|| self.tracking.clone())
+            .flatten();
         let addr = addr.to_string();
         let cfg = self.cfg.clone();
         let depth = self.depth.clone();
         tokio::task::spawn_local(async move {
-            run_conn((&addr, db), rx, role, tracking, &cfg, &task_conn, &depth).await;
+            run_conn(
+                (&addr, db),
+                rx,
+                role,
+                tracking.as_ref(),
+                &cfg,
+                &task_conn,
+                &depth,
+            )
+            .await;
             task_conn.dead.set(true);
         });
         conn
@@ -321,7 +324,8 @@ impl Drop for ExclusiveLease {
 
 pub(crate) struct Pending<S> {
     pub(crate) expect: u32,
-    pub(crate) sink: S,
+    // None for a frame the connection sent on its own account
+    pub(crate) sink: Option<S>,
 }
 
 type PoolPair = [Option<Rc<Pool>>; 2];
@@ -367,14 +371,17 @@ pub fn ensure_read_room(buf: &mut BytesMut) {
     }
 }
 
-// assumes RESP2 backends: a reply with no request pending is a desync, not a push
+// assumes RESP2 backends: a reply with no request pending is a desync, not a push;
+// true once a caching opt-in was refused, which says the connection's tracking is off
 pub(crate) fn pair_replies<S>(
+    addr: &str,
     buf: &mut BytesMut,
     cur: &mut resp::Cursor,
     pending: &mut VecDeque<Pending<S>>,
     front_err: &mut Option<Bytes>,
     deliver: impl Fn(S, Bytes),
-) -> Result<(), &'static str> {
+) -> Result<bool, &'static str> {
+    let mut refused = false;
     loop {
         match resp::scan_value_at(buf, cur) {
             resp::Scan::Complete(len) => {
@@ -384,19 +391,27 @@ pub(crate) fn pair_replies<S>(
                     Some(front) if front.expect > 1 => {
                         front.expect -= 1;
                         if front_err.is_none() && frame.first() == Some(&b'-') {
+                            if frame.starts_with(CACHING_REFUSED) {
+                                log_warn!(
+                                    "backend {addr}: caching opt-in refused, tracking re-sent"
+                                );
+                                refused = true;
+                            }
                             *front_err = Some(frame);
                         }
                     }
                     Some(_) => {
-                        if let Some(d) = pending.pop_front() {
+                        if let Some(d) = pending.pop_front()
+                            && let Some(sink) = d.sink
+                        {
                             // a failed head frame is the reply: the request never ran as sent
-                            deliver(d.sink, front_err.take().unwrap_or(frame));
+                            deliver(sink, front_err.take().unwrap_or(frame));
                         }
                     }
                 }
             }
             resp::Scan::Invalid(e) => return Err(e),
-            resp::Scan::Incomplete => return Ok(()),
+            resp::Scan::Incomplete => return Ok(refused),
         }
     }
 }
@@ -407,24 +422,42 @@ pub(crate) async fn open(
     db: u8,
     readonly: bool,
     cfg: &Config,
-    tracking: Option<&[u8]>,
+    tracking: Option<&TrackingFrames>,
 ) -> Result<(OwnedReadHalf, OwnedWriteHalf), String> {
     let stream = connect(addr, cfg.tcp_keepalive_secs)
         .await
         .map_err(|e| e.to_string())?;
     let (mut r, mut w) = stream.into_split();
-    handshake(&mut r, &mut w, (db, readonly), cfg, tracking).await?;
+    let frame = tracking_frame(tracking, addr, db, readonly);
+    log_debug!(
+        "dial {addr} db{db} readonly={readonly} tracking={}",
+        frame.is_some()
+    );
+    handshake(&mut r, &mut w, (db, readonly), cfg, frame.as_deref()).await?;
     Ok((r, w))
+}
+
+// only a master connection on database 0 carries tracking
+fn tracking_frame(
+    tracking: Option<&TrackingFrames>,
+    addr: &str,
+    db: u8,
+    readonly: bool,
+) -> Option<Bytes> {
+    match tracking {
+        Some(t) if !readonly && db == 0 => t.borrow().get(addr).cloned(),
+        _ => None,
+    }
 }
 
 /// Drives one connection: batches requests into writev, pairs replies to sinks,
 /// and fails what is left once the socket or the abort ends it.
 pub(crate) async fn pump<S, D: Fn(S, Bytes) + Copy>(
-    addr: &str,
+    (addr, db, readonly): (&str, u8, bool),
     rx: &mut mpsc::Receiver<Outbound<S>>,
     (mut read_half, mut write_half): (OwnedReadHalf, OwnedWriteHalf),
-    abort: Option<&tokio::sync::Notify>,
-    depth: Option<&BatchDepth>,
+    (abort, depth): (Option<&tokio::sync::Notify>, Option<&BatchDepth>),
+    tracking: Option<&TrackingFrames>,
     deliver: D,
 ) {
     let mut pending: VecDeque<Pending<S>> = VecDeque::new();
@@ -462,15 +495,29 @@ pub(crate) async fn pump<S, D: Fn(S, Bytes) + Copy>(
                 if matches!(r, Ok(0) | Err(_)) {
                     break 'io;
                 }
-                if let Err(e) = pair_replies(&mut buf, &mut cur, &mut pending, &mut front_err, deliver) {
-                    log_debug!("backend {addr} protocol error: {e}");
-                    break 'io;
+                match pair_replies(addr, &mut buf, &mut cur, &mut pending, &mut front_err, deliver) {
+                    Err(e) => {
+                        log_debug!("backend {addr} protocol error: {e}");
+                        break 'io;
+                    }
+                    Ok(true) => {
+                        if let Some(frame) = tracking_frame(tracking, addr, db, readonly) {
+                            pending.push_back(Pending {
+                                expect: 1,
+                                sink: None,
+                            });
+                            if write_frames(&mut write_half, &[frame]).await.is_err() {
+                                break 'io;
+                            }
+                        }
+                    }
+                    Ok(false) => {}
                 }
             }
         }
     }
-    for p in pending.drain(..) {
-        deliver(p.sink, Bytes::from_static(ERR_BACKEND_LOST));
+    for sink in pending.drain(..).filter_map(|p| p.sink) {
+        deliver(sink, Bytes::from_static(ERR_BACKEND_LOST));
     }
     drain_channel(rx, deliver);
 }
@@ -493,7 +540,7 @@ pub(crate) fn stage<S>(
     for out in batch.drain(..) {
         pending.push_back(Pending {
             expect: out.expect,
-            sink: out.sink,
+            sink: Some(out.sink),
         });
         if let Some(h) = out.head {
             frames.push(h);
@@ -594,7 +641,7 @@ pub(crate) async fn run_pipe<S, D: Fn(S, Bytes) + Copy>(
     (addr, db): (&str, u8),
     readonly: bool,
     cfg: &Config,
-    tracking: Option<&[u8]>,
+    tracking: Option<&TrackingFrames>,
     rx: &mut mpsc::Receiver<Outbound<S>>,
     (abort, depth): (Option<&tokio::sync::Notify>, Option<&BatchDepth>),
     deliver: D,
@@ -604,7 +651,17 @@ pub(crate) async fn run_pipe<S, D: Fn(S, Bytes) + Copy>(
         r = open(addr, db, readonly, cfg, tracking) => r,
     };
     match halves {
-        Ok(halves) => pump(addr, rx, halves, abort, depth, deliver).await,
+        Ok(halves) => {
+            pump(
+                (addr, db, readonly),
+                rx,
+                halves,
+                (abort, depth),
+                tracking,
+                deliver,
+            )
+            .await
+        }
         Err(e) => {
             log_debug!("connect {addr}: {e}");
             drain_channel(rx, deliver);
@@ -632,7 +689,7 @@ async fn run_conn(
     (addr, db): (&str, u8),
     mut rx: mpsc::Receiver<Outbound>,
     role: Role,
-    tracking: Option<Bytes>,
+    tracking: Option<&TrackingFrames>,
     cfg: &Config,
     conn: &Conn,
     depth: &BatchDepth,
@@ -644,7 +701,7 @@ async fn run_conn(
         (addr, db),
         role == Role::Replica,
         cfg,
-        tracking.as_deref(),
+        tracking,
         &mut rx,
         (abort, depth),
         deliver,
@@ -686,7 +743,10 @@ mod tests {
     }
 
     fn pending(expect: u32, tag: u32) -> Pending<u32> {
-        Pending { expect, sink: tag }
+        Pending {
+            expect,
+            sink: Some(tag),
+        }
     }
 
     fn pair(
@@ -697,10 +757,36 @@ mod tests {
         let mut cur = resp::Cursor::default();
         let mut front_err = None;
         let got = RefCell::new(Vec::new());
-        pair_replies(&mut buf, &mut cur, pending, &mut front_err, |s, f| {
+        pair_replies("m", &mut buf, &mut cur, pending, &mut front_err, |s, f| {
             got.borrow_mut().push((s, f))
         })?;
         Ok(got.into_inner())
+    }
+
+    fn refused(buf: &[u8], pending: &mut VecDeque<Pending<u32>>) -> bool {
+        let mut buf = BytesMut::from(buf);
+        let mut cur = resp::Cursor::default();
+        let mut front_err = None;
+        pair_replies("m", &mut buf, &mut cur, pending, &mut front_err, |_, _| {}).unwrap()
+    }
+
+    #[test]
+    fn a_refused_opt_in_is_reported_and_a_sinkless_frame_swallows_its_reply() {
+        let mut queue = VecDeque::from([pending(2, 7)]);
+        assert!(refused(
+            b"-ERR CLIENT CACHING can be called only when tracking\r\n$1\r\nv\r\n",
+            &mut queue
+        ));
+        assert!(!refused(b"+OK\r\n", &mut VecDeque::from([pending(1, 7)])));
+        let mut queue = VecDeque::from([
+            Pending {
+                expect: 1,
+                sink: None,
+            },
+            pending(1, 8),
+        ]);
+        let got = pair(b"+OK\r\n:1\r\n", &mut queue).unwrap();
+        assert_eq!(got, vec![(8, Bytes::from_static(b":1\r\n"))]);
     }
 
     #[test]

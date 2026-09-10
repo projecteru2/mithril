@@ -159,10 +159,7 @@ pub async fn control_loop(
         tokio::select! {
             nc = ctl.recv() => {
                 let Some(mut nc) = nc else { return };
-                let frame = match &tracking {
-                    Some(t) if !nc.readonly && nc.db == 0 => t.borrow().get(nc.addr.as_str()).cloned(),
-                    _ => None,
-                };
+                let tracking = tracking.clone();
                 let fabric = fabric.clone();
                 let cfg = cfg.clone();
                 tokio::task::spawn_local(async move {
@@ -170,7 +167,7 @@ pub async fn control_loop(
                         (&nc.addr, nc.db),
                         nc.readonly,
                         &cfg,
-                        frame.as_deref(),
+                        tracking.as_ref(),
                         &mut nc.rx,
                         (None, None),
                         deliver,

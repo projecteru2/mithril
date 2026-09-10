@@ -26,6 +26,8 @@ use crate::topology::Topology;
 
 /// Marks the next command on a tracking connection as cached.
 pub const CACHING_FRAME: &[u8] = b"*3\r\n$6\r\nCLIENT\r\n$7\r\nCACHING\r\n$3\r\nYES\r\n";
+/// How a backend whose tracking is off answers that mark.
+pub const CACHING_REFUSED: &[u8] = b"-ERR CLIENT CACHING";
 
 // larger replies churn the byte budget faster than they earn hits
 const ENTRY_MAX_BYTES: usize = 64 * 1024;

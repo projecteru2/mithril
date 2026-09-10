@@ -18,6 +18,7 @@ use super::queue::ReplyQueue;
 use super::scripting::evalsha_target;
 use super::{ERR_TRYAGAIN, Lane, Reply, Shared};
 use crate::backend::{ASKING_FRAME, BATCH, ERR_BACKEND_LOST, write_frames};
+use crate::cache::CACHING_REFUSED;
 use crate::resp;
 use crate::stats;
 
@@ -248,6 +249,24 @@ pub(super) async fn write_loop(
                         }
                         // clients believe the proxy owns every slot: never leak redirects
                         let _ = shared.refresh.send(());
+                        frame = Bytes::from_static(ERR_TRYAGAIN);
+                    } else if frame.starts_with(CACHING_REFUSED)
+                        && let Some((retry, slot, db)) = take_bounce(&link, seq)
+                    {
+                        // the connection re-tracks itself; the request runs again without the opt-in
+                        let topo = shared.topo.load_full();
+                        if let Some(idx) = topo.owner(slot) {
+                            let resend = Resend {
+                                shared: &shared,
+                                reply_q: &reply_q,
+                                link: &link,
+                                client_id,
+                            };
+                            resend
+                                .requeue(&topo.nodes[idx as usize].addr, seq, None, retry, 0, db)
+                                .await;
+                            continue;
+                        }
                         frame = Bytes::from_static(ERR_TRYAGAIN);
                     } else if frame.starts_with(NOSCRIPT)
                         && rerunnable(&link, seq)
