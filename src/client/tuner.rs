@@ -37,8 +37,8 @@ const PROBE_BACKOFF_MAX_TICKS: u32 = 4800;
 const PROBE_DOUBLINGS: u32 = (PROBE_BACKOFF_MAX_TICKS / PROBE_BACKOFF_TICKS).ilog2();
 // a rate this far from the one the current state was chosen on is a changed workload
 const RATE_SHIFT_PCT: u64 = 25;
-// a baseline whose ticks spread wider than this ratio holds a gap or a ramp, not a rate
-const STEADY_RATIO: u64 = 2;
+// a baseline whose ticks spread wider than this holds a gap or a ramp, not a rate
+const STEADY_SPREAD_PCT: u64 = 25;
 
 impl Session {
     // an unpipelined session gains from the deeper batches of the shared pipe, a
@@ -100,7 +100,8 @@ impl Probe {
     fn tick(&mut self, busy_thin: bool, still_busy: bool, commands_now: u64) -> bool {
         self.record(commands_now);
         self.wait = self.wait.saturating_sub(1);
-        // the ring still holds the losing trial for one window after a decision
+        // the ring still holds the losing trial for one window after a decision, and
+        // both rates for one window after a shift
         self.settling = self.settling.saturating_sub(1);
         if self.settling == 0
             && self.decided > 0
@@ -108,6 +109,7 @@ impl Probe {
         {
             self.decided = 0;
             self.wait = 0;
+            self.settling = RATE_TICKS as u32;
         }
         match self.phase {
             Phase::Probing { baseline, ticks } => self.probing(baseline, ticks),
@@ -139,7 +141,7 @@ impl Probe {
             .ring
             .iter()
             .fold((u64::MAX, 0), |(lo, hi), &v| (lo.min(v), hi.max(v)));
-        max <= min * STEADY_RATIO
+        max * 100 <= min * (100 + STEADY_SPREAD_PCT)
     }
 
     fn enter(&mut self, busy_thin: bool) {
@@ -171,7 +173,12 @@ impl Probe {
 
     fn start_probe(&mut self) {
         let baseline = self.rate();
-        if self.wait > 0 || self.seen < RATE_TICKS || baseline < self.floor || !self.steady() {
+        if self.wait > 0
+            || self.settling > 0
+            || self.seen < RATE_TICKS
+            || baseline < self.floor
+            || !self.steady()
+        {
             return;
         }
         self.probes += 1;
@@ -432,6 +439,8 @@ mod tests {
         assert!(rig.run(RATE_TICKS as u32, 1_200, true, true));
         assert!(rig.run(RATE_TICKS as u32, 600, false, false));
         assert_eq!(rig.probe.wait, 0);
+        assert!(rig.run(1, 600, true, true));
+        assert!(rig.run(RATE_TICKS as u32, 600, false, false));
         assert!(!rig.run(1, 600, true, true));
         assert_eq!(rig.probe.probes, 2);
     }
