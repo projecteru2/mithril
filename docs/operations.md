@@ -12,7 +12,7 @@ client's current command in `cmd`.
 
 | section | fields |
 |---|---|
-| Server | `mithril_version`, `process_id`, `tcp_port`, `uptime_in_seconds`, `config_file` |
+| Server | `redis_version`, `redis_mode`, `mithril_version`, `process_id`, `tcp_port`, `uptime_in_seconds`, `config_file` |
 | Clients | `connected_clients` |
 | CPU | `used_cpu_sys`, `used_cpu_user` |
 | Stats | `total_connections_received`, `total_commands_processed`, `total_net_input_bytes`, `total_net_output_bytes`, `total_error_replies`, `redirections`, `redirect_waits`, session lifecycle counters (`readers_exited`, `writers_exited`, `sessions_closed`) |
@@ -21,7 +21,7 @@ client's current command in `cmd`.
 | Commandstats | `cmdstat_<command>:calls=<n>` for every command run at least once, subcommands as `cmdstat_client\|list`; counted once accepted, summed over workers |
 
 `CLIENT LIST` lists every connection across workers (id, addr, fd, name,
-age).
+age, cmd).
 
 The lifecycle counters exist for deploy verification: after a binary swap,
 `readers_exited`/`sessions_closed` moving under load proves which binary is

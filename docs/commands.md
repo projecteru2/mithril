@@ -124,13 +124,15 @@ returns to 0.
 ## Answered by the proxy
 
 PING, ECHO, SELECT, TIME, AUTH, HELLO, RESET, QUIT, INFO,
-CONFIG (GET; SET accepts `loglevel`, `acl-pubsub-default`, `acllog-max-len`,
-`slowlog-log-slower-than`, `slowlog-max-len`),
+CONFIG (GET over every key but `user` and the backend credentials, with
+`requirepass` redacted; SET accepts `loglevel`, `acl-pubsub-default`,
+`acllog-max-len`, `slowlog-log-slower-than`, `slowlog-max-len`),
 SLOWLOG (GET/LEN/RESET/HELP over the proxy's own slow log, see
 operations.md), PSLOWLOG (the same subcommands forwarded to every node,
 answered as `[address, reply]` pairs), CLIENT (ID/SETNAME/GETNAME/LIST),
 COMMAND (COUNT, INFO with flags and ACL categories, GETKEYS covering
-ranges, numkeys blocks, STREAMS lists and STORE targets), ACL (CAT,
+ranges, numkeys blocks, STREAMS lists and STORE targets, DOCS answered
+empty), ACL (CAT,
 SETUSER, GETUSER, DELUSER, USERS, LIST, WHOAMI, GENPASS, LOG),
 MULTI/EXEC/DISCARD, and the
 CLUSTER family. CLUSTER INFO/MYID/KEYSLOT/NODES/SLOTS/SHARDS describe a

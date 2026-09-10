@@ -20,8 +20,8 @@ emulation advertises, and the sample config binds the wildcard address.
 ## Release binaries
 
 Every GitHub release carries static Linux binaries (x86_64 and arm64, musl)
-and a macOS arm64 binary, each as a tarball with the sample config, plus a
-`checksums.txt`:
+and a macOS arm64 binary, each as a tarball with the sample config, LICENSE
+and README, plus a `checksums.txt`:
 
 ```shell
 V=0.1.6
@@ -38,7 +38,7 @@ up automatically):
 
 ```shell
 make build            # release binary at target/release/mithril
-make test lint        # the CI gate: cargo test + clippy -D warnings
+make test lint fmt-check   # the CI gate: cargo test, clippy -D warnings, rustfmt --check
 ```
 
 The `Makefile` injects the git tag and revision into `--version`.
