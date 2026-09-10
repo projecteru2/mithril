@@ -11,15 +11,13 @@ use crate::stats::{self, Pipes, Stats};
 // pipelining score: a local session shares at 0, a shared one returns at PIPELINED_LOCAL
 pub(super) const PIPELINED_LOCAL: u8 = 4;
 const PIPELINED_MAX: u8 = 8;
-// what triggers a probe: a worker is busy and its local backend batches would
-// stay thin (in-flight commands per master)
+// a worker busy with thin local batches (in-flight commands per master) is what triggers a probe
 const TUNE_PERIOD: Duration = Duration::from_millis(100);
 const BUSY_ENTER: u32 = 85;
 const BUSY_LEAVE: u32 = 60;
 const DEPTH_ENTER: u64 = 8;
 const DEPTH_LEAVE: u64 = 16;
-// ticks the enter or leave condition must hold: moving sessions off the workers
-// lowers their busyness, so leaving is slow and entering prompt
+// leaving is slow, since moving the sessions away is what lowers the workers' busyness
 const ENTER_TICKS: u32 = 3;
 const LEAVE_TICKS: u32 = 30;
 // the command-rate window, ten ticks of 100 ms, so a rate is commands per second
@@ -34,16 +32,14 @@ const MIN_RATE_PER_SEC: u64 = 100;
 // ticks to the next probe, doubling while decisions confirm the current state
 const PROBE_BACKOFF_TICKS: u32 = 600;
 const PROBE_BACKOFF_MAX_TICKS: u32 = 4800;
-const PROBE_DOUBLINGS: u32 = (PROBE_BACKOFF_MAX_TICKS / PROBE_BACKOFF_TICKS).ilog2();
 // a rate this far under the one the shared pipes were chosen on is a lighter workload
 const RATE_FALL_PCT: u64 = 25;
 // a baseline whose ticks spread wider than this holds a gap or a ramp, not a rate
 const STEADY_SPREAD_PCT: u64 = 25;
 
 impl Session {
-    // an unpipelined session gains from the deeper batches of the shared pipe, a
-    // pipelined one from its worker-local connection; a switch happens while nothing
-    // is in flight
+    // an unpipelined session gains from the shared pipe's batching, a pipelined one from
+    // its worker's connection; a switch happens while nothing is in flight
     pub(super) fn adapt_pipes(&self) {
         let depth = self.outstanding();
         let score = self.pipelined.get();
@@ -59,16 +55,6 @@ impl Session {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-enum Phase {
-    #[default]
-    Steady,
-    Probing {
-        baseline: u64,
-        ticks: u32,
-    },
-}
-
 // the proxy's experiment: a busy-and-thin majority triggers it, the measured command rate decides
 #[derive(Default)]
 struct Probe {
@@ -76,23 +62,24 @@ struct Probe {
     probes: u64,
     keeps: u64,
     reverts: u64,
-    phase: Phase,
+    probing: Option<(u64, u32)>,
     streak: u32,
     wait: u32,
-    confirmed: u32,
+    backoff: u32,
     decided: u64,
     settling: u32,
     shifted: bool,
     floor: u64,
     ring: [u64; RATE_TICKS],
     at: usize,
-    seen: usize,
     last: u64,
 }
 
 impl Probe {
     fn new(workers: usize) -> Probe {
         Probe {
+            backoff: PROBE_BACKOFF_TICKS,
+            settling: RATE_TICKS as u32,
             floor: MIN_RATE_PER_SEC * workers as u64,
             ..Probe::default()
         }
@@ -102,10 +89,10 @@ impl Probe {
         self.record(commands_now);
         self.wait = self.wait.saturating_sub(1);
         self.settle();
-        match self.phase {
-            Phase::Probing { baseline, ticks } => self.probing(baseline, ticks),
-            Phase::Steady if self.prefer => self.leave(still_busy),
-            Phase::Steady => self.enter(busy_thin),
+        match self.probing {
+            Some((baseline, ticks)) => self.advance(baseline, ticks),
+            None if self.prefer => self.leave(still_busy),
+            None => self.enter(busy_thin),
         }
         self.prefer
     }
@@ -116,11 +103,8 @@ impl Probe {
         pipes.reverts.store(self.reverts, Ordering::Relaxed);
     }
 
-    // on the shared pipes a rate that fell well under the decided one is judged
-    // again once it is steady and above the floor: back near it the workload only
-    // paused, still under it the local path may serve the lighter load better and
-    // the decision is void; a heavier load batches at least as well, and from the
-    // local path the busy trigger already watches
+    // on the shared pipes a rate that fell a quarter under the decided one voids the
+    // decision once it has settled there; back near it, the workload only paused
     fn settle(&mut self) {
         self.settling = self.settling.saturating_sub(1);
         if self.settling > 0 || self.decided == 0 || !self.prefer {
@@ -132,7 +116,7 @@ impl Probe {
                 self.shifted = true;
                 self.settling = RATE_TICKS as u32;
             }
-        } else if self.steady() && self.rate() >= self.floor {
+        } else if self.settled() {
             self.shifted = false;
             if fell {
                 self.decided = 0;
@@ -145,19 +129,21 @@ impl Probe {
         self.ring[self.at] = commands_now.saturating_sub(self.last);
         self.at = (self.at + 1) % RATE_TICKS;
         self.last = commands_now;
-        self.seen = (self.seen + 1).min(RATE_TICKS);
     }
 
     fn rate(&self) -> u64 {
         self.ring.iter().sum()
     }
 
-    fn steady(&self) -> bool {
+    // the ring holds one steady second of real traffic
+    fn settled(&self) -> bool {
         let (min, max) = self
             .ring
             .iter()
             .fold((u64::MAX, 0), |(lo, hi), &v| (lo.min(v), hi.max(v)));
-        max * 100 <= min * (100 + STEADY_SPREAD_PCT)
+        self.settling == 0
+            && self.rate() >= self.floor
+            && max * 100 <= min * (100 + STEADY_SPREAD_PCT)
     }
 
     fn enter(&mut self, busy_thin: bool) {
@@ -189,26 +175,19 @@ impl Probe {
     }
 
     fn start_probe(&mut self) {
-        let baseline = self.rate();
-        if self.wait > 0
-            || self.settling > 0
-            || self.shifted
-            || self.seen < RATE_TICKS
-            || baseline < self.floor
-            || !self.steady()
-        {
+        if self.wait > 0 || self.shifted || !self.settled() {
             return;
         }
         self.probes += 1;
         self.streak = 0;
         self.prefer = !self.prefer;
-        self.phase = Phase::Probing { baseline, ticks: 0 };
+        self.probing = Some((self.rate(), 0));
     }
 
-    fn probing(&mut self, baseline: u64, ticks: u32) {
+    fn advance(&mut self, baseline: u64, ticks: u32) {
         let ticks = ticks + 1;
         if ticks < PROBE_TICKS {
-            self.phase = Phase::Probing { baseline, ticks };
+            self.probing = Some((baseline, ticks));
             return;
         }
         let measured = self.rate();
@@ -218,13 +197,13 @@ impl Probe {
             (baseline, measured)
         };
         let keep = shared * 100 >= local * (100 + KEEP_GAIN_PCT);
-        // a decision that flips the state starts the schedule over, one that confirms it waits longer
+        // a flip restarts the schedule, a confirmation waits longer
         if keep == self.prefer {
-            self.confirmed = 0;
+            self.backoff = PROBE_BACKOFF_TICKS;
             self.wait = PROBE_BACKOFF_TICKS;
         } else {
-            self.wait = PROBE_BACKOFF_TICKS << self.confirmed;
-            self.confirmed = (self.confirmed + 1).min(PROBE_DOUBLINGS);
+            self.wait = self.backoff;
+            self.backoff = (self.backoff * 2).min(PROBE_BACKOFF_MAX_TICKS);
         }
         if keep {
             self.keeps += 1;
@@ -235,12 +214,11 @@ impl Probe {
         self.settling = RATE_TICKS as u32;
         self.shifted = false;
         self.prefer = keep;
-        self.phase = Phase::Steady;
+        self.probing = None;
     }
 }
 
-/// Publishes this worker's CPU busyness and batch depth and mirrors the process-wide
-/// pipe preference; the lead worker also runs the experiment that sets it.
+/// Publishes the worker's load samples and mirrors the pipe preference; the lead worker runs the experiment.
 pub async fn auto_tuner(shared: Rc<Shared>, lead: bool) {
     let mut last_ticks = stats::thread_cpu_ticks();
     let mut last_at = Instant::now();
@@ -275,8 +253,7 @@ pub async fn auto_tuner(shared: Rc<Shared>, lead: bool) {
     }
 }
 
-// the cost of the shared pipes is process-wide, so one experiment moves every session
-// and the whole proxy's command rate judges it
+// the shared pipes cost the whole proxy: one experiment moves every session, the proxy's rate judges
 fn conduct(stats: &Stats, probe: &mut Probe) {
     let (busy_thin, still_busy, commands) = survey(stats);
     let prefer = probe.tick(busy_thin, still_busy, commands);
@@ -316,16 +293,10 @@ fn switch_pipes(sharded: bool, score: u8, worker_prefers_shared: bool) -> bool {
 
 // a never-idle session is paused to move only for a switch still wanted once it drains
 fn must_drain(sharded: bool, score: u8, worker_prefers_shared: bool) -> bool {
-    if worker_prefers_shared {
-        !sharded
-    } else {
-        sharded && score >= PIPELINED_LOCAL
-    }
+    (worker_prefers_shared || sharded) && switch_pipes(sharded, score, worker_prefers_shared)
 }
 
-// the measured local batch while local traffic flows; with none, the in-flight
-// commands spread over the masters — an estimate that errs toward staying on the
-// shared pipes, which at saturation batch at least as well as local connections
+// with no local writes, in-flight commands per master stand in, erring toward the shared pipes
 fn tune_depth(measured: u32, writes: u32, inflight: u64, masters: u64) -> u64 {
     if writes > 0 {
         u64::from(measured)

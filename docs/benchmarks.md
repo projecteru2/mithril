@@ -54,11 +54,9 @@ unpipelined saturation cells — which `backend-sharding` recovers.
 
 ### backend-sharding auto (same rig, commit e6e1592 lineage)
 
-`auto` decides per worker and per session: a worker that is busy with
-thin local batches moves every session it hosts to the shared pipes, a
-lightly loaded worker keeps its own connections, and an unpipelined
-session prefers the shared pipe on its own (see architecture.md). Two
-rounds each, redis-benchmark unless stated:
+The table was measured with the first `auto`, whose worker rule moved
+sessions on busyness alone; the paragraph after it has the current
+mechanism. Two rounds each, redis-benchmark unless stated:
 
 | cell | default | shard | auto |
 |---|---|---|---|

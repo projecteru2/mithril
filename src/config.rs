@@ -220,8 +220,7 @@ impl Config {
         if self.backend_sharding == Sharding::On && self.backend_conns > 1 {
             crate::log_warn!("backend-conns is ignored under backend-sharding");
         }
-        // one worker with one connection per node already carries every request on
-        // the pipe the shared lane would add: nothing to share
+        // one worker with one connection per node has nothing to share
         if self.workers == 1 && self.backend_conns == 1 && self.backend_sharding == Sharding::Auto {
             self.backend_sharding = Sharding::Off;
         }
