@@ -35,8 +35,8 @@ const MIN_RATE_PER_SEC: u64 = 100;
 const PROBE_BACKOFF_TICKS: u32 = 600;
 const PROBE_BACKOFF_MAX_TICKS: u32 = 4800;
 const PROBE_DOUBLINGS: u32 = (PROBE_BACKOFF_MAX_TICKS / PROBE_BACKOFF_TICKS).ilog2();
-// a rate this far from the one the current state was chosen on is a changed workload
-const RATE_SHIFT_PCT: u64 = 25;
+// a rate this far under the one the shared pipes were chosen on is a lighter workload
+const RATE_FALL_PCT: u64 = 25;
 // a baseline whose ticks spread wider than this holds a gap or a ramp, not a rate
 const STEADY_SPREAD_PCT: u64 = 25;
 
@@ -116,23 +116,25 @@ impl Probe {
         pipes.reverts.store(self.reverts, Ordering::Relaxed);
     }
 
-    // a rate that leaves the decided one is judged again once it is steady and
-    // above the floor: back near it the workload only paused, away from it the
-    // decision is void; an idle proxy waits for traffic
+    // on the shared pipes a rate that fell well under the decided one is judged
+    // again once it is steady and above the floor: back near it the workload only
+    // paused, still under it the local path may serve the lighter load better and
+    // the decision is void; a heavier load batches at least as well, and from the
+    // local path the busy trigger already watches
     fn settle(&mut self) {
         self.settling = self.settling.saturating_sub(1);
-        if self.settling > 0 || self.decided == 0 {
+        if self.settling > 0 || self.decided == 0 || !self.prefer {
             return;
         }
-        let moved = self.rate().abs_diff(self.decided) * 100 > self.decided * RATE_SHIFT_PCT;
+        let fell = self.rate() * 100 < self.decided * (100 - RATE_FALL_PCT);
         if !self.shifted {
-            if moved {
+            if fell {
                 self.shifted = true;
                 self.settling = RATE_TICKS as u32;
             }
         } else if self.steady() && self.rate() >= self.floor {
             self.shifted = false;
-            if moved {
+            if fell {
                 self.decided = 0;
                 self.wait = 0;
             }
@@ -469,6 +471,16 @@ mod tests {
         assert!(!rig.run(RATE_TICKS as u32, 1_000, true, true));
         assert_eq!(rig.probe.probes, 1);
         assert_eq!(rig.probe.wait, PROBE_BACKOFF_TICKS - RATE_TICKS as u32);
+    }
+
+    #[test]
+    fn a_heavier_workload_keeps_the_shared_pipes() {
+        let mut rig = Rig::new();
+        rig.run(RATE_TICKS as u32, 1_000, true, true);
+        assert!(rig.run(PROBE_TICKS, 1_200, true, true));
+        assert!(rig.run(4 * RATE_TICKS as u32, 2_400, true, true));
+        assert_eq!(rig.probe.probes, 1);
+        assert!(rig.probe.wait > 0);
     }
 
     #[test]
