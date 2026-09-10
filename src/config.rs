@@ -220,8 +220,9 @@ impl Config {
         if self.backend_sharding == Sharding::On && self.backend_conns > 1 {
             crate::log_warn!("backend-conns is ignored under backend-sharding");
         }
-        // one worker's own connections already carry every request: nothing to share
-        if self.workers == 1 && self.backend_sharding == Sharding::Auto {
+        // one worker with one connection per node already carries every request on
+        // the pipe the shared lane would add: nothing to share
+        if self.workers == 1 && self.backend_conns == 1 && self.backend_sharding == Sharding::Auto {
             self.backend_sharding = Sharding::Off;
         }
         Ok(self)
@@ -322,6 +323,11 @@ mod tests {
         let mut cfg = Config::default();
         cfg.set("bootstrap", "127.0.0.1:7001").unwrap();
         cfg.set("worker-threads", "2").unwrap();
+        assert_eq!(cfg.finish().unwrap().backend_sharding, Sharding::Auto);
+        let mut cfg = Config::default();
+        cfg.set("bootstrap", "127.0.0.1:7001").unwrap();
+        cfg.set("worker-threads", "1").unwrap();
+        cfg.set("backend-conns", "2").unwrap();
         assert_eq!(cfg.finish().unwrap().backend_sharding, Sharding::Auto);
     }
 }
