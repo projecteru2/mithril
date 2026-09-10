@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use super::Shared;
 use super::session::Session;
-use crate::stats::{self, Pipes, Stats};
+use crate::stats::{self, Stats};
 
 // pipelining score: a local session shares at 0, a shared one returns at PIPELINED_LOCAL
 pub(super) const PIPELINED_LOCAL: u8 = 4;
@@ -95,12 +95,6 @@ impl Probe {
             None => self.enter(busy_thin),
         }
         self.prefer
-    }
-
-    fn publish(&self, pipes: &Pipes) {
-        pipes.probes.store(self.probes, Ordering::Relaxed);
-        pipes.keeps.store(self.keeps, Ordering::Relaxed);
-        pipes.reverts.store(self.reverts, Ordering::Relaxed);
     }
 
     // on the shared pipes a rate that fell a quarter under the decided one voids the
@@ -258,7 +252,9 @@ fn conduct(stats: &Stats, probe: &mut Probe) {
     let (busy_thin, still_busy, commands) = survey(stats);
     let prefer = probe.tick(busy_thin, still_busy, commands);
     stats.pipes.prefer.store(prefer, Ordering::Relaxed);
-    probe.publish(&stats.pipes);
+    stats.pipes.probes.store(probe.probes, Ordering::Relaxed);
+    stats.pipes.keeps.store(probe.keeps, Ordering::Relaxed);
+    stats.pipes.reverts.store(probe.reverts, Ordering::Relaxed);
 }
 
 // a worker that has not ticked yet reads as idle and counts against both majorities
