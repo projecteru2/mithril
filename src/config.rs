@@ -111,7 +111,7 @@ impl Default for Config {
             maxclients: 10000,
             bootstrap: Vec::new(),
             backend_conns: 1,
-            backend_sharding: Sharding::Off,
+            backend_sharding: Sharding::Auto,
             reply_cache: false,
             reply_cache_max_bytes: 64 << 20,
             reply_cache_max_age_secs: 10,

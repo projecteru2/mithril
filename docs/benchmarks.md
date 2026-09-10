@@ -10,9 +10,10 @@ cores (memtier_benchmark 8 threads, 20-second windows; redis-benchmark
 reversed on the second pass; the ranges below are the two passes. 64-byte
 values unless stated, 100k keys, random keys, SET:GET 1:1 unless stated.
 
-Columns: **mithril** (default), **shard** (`backend-sharding yes`),
-**cache** (`reply-cache yes`), **shard+cache** (both), mt-proxy (C++),
-predixy (C++). Commit 9336a89 lineage.
+Columns: **mithril** (`backend-sharding no`, the default until v0.1.6),
+**shard** (`backend-sharding yes`), **cache** (`reply-cache yes`),
+**shard+cache** (both), mt-proxy (C++), predixy (C++). Commit 9336a89
+lineage.
 
 ### Throughput (ops/s)
 
@@ -70,10 +71,20 @@ rounds each, redis-benchmark unless stated:
 | memtier P16, 200 conns (sliding) | **4.36M / 0.76** | 3.59M / 0.92 | 3.74M / 0.86 |
 | memtier P1, 400 conns | 445k | 443k | 443k |
 
-`auto` lands on the better of the two paths in every cell but one: a
-sliding-pipeline client at moderate concurrency on a partly idle proxy
-runs 14% slower than default, because the shared pipes cost a hop those
-sessions cannot hide. If that is your only workload, set `no`.
+That `auto` landed on the better of the two paths in every cell but one:
+a sliding-pipeline client at moderate concurrency on a partly idle proxy
+ran 14% slower than `no`, because its worker rule moved sessions on
+busyness alone. Since v0.1.7 `auto` runs one experiment for the whole
+proxy and keeps the shared pipes only where the proxy's command rate
+measures higher (see architecture.md); on the same rig, with 90-second
+GET and 60-second memtier cells over three rotated rounds: P16 1000 conns
+GET `no` 5.54M, `auto` 8.98M, `yes` 9.01M; the sliding memtier cell `no`
+4.31M, `auto` 4.23M, `yes` 3.58M; P1 2000 conns and the cache cells at
+parity with the best fixed mode. The 2% in the sliding cell is the
+experiment itself (two two-second windows in a minute, then one per
+minute doubling to eight), which is why `auto` is now the default; set
+`no` only when a sliding pipeline is the whole workload and that 2%
+matters more than the 60% the other shapes gain.
 
 Re-measured at v0.1.6 on the same rig (four rotated rounds, default /
 shard / auto): P16 1000 conns GET 5.55M / 8.87M / 8.76M and SET 5.54M /

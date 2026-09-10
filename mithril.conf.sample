@@ -17,7 +17,7 @@ bootstrap 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
 backend-conns 1
 # one process-wide pipe per node (deeper backend batches for unpipelined load):
 # no | yes | auto (per session: unpipelined sessions share, pipelining ones stay local)
-# backend-sharding no
+# backend-sharding auto
 
 # worker-local GET/MGET reply cache, kept coherent by server-side key tracking
 # reply-cache no
