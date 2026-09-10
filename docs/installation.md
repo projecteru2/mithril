@@ -24,7 +24,7 @@ and a macOS arm64 binary, each as a tarball with the sample config, LICENSE
 and README, plus a `checksums.txt`:
 
 ```shell
-V=0.1.6
+V=0.1.7
 curl -LO https://github.com/projecteru2/mithril/releases/download/v$V/mithril_${V}_Linux_x86_64.tar.gz
 curl -LO https://github.com/projecteru2/mithril/releases/download/v$V/checksums.txt
 grep "mithril_${V}_Linux_x86_64" checksums.txt | sha256sum -c
