@@ -723,6 +723,7 @@ async fn track_once(addr: &str, w: &Rc<Wiring>) -> Result<(), String> {
     };
     w.rearm(addr, &frame).await?;
     w.cache.tracker_up(addr);
+    log_debug!("tracker {addr} up, id {id}");
 
     let mut ping = tokio::time::interval(TRACKER_PING);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

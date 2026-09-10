@@ -175,6 +175,7 @@ impl Backends {
             .await;
             check_rearm(rx.await.ok())?;
         }
+        log_debug!("rearm {addr}: {} connections", conns.len());
         Ok(())
     }
 
@@ -270,6 +271,11 @@ impl Backends {
             Some(t) if role == Role::Master && db == 0 => t.borrow().get(addr).cloned(),
             _ => None,
         };
+        log_debug!(
+            "dial {addr} db{db} exclusive={} tracking={}",
+            role == Role::Exclusive,
+            tracking.is_some()
+        );
         let addr = addr.to_string();
         let cfg = self.cfg.clone();
         let depth = self.depth.clone();
