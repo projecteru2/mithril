@@ -116,8 +116,9 @@ impl Probe {
         pipes.reverts.store(self.reverts, Ordering::Relaxed);
     }
 
-    // a rate that leaves the decided one is judged again once it is steady: back
-    // near it the workload only paused, away from it the decision is void
+    // a rate that leaves the decided one is judged again once it is steady and
+    // above the floor: back near it the workload only paused, away from it the
+    // decision is void; an idle proxy waits for traffic
     fn settle(&mut self) {
         self.settling = self.settling.saturating_sub(1);
         if self.settling > 0 || self.decided == 0 {
@@ -129,7 +130,7 @@ impl Probe {
                 self.shifted = true;
                 self.settling = RATE_TICKS as u32;
             }
-        } else if self.steady() {
+        } else if self.steady() && self.rate() >= self.floor {
             self.shifted = false;
             if moved {
                 self.decided = 0;
@@ -477,6 +478,10 @@ mod tests {
         assert!(rig.run(PROBE_TICKS, 1_200, true, true));
         rig.run(RATE_TICKS as u32, 1_200, true, true);
         rig.run(3, 0, false, false);
+        assert!(rig.run(3 * RATE_TICKS as u32, 1_200, true, true));
+        assert_eq!(rig.probe.probes, 1);
+        assert!(rig.probe.wait > 0);
+        rig.run(2 * RATE_TICKS as u32, 0, false, false);
         assert!(rig.run(3 * RATE_TICKS as u32, 1_200, true, true));
         assert_eq!(rig.probe.probes, 1);
         assert!(rig.probe.wait > 0);
