@@ -354,8 +354,8 @@ impl Session {
         let id = if spec.subs.is_empty() {
             spec.id
         } else {
-            resp::Args::new(&frame, argc)
-                .nth(1)
+            it.clone()
+                .next()
                 .and_then(|sub| spec.subcommand(sub))
                 .map_or(spec.id, |sub| sub.id)
         };

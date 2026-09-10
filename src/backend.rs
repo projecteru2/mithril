@@ -371,8 +371,7 @@ pub fn ensure_read_room(buf: &mut BytesMut) {
     }
 }
 
-// assumes RESP2 backends: a reply with no request pending is a desync, not a push;
-// true once a caching opt-in was refused, which says the connection's tracking is off
+// RESP2 only: a reply with no request pending is a desync, not a push; true on a refused opt-in
 pub(crate) fn pair_replies<S>(
     buf: &mut BytesMut,
     cur: &mut resp::Cursor,

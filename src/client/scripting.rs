@@ -8,6 +8,7 @@ use super::session::Session;
 use crate::command::{self, Spec};
 use crate::crc16;
 use crate::resp;
+use crate::script::Scripts;
 use crate::topology::Topology;
 
 impl Session {
@@ -24,9 +25,8 @@ impl Session {
                     self.emit_error("ERR wrong number of arguments for 'script|load' command");
                     return;
                 };
-                // copied: the request frame is a slice of the session's read buffer
-                let body = Bytes::copy_from_slice(body);
-                let remember = Some((body, self.shared.scripts.flushes()));
+                let load = Scripts::load_of(body);
+                let remember = Some((load, self.shared.scripts.flushes()));
                 (Targets::LiveNodes, Gather::Same, remember)
             }
             "script" if is(b"exists") => (Targets::Masters, Gather::Every, None),

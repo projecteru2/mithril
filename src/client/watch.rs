@@ -147,6 +147,13 @@ impl Watched {
         self.lease.borrow().as_ref().map(|l| l.conn().clone())
     }
 
+    fn conn_dead(&self) -> bool {
+        self.lease
+            .borrow()
+            .as_ref()
+            .is_some_and(|l| l.conn().is_dead())
+    }
+
     fn answer(&self, reply_q: &ReplyQueue, seq: u64, reply: Bytes) {
         self.owed.borrow_mut().retain(|&s| s != seq);
         let _ = reply_q.send(Reply::At(seq, reply));
@@ -461,7 +468,7 @@ impl Session {
                     .push_back(Queued::Cmd { seq, head, frame });
                 None
             }
-            State::Armed | State::Finishing if watched.conn().is_some_and(|c| c.is_dead()) => {
+            State::Armed | State::Finishing if watched.conn_dead() => {
                 watched.die(&self.reply_q, seq, Bytes::from_static(ERR_BACKEND_LOST));
                 None
             }

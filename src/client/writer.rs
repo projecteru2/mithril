@@ -454,6 +454,9 @@ pub(super) async fn write_loop(
             }
             stats::add(&shared.wstats.bytes_out, total as u64);
             ready.clear();
+            if ready.capacity() > 1024 {
+                ready = Vec::with_capacity(BATCH);
+            }
         }
         shared.inflight.set(
             shared

@@ -40,7 +40,7 @@ impl Session {
         frame: Bytes,
         targets: Targets,
         gather: Gather,
-        // a SCRIPT LOAD body with the flush count at its dispatch, remembered under the returned sha
+        // a SCRIPT LOAD frame with the flush count at its dispatch, remembered under the returned sha
         remember: Option<(Bytes, u64)>,
     ) {
         let seq = self.alloc_seq();
@@ -81,10 +81,10 @@ impl Session {
                 Gather::Every => multikey::merge_every(replies.iter()),
                 Gather::PerNode => Ok(per_node(&topo, &nodes, &replies)),
             };
-            if let (Ok(reply), Some((body, flushes))) = (&merged, remember)
+            if let (Ok(reply), Some((load, flushes))) = (&merged, remember)
                 && let Some(sha) = resp::bulk_payload(reply)
             {
-                shared.scripts.remember(sha, body, flushes);
+                shared.scripts.remember(sha, load, flushes);
             }
             link.hold.set(false);
             let _ = reply_q.send(Reply::At(seq, merged.unwrap_or_else(|e| e)));
