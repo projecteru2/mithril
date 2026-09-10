@@ -451,6 +451,7 @@ impl Session {
             let _marks = marks;
             let mut results: Vec<(Vec<usize>, Bytes)> = Vec::with_capacity(parts.len());
             let mut retries: Vec<(multikey::Part, oneshot::Receiver<Bytes>)> = Vec::new();
+            let mut reruns: Vec<(multikey::Part, oneshot::Receiver<Bytes>)> = Vec::new();
             let mut singles = Singles::new(merge);
             let mut cached = cached.into_iter();
             for (part, rx) in parts.into_iter().zip(receivers) {
@@ -464,14 +465,9 @@ impl Session {
                     results.push((part.positions, reply));
                     continue;
                 }
-                // a redirected part executed nothing: one resend is idempotent
                 match parse_redirect(&reply) {
                     Some((ask, target)) => {
-                        stats::bump(&shared.wstats.redirects);
-                        let _ = shared.refresh.send(());
-                        let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
-                        let frame = part.frame.clone();
-                        let rx = scatter_one(&shared, target, lane, head, frame).await;
+                        let rx = redirect(&shared, target, ask, lane, &part.frame).await;
                         retries.push((part, rx));
                     }
                     None if reply.starts_with(CACHING_REFUSED) => {
@@ -481,7 +477,7 @@ impl Session {
                                 let addr = &topo.nodes[idx as usize].addr;
                                 let frame = part.frame.clone();
                                 let rx = scatter_one(&shared, addr, lane, None, frame).await;
-                                retries.push((part, rx));
+                                reruns.push((part, rx));
                             }
                             None => results.push((part.positions, reply)),
                         }
@@ -500,6 +496,14 @@ impl Session {
                     }
                     None => results.push((part.positions, reply)),
                 }
+            }
+            for (part, rx) in reruns {
+                let reply = recv_or_lost(rx).await;
+                let rx = match parse_redirect(&reply) {
+                    Some((ask, target)) => redirect(&shared, target, ask, lane, &part.frame).await,
+                    None => resolved(reply),
+                };
+                retries.push((part, rx));
             }
             for (part, rx) in retries {
                 let reply = recv_or_lost(rx).await;
@@ -637,6 +641,20 @@ fn part_head(
         Some(PartCache::Fill(_)) => Some(Some(Bytes::from_static(CACHING_FRAME))),
         _ => Some(None),
     }
+}
+
+// a redirected part executed nothing: one resend is idempotent
+async fn redirect(
+    shared: &Rc<Shared>,
+    target: &str,
+    ask: bool,
+    lane: Lane,
+    frame: &Bytes,
+) -> oneshot::Receiver<Bytes> {
+    stats::bump(&shared.wstats.redirects);
+    let _ = shared.refresh.send(());
+    let head = ask.then(|| Bytes::from_static(ASKING_FRAME));
+    scatter_one(shared, target, lane, head, frame.clone()).await
 }
 
 // a part served from the cache answers through the same channel as a fetched one
