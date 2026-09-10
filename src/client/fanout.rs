@@ -13,7 +13,7 @@ use super::pipe::{
 use super::session::Session;
 use super::{Cold, ERR_NO_OWNER, Lane, Reply, Shared, error_frame};
 use crate::backend::{ASKING_FRAME, BATCH, ERR_BACKEND_LOST};
-use crate::cache::{CACHING_FRAME, ReplyCache};
+use crate::cache::{CACHING_FRAME, CACHING_REFUSED, ReplyCache};
 use crate::command::{self, Kind, Spec};
 use crate::multikey;
 use crate::resp;
@@ -473,6 +473,17 @@ impl Session {
                         let frame = part.frame.clone();
                         let rx = scatter_one(&shared, target, lane, head, frame).await;
                         retries.push((part, rx));
+                    }
+                    None if reply.starts_with(CACHING_REFUSED) => {
+                        let topo = shared.topo.load_full();
+                        match topo.nodes.get(usize::from(part.node)) {
+                            Some(node) => {
+                                let frame = part.frame.clone();
+                                let rx = scatter_one(&shared, &node.addr, lane, None, frame).await;
+                                retries.push((part, rx));
+                            }
+                            None => results.push((part.positions, reply)),
+                        }
                     }
                     None if degradable && reply.starts_with(b"-TRYAGAIN") => {
                         // boxed: the resend's state must not widen every fan-out's future

@@ -251,23 +251,32 @@ pub(super) async fn write_loop(
                         let _ = shared.refresh.send(());
                         frame = Bytes::from_static(ERR_TRYAGAIN);
                     } else if frame.starts_with(CACHING_REFUSED)
-                        && let Some((retry, slot, db)) = take_bounce(&link, seq)
+                        && let Some((retry, slot, db)) = take_refused(&link, seq)
                     {
                         // the connection re-tracks itself; the request runs again without the opt-in
                         let topo = shared.topo.load_full();
-                        if let Some(idx) = topo.owner(slot) {
-                            let resend = Resend {
-                                shared: &shared,
-                                reply_q: &reply_q,
-                                link: &link,
-                                client_id,
-                            };
-                            resend
-                                .requeue(&topo.nodes[idx as usize].addr, seq, None, retry, 0, db)
-                                .await;
-                            continue;
+                        match topo.owner(slot) {
+                            Some(idx) => {
+                                let resend = Resend {
+                                    shared: &shared,
+                                    reply_q: &reply_q,
+                                    link: &link,
+                                    client_id,
+                                };
+                                let addr = &topo.nodes[idx as usize].addr;
+                                resend.requeue(addr, seq, None, retry, 0, db).await;
+                                continue;
+                            }
+                            None => {
+                                if let Some(fill) = retry.2
+                                    && let Some(cache) = &shared.cache
+                                {
+                                    fill.abandon(cache);
+                                }
+                                let _ = shared.refresh.send(());
+                                frame = Bytes::from_static(ERR_TRYAGAIN);
+                            }
                         }
-                        frame = Bytes::from_static(ERR_TRYAGAIN);
                     } else if frame.starts_with(NOSCRIPT)
                         && rerunnable(&link, seq)
                         && let Some((retry, db, target)) = take_reload(&link, seq)
@@ -504,6 +513,11 @@ fn take_retry(link: &WriterLink, seq: u64, ask: bool, target: &str) -> Option<(R
     let db = entry.db;
     let fill = link.detach_fill(&mut entry);
     Some(((entry.frame.clone(), entry.expect, fill), db))
+}
+
+fn take_refused(link: &WriterLink, seq: u64) -> Option<(Retry, u16, u8)> {
+    let filled = entry_at(&link.inflight, seq)?.fill.is_some();
+    filled.then(|| take_bounce(link, seq)).flatten()
 }
 
 // a request that must wait a topology change out takes one ride, while nothing later holds a sequence

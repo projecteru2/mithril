@@ -374,7 +374,6 @@ pub fn ensure_read_room(buf: &mut BytesMut) {
 // assumes RESP2 backends: a reply with no request pending is a desync, not a push;
 // true once a caching opt-in was refused, which says the connection's tracking is off
 pub(crate) fn pair_replies<S>(
-    addr: &str,
     buf: &mut BytesMut,
     cur: &mut resp::Cursor,
     pending: &mut VecDeque<Pending<S>>,
@@ -391,12 +390,7 @@ pub(crate) fn pair_replies<S>(
                     Some(front) if front.expect > 1 => {
                         front.expect -= 1;
                         if front_err.is_none() && frame.first() == Some(&b'-') {
-                            if frame.starts_with(CACHING_REFUSED) {
-                                log_warn!(
-                                    "backend {addr}: caching opt-in refused, tracking re-sent"
-                                );
-                                refused = true;
-                            }
+                            refused |= frame.starts_with(CACHING_REFUSED);
                             *front_err = Some(frame);
                         }
                     }
@@ -495,13 +489,13 @@ pub(crate) async fn pump<S, D: Fn(S, Bytes) + Copy>(
                 if matches!(r, Ok(0) | Err(_)) {
                     break 'io;
                 }
-                match pair_replies(addr, &mut buf, &mut cur, &mut pending, &mut front_err, deliver) {
+                match pair_replies(&mut buf, &mut cur, &mut pending, &mut front_err, deliver) {
                     Err(e) => {
                         log_debug!("backend {addr} protocol error: {e}");
                         break 'io;
                     }
-                    Ok(true) => {
-                        if let Some(frame) = tracking_frame(tracking, addr, db, readonly) {
+                    Ok(true) => match tracking_frame(tracking, addr, db, readonly) {
+                        Some(frame) => {
                             pending.push_back(Pending {
                                 expect: 1,
                                 sink: None,
@@ -509,8 +503,10 @@ pub(crate) async fn pump<S, D: Fn(S, Bytes) + Copy>(
                             if write_frames(&mut write_half, &[frame]).await.is_err() {
                                 break 'io;
                             }
+                            log_warn!("backend {addr}: caching opt-in refused, tracking re-sent");
                         }
-                    }
+                        None => log_warn!("backend {addr}: caching opt-in refused, no tracker up"),
+                    },
                     Ok(false) => {}
                 }
             }
@@ -757,7 +753,7 @@ mod tests {
         let mut cur = resp::Cursor::default();
         let mut front_err = None;
         let got = RefCell::new(Vec::new());
-        pair_replies("m", &mut buf, &mut cur, pending, &mut front_err, |s, f| {
+        pair_replies(&mut buf, &mut cur, pending, &mut front_err, |s, f| {
             got.borrow_mut().push((s, f))
         })?;
         Ok(got.into_inner())
@@ -767,7 +763,7 @@ mod tests {
         let mut buf = BytesMut::from(buf);
         let mut cur = resp::Cursor::default();
         let mut front_err = None;
-        pair_replies("m", &mut buf, &mut cur, pending, &mut front_err, |_, _| {}).unwrap()
+        pair_replies(&mut buf, &mut cur, pending, &mut front_err, |_, _| {}).unwrap()
     }
 
     #[test]
