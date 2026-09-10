@@ -476,10 +476,11 @@ impl Session {
                     }
                     None if reply.starts_with(CACHING_REFUSED) => {
                         let topo = shared.topo.load_full();
-                        match topo.nodes.get(usize::from(part.node)) {
-                            Some(node) => {
+                        match request_slot(&part.frame).and_then(|s| topo.owner(s)) {
+                            Some(idx) => {
+                                let addr = &topo.nodes[idx as usize].addr;
                                 let frame = part.frame.clone();
-                                let rx = scatter_one(&shared, &node.addr, lane, None, frame).await;
+                                let rx = scatter_one(&shared, addr, lane, None, frame).await;
                                 retries.push((part, rx));
                             }
                             None => results.push((part.positions, reply)),
