@@ -105,7 +105,8 @@ local traffic flows), and one worker turns those samples into a single
 experiment for the whole proxy, since the cost of the shared pipes is
 process-wide and a per-worker verdict measures a free-rider gain. Half the
 workers busy (85% and above) with thin local batches (under eight frames
-per write) for 300 ms moves every session to the shared pipes; the proxy
+per write) for 300 ms, once the command rate has been steady for a second,
+moves every session to the shared pipes; the proxy
 then compares the commands it runs a second later against the second
 before the move, keeps them on a 5% gain, and otherwise takes them back
 and waits a minute before trying again, doubling that to eight minutes

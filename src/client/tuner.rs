@@ -37,6 +37,8 @@ const PROBE_BACKOFF_MAX_TICKS: u32 = 4800;
 const PROBE_DOUBLINGS: u32 = (PROBE_BACKOFF_MAX_TICKS / PROBE_BACKOFF_TICKS).ilog2();
 // a rate this far from the one the current state was chosen on is a changed workload
 const RATE_SHIFT_PCT: u64 = 25;
+// a baseline whose ticks spread wider than this ratio holds a gap or a ramp, not a rate
+const STEADY_RATIO: u64 = 2;
 
 impl Session {
     // an unpipelined session gains from the deeper batches of the shared pipe, a
@@ -132,6 +134,14 @@ impl Probe {
         self.ring.iter().sum()
     }
 
+    fn steady(&self) -> bool {
+        let (min, max) = self
+            .ring
+            .iter()
+            .fold((u64::MAX, 0), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        max <= min * STEADY_RATIO
+    }
+
     fn enter(&mut self, busy_thin: bool) {
         if !busy_thin {
             self.streak = 0;
@@ -161,7 +171,7 @@ impl Probe {
 
     fn start_probe(&mut self) {
         let baseline = self.rate();
-        if self.wait > 0 || self.seen < RATE_TICKS || baseline < self.floor {
+        if self.wait > 0 || self.seen < RATE_TICKS || baseline < self.floor || !self.steady() {
             return;
         }
         self.probes += 1;
@@ -435,6 +445,17 @@ mod tests {
         assert!(!rig.run(RATE_TICKS as u32, 1_000, true, true));
         assert_eq!(rig.probe.probes, 1);
         assert_eq!(rig.probe.wait, PROBE_BACKOFF_TICKS - RATE_TICKS as u32);
+    }
+
+    #[test]
+    fn a_probe_waits_for_a_steady_baseline() {
+        let mut rig = Rig::new();
+        rig.run(RATE_TICKS as u32 - 1, 1_000, true, true);
+        rig.run(1, 0, true, true);
+        assert!(!rig.run(RATE_TICKS as u32 - 1, 1_000, true, true));
+        assert_eq!(rig.probe.probes, 0);
+        assert!(rig.run(1, 1_000, true, true));
+        assert_eq!(rig.probe.probes, 1);
     }
 
     #[test]
