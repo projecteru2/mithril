@@ -110,9 +110,10 @@ moves every session to the shared pipes; the proxy
 then compares the commands it runs a second later against the second
 before the move, keeps them on a 5% gain, and otherwise takes them back
 and waits a minute before trying again, doubling that to eight minutes
-while the answer holds; a command rate that moves a quarter away from the
-one the answer was measured on ends the wait, since the workload it was
-measured on is gone. From the shared pipes it probes the other way on
+while the answer holds; a command rate that settles a quarter away from
+the one the answer was measured on ends the wait, since that workload is
+gone, while a pause that returns to it changes nothing. From the shared
+pipes it probes the other way on
 the same schedule, and lets go unmeasured once fewer than half the workers
 have stayed busy for three seconds — slowly, because moving the sessions
 away is what lowers their busyness. An idle proxy never probes. Switches happen only while a session has

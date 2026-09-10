@@ -82,6 +82,7 @@ struct Probe {
     confirmed: u32,
     decided: u64,
     settling: u32,
+    shifted: bool,
     floor: u64,
     ring: [u64; RATE_TICKS],
     at: usize,
@@ -100,17 +101,7 @@ impl Probe {
     fn tick(&mut self, busy_thin: bool, still_busy: bool, commands_now: u64) -> bool {
         self.record(commands_now);
         self.wait = self.wait.saturating_sub(1);
-        // the ring still holds the losing trial for one window after a decision, and
-        // both rates for one window after a shift
-        self.settling = self.settling.saturating_sub(1);
-        if self.settling == 0
-            && self.decided > 0
-            && self.rate().abs_diff(self.decided) * 100 > self.decided * RATE_SHIFT_PCT
-        {
-            self.decided = 0;
-            self.wait = 0;
-            self.settling = RATE_TICKS as u32;
-        }
+        self.settle();
         match self.phase {
             Phase::Probing { baseline, ticks } => self.probing(baseline, ticks),
             Phase::Steady if self.prefer => self.leave(still_busy),
@@ -123,6 +114,28 @@ impl Probe {
         pipes.probes.store(self.probes, Ordering::Relaxed);
         pipes.keeps.store(self.keeps, Ordering::Relaxed);
         pipes.reverts.store(self.reverts, Ordering::Relaxed);
+    }
+
+    // a rate that leaves the decided one is judged again once it is steady: back
+    // near it the workload only paused, away from it the decision is void
+    fn settle(&mut self) {
+        self.settling = self.settling.saturating_sub(1);
+        if self.settling > 0 || self.decided == 0 {
+            return;
+        }
+        let moved = self.rate().abs_diff(self.decided) * 100 > self.decided * RATE_SHIFT_PCT;
+        if !self.shifted {
+            if moved {
+                self.shifted = true;
+                self.settling = RATE_TICKS as u32;
+            }
+        } else if self.steady() {
+            self.shifted = false;
+            if moved {
+                self.decided = 0;
+                self.wait = 0;
+            }
+        }
     }
 
     fn record(&mut self, commands_now: u64) {
@@ -167,6 +180,7 @@ impl Probe {
             self.streak = 0;
             self.wait = 0;
             self.decided = 0;
+            self.shifted = false;
             self.prefer = false;
         }
     }
@@ -175,6 +189,7 @@ impl Probe {
         let baseline = self.rate();
         if self.wait > 0
             || self.settling > 0
+            || self.shifted
             || self.seen < RATE_TICKS
             || baseline < self.floor
             || !self.steady()
@@ -215,6 +230,7 @@ impl Probe {
         }
         self.decided = if keep { shared } else { local };
         self.settling = RATE_TICKS as u32;
+        self.shifted = false;
         self.prefer = keep;
         self.phase = Phase::Steady;
     }
@@ -437,10 +453,8 @@ mod tests {
         assert!(rig.run(PROBE_TICKS, 1_200, true, true));
         assert_eq!(rig.probe.wait, PROBE_BACKOFF_TICKS);
         assert!(rig.run(RATE_TICKS as u32, 1_200, true, true));
-        assert!(rig.run(RATE_TICKS as u32, 600, false, false));
+        assert!(rig.run(2 * RATE_TICKS as u32, 600, false, false));
         assert_eq!(rig.probe.wait, 0);
-        assert!(rig.run(1, 600, true, true));
-        assert!(rig.run(RATE_TICKS as u32, 600, false, false));
         assert!(!rig.run(1, 600, true, true));
         assert_eq!(rig.probe.probes, 2);
     }
@@ -454,6 +468,18 @@ mod tests {
         assert!(!rig.run(RATE_TICKS as u32, 1_000, true, true));
         assert_eq!(rig.probe.probes, 1);
         assert_eq!(rig.probe.wait, PROBE_BACKOFF_TICKS - RATE_TICKS as u32);
+    }
+
+    #[test]
+    fn a_pause_in_the_same_workload_keeps_the_schedule() {
+        let mut rig = Rig::new();
+        rig.run(RATE_TICKS as u32, 1_000, true, true);
+        assert!(rig.run(PROBE_TICKS, 1_200, true, true));
+        rig.run(RATE_TICKS as u32, 1_200, true, true);
+        rig.run(3, 0, false, false);
+        assert!(rig.run(3 * RATE_TICKS as u32, 1_200, true, true));
+        assert_eq!(rig.probe.probes, 1);
+        assert!(rig.probe.wait > 0);
     }
 
     #[test]
