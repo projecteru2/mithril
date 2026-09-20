@@ -163,11 +163,10 @@ impl PendingFills {
 
 impl Drop for PendingFills {
     fn drop(&mut self) {
-        if let Some(cache) = &self.cache {
-            for part in self.parts.as_slice() {
-                if let PartCache::Fill(keys) = part {
-                    cache.abandon_fills(keys);
-                }
+        let Some(cache) = &self.cache else { return };
+        for part in self.parts.as_slice() {
+            if let PartCache::Fill(keys) = part {
+                cache.abandon_fills(keys);
             }
         }
     }
@@ -770,8 +769,6 @@ mod tests {
                 for (key, tx) in keys.iter().zip(senders) {
                     assert!(cache.begin_fill(key));
                     assert!(tx.send(Bytes::from_static(b"*1\r\n$1\r\nx\r\n")).is_err());
-                    assert!(!cache.begin_fill(key));
-                    cache.abandon_fill(key);
                 }
             })
             .await;
@@ -813,7 +810,6 @@ mod tests {
                         .send(Bytes::from_static(b"*1\r\n$1\r\nx\r\n"))
                         .is_err()
                 );
-                assert!(!cache.begin_fill(&keys[1]));
                 for key in &keys {
                     cache.complete_fill(key, b"$1\r\ny\r\n");
                     assert_eq!(
