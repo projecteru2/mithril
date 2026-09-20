@@ -146,6 +146,32 @@ impl PartCache {
     }
 }
 
+struct PendingFills {
+    cache: Option<Rc<ReplyCache>>,
+    parts: std::vec::IntoIter<PartCache>,
+}
+
+impl PendingFills {
+    fn complete_next(&mut self, reply: &[u8]) {
+        if let Some(PartCache::Fill(keys)) = self.parts.next()
+            && let Some(cache) = &self.cache
+        {
+            cache.complete_fills(&keys, reply);
+        }
+    }
+}
+
+impl Drop for PendingFills {
+    fn drop(&mut self) {
+        let Some(cache) = &self.cache else { return };
+        for part in self.parts.as_slice() {
+            if let PartCache::Fill(keys) = part {
+                cache.abandon_fills(keys);
+            }
+        }
+    }
+}
+
 impl Session {
     // fast path: no gate pending and every pipe has room, so nothing awaits
     pub(super) fn fan_out(
@@ -444,6 +470,14 @@ impl Session {
         let link = self.link.clone();
         let shared = self.shared.clone();
         let reply_q = self.reply_q.clone();
+        let mut cached = PendingFills {
+            cache: if cached.is_empty() {
+                None
+            } else {
+                shared.cache.clone()
+            },
+            parts: cached.into_iter(),
+        };
         // the lane is snapshotted here: a later SELECT must not move these parts
         let lane = self.lane();
         // detached: bounded by backend replies, aborted at teardown
@@ -453,14 +487,9 @@ impl Session {
             let mut retries: Vec<(multikey::Part, oneshot::Receiver<Bytes>)> = Vec::new();
             let mut reruns: Vec<(multikey::Part, oneshot::Receiver<Bytes>)> = Vec::new();
             let mut singles = Singles::new(merge);
-            let mut cached = cached.into_iter();
             for (part, rx) in parts.into_iter().zip(receivers) {
                 let reply = recv_or_lost(rx).await;
-                if let Some(PartCache::Fill(keys)) = cached.next()
-                    && let Some(cache) = &shared.cache
-                {
-                    cache.complete_fills(&keys, &reply);
-                }
+                cached.complete_next(&reply);
                 if reply.first() != Some(&b'-') {
                     results.push((part.positions, reply));
                     continue;
@@ -707,6 +736,112 @@ fn merge_for(kind: Kind) -> Option<Merge> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::tests::cache;
+
+    fn pending_fills(cache: &Rc<ReplyCache>, keys: &[Bytes]) -> PendingFills {
+        let parts: Vec<_> = keys
+            .iter()
+            .map(|key| PartCache::Fill(vec![key.clone()]).armed(cache))
+            .collect();
+        assert!(parts.iter().all(|part| matches!(part, PartCache::Fill(_))));
+        PendingFills {
+            cache: Some(cache.clone()),
+            parts: parts.into_iter(),
+        }
+    }
+
+    #[tokio::test]
+    async fn aborted_fanout_releases_fills_before_first_poll() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let cache = cache(1 << 20);
+                let keys = [Bytes::from_static(b"a"), Bytes::from_static(b"b")];
+                let mut pending = pending_fills(&cache, &keys);
+                let (senders, receivers): (Vec<_>, Vec<_>) =
+                    (0..keys.len()).map(|_| oneshot::channel()).unzip();
+                let task = tokio::task::spawn_local(async move {
+                    for rx in receivers {
+                        pending.complete_next(&recv_or_lost(rx).await);
+                    }
+                });
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+                for (key, tx) in keys.iter().zip(senders) {
+                    assert!(cache.begin_fill(key));
+                    assert!(tx.send(Bytes::from_static(b"*1\r\n$1\r\nx\r\n")).is_err());
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn aborted_fanout_releases_only_unsettled_fills() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let cache = cache(1 << 20);
+                let keys = [Bytes::from_static(b"a"), Bytes::from_static(b"b")];
+                let mut pending = pending_fills(&cache, &keys);
+                let (first_tx, first_rx) = oneshot::channel();
+                let (last_tx, last_rx) = oneshot::channel();
+                let (settled_tx, settled_rx) = oneshot::channel();
+                let task = tokio::task::spawn_local(async move {
+                    pending.complete_next(&recv_or_lost(first_rx).await);
+                    settled_tx.send(()).unwrap();
+                    pending.complete_next(&recv_or_lost(last_rx).await);
+                });
+                first_tx
+                    .send(Bytes::from_static(b"*1\r\n$1\r\nx\r\n"))
+                    .unwrap();
+                settled_rx.await.unwrap();
+                assert_eq!(
+                    cache.lookup(&keys[0]).as_deref(),
+                    Some(b"$1\r\nx\r\n".as_slice())
+                );
+                cache.invalidate(&keys[1]);
+                cache.flush();
+                assert!(!cache.begin_fill(&keys[1]));
+                assert!(cache.begin_fill(&keys[0]));
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+                assert!(!cache.begin_fill(&keys[0]));
+                assert!(cache.begin_fill(&keys[1]));
+                assert!(
+                    last_tx
+                        .send(Bytes::from_static(b"*1\r\n$1\r\nx\r\n"))
+                        .is_err()
+                );
+                for key in &keys {
+                    cache.complete_fill(key, b"$1\r\ny\r\n");
+                    assert_eq!(
+                        cache.lookup(key).as_deref(),
+                        Some(b"$1\r\ny\r\n".as_slice())
+                    );
+                }
+            })
+            .await;
+    }
+
+    #[test]
+    fn completed_fanout_does_not_release_later_fills() {
+        for reply in [
+            b"*1\r\n$1\r\nx\r\n".as_slice(),
+            b"-ERR CLIENT CACHING refused\r\n",
+        ] {
+            let cache = cache(1 << 20);
+            let key = Bytes::from_static(b"a");
+            let mut pending = pending_fills(&cache, std::slice::from_ref(&key));
+            pending.complete_next(reply);
+            cache.invalidate(&key);
+            assert!(cache.begin_fill(&key));
+            drop(pending);
+            assert!(!cache.begin_fill(&key));
+            cache.complete_fill(&key, b"$1\r\ny\r\n");
+            assert_eq!(
+                cache.lookup(&key).as_deref(),
+                Some(b"$1\r\ny\r\n".as_slice())
+            );
+        }
+    }
 
     #[test]
     fn singles_fold_sums_and_oks_and_keep_mget_items() {

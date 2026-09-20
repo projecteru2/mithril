@@ -823,12 +823,12 @@ fn collect_push(frame: &[u8], keys: &mut Vec<Range<usize>>) -> Option<Push> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::hash::BuildHasher;
 
     use super::*;
 
-    fn cache(max_bytes: usize) -> Rc<ReplyCache> {
+    pub(crate) fn cache(max_bytes: usize) -> Rc<ReplyCache> {
         let cfg = Config {
             reply_cache_max_bytes: max_bytes,
             ..Config::default()
